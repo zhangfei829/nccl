@@ -343,8 +343,8 @@ int main(int argc, char* argv[])
     NCCLCHECK(ncclEpHandleGetNumRecvTokens(ep_handle, &num_recv_tokens));
   }
   else {
-  // Specific to this test
-    num_recv_tokens = config.max_tokens_per_rank * num_local_experts;
+    // HT: must match ep_group->max_recv_tokens (nRanks * max_tokens_per_rank), not * num_local_experts.
+    num_recv_tokens = static_cast<unsigned int>(nRanks) * config.max_tokens_per_rank;
   }
   assert(num_recv_tokens);
 

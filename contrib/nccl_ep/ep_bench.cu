@@ -1982,7 +1982,8 @@ int main(int argc, char* argv[]) {
             fflush(stdout);
         }
     } else {
-        num_recv_tokens = config.max_tokens_per_rank * num_local_experts;
+        // Must match ep_group->max_recv_tokens in nccl_ep.cc (nRanks * max_tokens_per_rank).
+        num_recv_tokens = static_cast<unsigned int>(nRanks) * config.max_tokens_per_rank;
     }
     assert(num_recv_tokens);
 
