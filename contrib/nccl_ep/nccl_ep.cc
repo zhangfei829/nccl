@@ -75,6 +75,20 @@ static void tensor_free(ncclEpGroup_t group, ncclNDTensor_t t);
 } while(0)
 #endif
 
+// CUDACHECK_RET macro for CUDA calls in functions returning ncclResult_t.
+// Defined early here so it is visible to init_hybridep_intranode_fabric below
+// (the original definition remained later in the file and is kept via #ifndef).
+#ifndef CUDACHECK_RET
+#define CUDACHECK_RET(cmd) do {                             \
+    cudaError_t err = cmd;                                  \
+    if (err != cudaSuccess) {                               \
+        fprintf(stderr, "CUDA error %s:%d '%s'\n",          \
+                __FILE__, __LINE__, cudaGetErrorString(err));\
+        return ncclInternalError;                            \
+    }                                                        \
+} while(0)
+#endif
+
 // Helper function to convert ncclDataType_t to cudaDataType_t
 static cudaDataType_t ncclDataTypeToCudaDataType(ncclDataType_t nccl_type) {
     switch (nccl_type) {
