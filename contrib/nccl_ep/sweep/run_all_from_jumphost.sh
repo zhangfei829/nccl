@@ -40,8 +40,16 @@ AGG_CSV="$OUT_ROOT/all_results.csv"
 
 SWEEP_SH="${NCCL_REPO}/contrib/nccl_ep/sweep/ep_sweep.sh"
 PARSE_PY="${NCCL_REPO}/contrib/nccl_ep/sweep/ep_parse.py"
+MERGE_PY="${NCCL_REPO}/contrib/nccl_ep/sweep/merge_into_master.py"
+
+# Long-lived master CSV: every EP-size result is merged here, deduped by
+# (ep_size, mode, tokens, dispatch_dtype_tag, algorithm) keeping the latest
+# timestamp. Override with MASTER_CSV=/some/path if you want a different
+# location.
+MASTER_CSV="${MASTER_CSV:-$HOME/fizhang/nccl_ep_master.csv}"
 
 mkdir -p "$OUT_ROOT"
+mkdir -p "$(dirname "$MASTER_CSV")"
 echo "==========================================================="
 echo "EP Sweep Driver (jumphost)"
 echo "  repo       : $NCCL_REPO"
@@ -51,9 +59,10 @@ echo "  modes      : $MODES"
 echo "  partition  : $PARTITION"
 echo "  time limit : $TIME_LIMIT"
 echo "  out_root   : $OUT_ROOT"
+echo "  master csv : $MASTER_CSV"
 echo "==========================================================="
 
-for sh in "$SWEEP_SH" "$PARSE_PY"; do
+for sh in "$SWEEP_SH" "$PARSE_PY" "$MERGE_PY"; do
     if [[ ! -f "$sh" ]]; then
         echo "ERROR: missing $sh (checked out?)" >&2
         exit 2
@@ -99,7 +108,7 @@ run_one_size() {
         echo "EP=$ep salloc/run failed (rc=$rc), continuing next size"
     fi
 
-    # Aggregate CSV
+    # Aggregate CSV for this sweep run (under OUT_ROOT, keeps historical)
     if [[ -f "$csv" ]]; then
         if [[ ! -f "$AGG_CSV" ]]; then
             cp "$csv" "$AGG_CSV"
@@ -107,6 +116,16 @@ run_one_size() {
             tail -n +2 "$csv" >> "$AGG_CSV"
         fi
         echo "EP=$ep -> appended $(wc -l <"$csv") rows to $AGG_CSV"
+
+        # Also merge into the long-lived master CSV (dedup by
+        # ep_size/mode/tokens/dispatch_dtype_tag/algorithm). This makes the
+        # master grow smoothly as we run more EP sizes over time, and
+        # reruns of the same config replace older rows.
+        if python3 "$MERGE_PY" "$MASTER_CSV" "$csv"; then
+            echo "EP=$ep -> merged into $MASTER_CSV"
+        else
+            echo "EP=$ep -> WARN: merge into master failed (csv kept in $csv)"
+        fi
     else
         echo "EP=$ep produced no csv"
     fi

@@ -10,6 +10,7 @@ and collects results into a single CSV ready for Excel pivoting.
 | `ep_parse.py`               | Parse one `ep_bench` log, append one CSV row.  |
 | `ep_sweep.sh`               | Inner driver: run all (mode x tokens) for one already-allocated EP size. |
 | `run_all_from_jumphost.sh`  | Outer driver: loop EP sizes, allocate + run inner. |
+| `merge_into_master.py`      | Merge one or more `results.csv` files into a long-lived master CSV, deduped by `(ep_size, mode, tokens, dispatch_dtype_tag, algorithm)`. |
 
 ## Sweep axes (defaults)
 
@@ -41,7 +42,7 @@ Outputs under `$OUT_ROOT` (default `$HOME/fizhang/nccl-sweep-<ts>/`):
 
 ```
 nccl-sweep-<ts>/
-  all_results.csv           <-- single file for Excel
+  all_results.csv           <-- this run only
   ep4/
     results.csv
     ep4_ll_t128.log
@@ -50,6 +51,26 @@ nccl-sweep-<ts>/
     hosts.ep4
   ep8/
     ...
+```
+
+And, in addition, a long-lived master CSV accumulates across all sweep
+invocations (override with `MASTER_CSV=/path/file.csv`):
+
+```
+$HOME/fizhang/nccl_ep_master.csv      <-- grows over time, deduped
+```
+
+Every EP size that finishes successfully is merged into the master
+(newer rows replace older ones for the same
+`(ep_size, mode, tokens, dispatch_dtype_tag, algorithm)`).
+
+To seed the master from CSVs you already have:
+
+```bash
+python3 contrib/nccl_ep/sweep/merge_into_master.py \
+    ~/fizhang/nccl_ep_master.csv \
+    ~/fizhang/nccl-sweep-20260420_141647/all_results.csv \
+    ~/fizhang/nccl-sweep-20260420_143135/all_results.csv
 ```
 
 ## Running a single EP size manually
