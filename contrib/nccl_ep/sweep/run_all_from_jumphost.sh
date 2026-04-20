@@ -70,29 +70,29 @@ run_one_size() {
     echo
     echo "######  EP=$ep  (nodes=$nnodes)  ######"
 
-    # Write inline sbatch-ish job launcher via salloc+srun. We don't use
-    # sbatch because the user already runs this interactively on jumphost
-    # and wants streaming stdout.
-
-    # Build the command to run inside the allocation.
-    read -r -d '' INNER_CMD <<EOF || true
-set -u
-cd "${NCCL_REPO}/contrib/nccl_ep/sweep"
-unset SLURM_TRES_PER_TASK || true
-export NCCL_HOME="${NCCL_HOME:-\$HOME/fizhang/nccl/build}"
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-EP_SIZE=${ep} TOKENS="${TOKENS}" MODES="${MODES}" \\
-  LOG_DIR="${outdir}" CSV_FILE="${csv}" \\
-  bash ep_sweep.sh
-EOF
+    # NOTE on allocation model (why no inner srun):
+    # We want mpirun's `--mca plm slurm` to launch orted with full GPU
+    # visibility on every allocated node. If we wrap ep_sweep.sh inside an
+    # inner `srun -N1 -w head_node` step, that inner step grabs the head
+    # node's GPU resource as a Slurm step, and the orted steps that
+    # mpirun starts on OTHER nodes end up with no GPU visibility
+    # ("cudaSetDevice: invalid device ordinal" at ep_bench.cu:1862).
+    # The fix is to run ep_sweep.sh directly in the salloc shell
+    # (which executes on the submit host). mpirun then starts fresh
+    # Slurm steps for orted on every node and they inherit the job's
+    # full GRES allocation.
 
     salloc -p "$PARTITION" -N "$nnodes" --ntasks-per-node=1 \
            --gres=gpu:4 --cpus-per-gpu=8 --time="$TIME_LIMIT" \
            bash -lc "
               set -u
-              srun --jobid=\$SLURM_JOB_ID --overlap --cpus-per-gpu=8 \
-                   -N 1 -n 1 -w \$(scontrol show hostnames \$SLURM_JOB_NODELIST | head -1) \
-                   bash -lc '${INNER_CMD//\'/\'\"\'\"\'}'
+              unset SLURM_TRES_PER_TASK || true
+              cd ${NCCL_REPO}/contrib/nccl_ep/sweep
+              export NCCL_HOME=\"${NCCL_HOME:-\$HOME/fizhang/nccl/build}\"
+              export CUDA_HOME=\"${CUDA_HOME:-/usr/local/cuda}\"
+              EP_SIZE=${ep} TOKENS='${TOKENS}' MODES='${MODES}' \
+                  LOG_DIR='${outdir}' CSV_FILE='${csv}' \
+                  bash ep_sweep.sh
            "
     rc=$?
     if [[ $rc -ne 0 ]]; then
