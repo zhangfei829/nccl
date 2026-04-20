@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <new>
@@ -41,6 +42,8 @@ struct ncclNDTensor {
 // Forward declarations for HT functions
 static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
 static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group);
+static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
+static ncclResult_t destroy_hybridep_intranode_fabric(ncclEpGroup_t ep_group);
 static ncclResult_t init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* config, cudaStream_t stream);
 static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group);
 static void tensor_free(ncclEpGroup_t group, ncclNDTensor_t t);
@@ -54,6 +57,21 @@ static void tensor_free(ncclEpGroup_t group, ncclNDTensor_t t);
             res, __FILE__, __LINE__);               \
     exit(EXIT_FAILURE);                             \
   }                                                 \
+} while(0)
+#endif
+
+// CUDA driver API error checking (for VMM / fabric handle calls)
+#ifndef CU_CHECK
+#define CU_CHECK(cmd) do {                                  \
+  CUresult _cu_res = (cmd);                                 \
+  if (_cu_res != CUDA_SUCCESS) {                            \
+    const char* _cu_err = nullptr;                          \
+    cuGetErrorString(_cu_res, &_cu_err);                    \
+    fprintf(stderr, "CU error %d (%s) at %s:%d\n",          \
+            (int)_cu_res, _cu_err ? _cu_err : "?",          \
+            __FILE__, __LINE__);                            \
+    return ncclSystemError;                                 \
+  }                                                         \
 } while(0)
 #endif
 
@@ -279,6 +297,19 @@ struct ncclEpGroup {
         void** peer_ipc_base_ptrs = nullptr;   // Opened IPC base pointers per peer (for cleanup)
         void* host_ptr_block = nullptr;        // Single cudaHostAlloc for all pointer arrays
 
+        // Fabric-memory-based intranode (used when MNNVL LSA covers all ranks).
+        // When enabled, replaces cudaIpc* with CUDA VMM Fabric Handles so that peers
+        // in different hostnames but the same NVLink fabric domain can share buffers
+        // directly via NVSwitch, without falling through to RDMA.
+        bool use_fabric_memory = false;
+        CUmemGenericAllocationHandle fabric_local_alloc = 0;           // local mega buffer alloc
+        size_t fabric_aligned_size = 0;                                // mega buffer size rounded to granularity
+        CUmemGenericAllocationHandle* fabric_peer_allocs = nullptr;    // [nRanks], own alloc at [rank]
+        CUdeviceptr* fabric_peer_vas = nullptr;                        // [nRanks], VAs for unmap
+        CUmemGenericAllocationHandle fabric_flags_alloc = 0;           // rank 0: own; others: imported
+        CUdeviceptr fabric_flags_va = 0;                               // VA for flags (rank 0 own, others imported)
+        size_t fabric_flags_aligned_size = 0;
+
         // Config
         bool initialized;
         bool internode_initialized;
@@ -370,6 +401,11 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
                                     const ncclEpGroupConfig_t* in_config,
                                     cudaStream_t stream)
 {
+    // If MNNVL LSA covers all ranks, use fabric memory handles instead of cudaIPC.
+    if (ep_group->ht_buffers.use_fabric_memory) {
+        return init_hybridep_intranode_fabric(ep_group, in_config, stream);
+    }
+
     ncclComm_t comm = ep_group->comm;
     int nRanks = ep_group->nRanks;
     int rank = ep_group->rank;
@@ -565,6 +601,9 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
 // HT Intranode Cleanup
 static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.initialized) return ncclSuccess;
+    if (ep_group->ht_buffers.use_fabric_memory) {
+        return destroy_hybridep_intranode_fabric(ep_group);
+    }
 
     // Node semantics: IPC cleanup mirrors Phase 3 — indexed by per-node position.
     int rank_in_node  = ep_group->rank_in_node;
@@ -613,6 +652,311 @@ static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
     if (ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs) {
         cudaFreeHost(ep_group->ht_buffers.dispatch_expert_output_scaling_factor_buffer_ptrs);
     }
+    if (ep_group->ht_buffers.host_ptr_block) {
+        cudaFreeHost(ep_group->ht_buffers.host_ptr_block);
+        ep_group->ht_buffers.host_ptr_block = nullptr;
+    }
+    if (ep_group->ht_buffers.peer_ipc_base_ptrs) {
+        cudaFreeHost(ep_group->ht_buffers.peer_ipc_base_ptrs);
+        ep_group->ht_buffers.peer_ipc_base_ptrs = nullptr;
+    }
+
+    ep_group->ht_buffers.initialized = false;
+    return ncclSuccess;
+}
+
+// ============================================================================
+// HT Intranode Fabric (MNNVL full-coverage variant)
+// ----------------------------------------------------------------------------
+// When the NCCL LSA team covers all ranks (NVL72 intra-pod), we treat the
+// whole EP group as a single "fabric node" and share HT staging buffers via
+// CUDA VMM Fabric Memory Handles instead of cudaIPC. Fabric handles work for
+// all peers in the NVLink fabric domain (both same-hostname and different-
+// hostname, since NVSwitch is a unified fabric), so HT kernels can do direct
+// peer load/store for the full EP group without falling back to RDMA.
+//
+// Key differences vs init_hybridep_intranode (cudaIPC variant):
+//   * Peer-pointer arrays are sized by nRanks (== lsa_rank_count) instead of
+//     gpus_per_node. In this code path they are equal by construction, but the
+//     semantic is "fabric domain ranks".
+//   * All allocations use cuMemCreate(CU_MEM_HANDLE_TYPE_FABRIC), then
+//     cuMemAddressReserve + cuMemMap + cuMemSetAccess. Peer mappings use
+//     cuMemImportFromShareableHandle + cuMemMap + cuMemSetAccess.
+//   * Handle exchange reuses ncclAllGatherHost with the 64-byte
+//     CUmemFabricHandle (same size as cudaIpcMemHandle_t).
+//   * cudaDeviceEnablePeerAccess is NOT called because fabric memory uses a
+//     different access path controlled by cuMemSetAccess per VA range.
+// ============================================================================
+static size_t fabric_round_up(size_t sz, size_t granularity) {
+    if (granularity == 0) granularity = 1;
+    return (sz + granularity - 1) & ~(granularity - 1);
+}
+
+static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group,
+                                    const ncclEpGroupConfig_t* in_config,
+                                    cudaStream_t stream)
+{
+    (void)in_config;
+    ncclComm_t comm = ep_group->comm;
+    int nRanks = ep_group->nRanks;
+    int rank = ep_group->rank;
+    // In fabric mode, rank_in_node == rank, gpus_per_node == nRanks (forced in ncclEpCreateGroup).
+    int n_fabric_ranks = ep_group->lsa_rank_count; // == nRanks
+    int hidden = ep_group->hidden;
+    int num_local_experts = ep_group->num_local_experts;
+    int max_recv_tokens = ep_group->max_recv_tokens;
+
+    ep_group->ht_buffers.initialized = false;
+
+    // Compute layout (same as IPC path, only storage backing differs).
+    auto align_ipc = [](size_t s) -> size_t { return (s + 255) & ~size_t(255); };
+    size_t expert_output_token_sz = static_cast<size_t>(max_recv_tokens) * hidden * sizeof(uint16_t);
+    size_t expert_output_prob_sz  = static_cast<size_t>(max_recv_tokens) * num_local_experts * n_fabric_ranks * sizeof(float);
+    size_t expert_input_token_sz  = static_cast<size_t>(max_recv_tokens) * hidden * sizeof(uint16_t);
+    size_t expert_input_prob_sz   = static_cast<size_t>(max_recv_tokens) * num_local_experts * n_fabric_ranks * sizeof(float);
+
+    size_t dispatch_token_aligned = align_ipc(expert_output_token_sz);
+    size_t dispatch_prob_aligned  = align_ipc(expert_output_prob_sz);
+    size_t combine_token_aligned  = align_ipc(expert_input_token_sz);
+    size_t combine_prob_aligned   = align_ipc(expert_input_prob_sz);
+
+    size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned
+                   + combine_token_aligned + combine_prob_aligned;
+
+    // Setup fabric allocation prop and compute granularity.
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = ep_group->cuda_device_id;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    size_t granularity = 0;
+    CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop,
+                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    size_t aligned_mega = fabric_round_up(mega_sz, granularity);
+    ep_group->ht_buffers.fabric_aligned_size = aligned_mega;
+
+    // --- Phase 1: allocate local mega buffer via fabric handle, map into local VA ---
+    CUmemGenericAllocationHandle local_alloc = 0;
+    CU_CHECK(cuMemCreate(&local_alloc, aligned_mega, &prop, 0));
+    ep_group->ht_buffers.fabric_local_alloc = local_alloc;
+
+    CUdeviceptr local_va = 0;
+    CU_CHECK(cuMemAddressReserve(&local_va, aligned_mega, granularity, 0, 0));
+    CU_CHECK(cuMemMap(local_va, aligned_mega, 0, local_alloc, 0));
+
+    CUmemAccessDesc access = {};
+    access.location = prop.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CU_CHECK(cuMemSetAccess(local_va, aligned_mega, &access, 1));
+
+    ep_group->ht_buffers.ipc_mega_buffer = reinterpret_cast<void*>(local_va);
+    ep_group->ht_buffers.ipc_mega_buffer_size = aligned_mega;
+
+    uint8_t* mega_base = reinterpret_cast<uint8_t*>(local_va);
+    ep_group->ht_buffers.ipc_dispatch_token_offset = 0;
+    ep_group->ht_buffers.expert_output_token = mega_base;
+    ep_group->ht_buffers.ipc_dispatch_prob_offset = dispatch_token_aligned;
+    ep_group->ht_buffers.expert_output_prob = reinterpret_cast<float*>(mega_base + dispatch_token_aligned);
+    ep_group->ht_buffers.ipc_combine_token_offset = dispatch_token_aligned + dispatch_prob_aligned;
+    ep_group->ht_buffers.expert_input_token = reinterpret_cast<uint16_t*>(
+        mega_base + dispatch_token_aligned + dispatch_prob_aligned);
+    ep_group->ht_buffers.ipc_combine_prob_offset = dispatch_token_aligned + dispatch_prob_aligned + combine_token_aligned;
+    ep_group->ht_buffers.expert_input_prob = reinterpret_cast<float*>(
+        mega_base + dispatch_token_aligned + dispatch_prob_aligned + combine_token_aligned);
+
+    // Host peer-pointer block (sized by n_fabric_ranks == nRanks).
+    size_t host_block_sz = sizeof(void*) * n_fabric_ranks
+                         + sizeof(float*) * n_fabric_ranks
+                         + sizeof(uint16_t*) * n_fabric_ranks
+                         + sizeof(float*) * n_fabric_ranks;
+    CUDACHECK_RET(cudaHostAlloc(&ep_group->ht_buffers.host_ptr_block, host_block_sz, cudaHostAllocMapped));
+    uint8_t* hptr = static_cast<uint8_t*>(ep_group->ht_buffers.host_ptr_block);
+    ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs = reinterpret_cast<void**>(hptr);
+    hptr += sizeof(void*) * n_fabric_ranks;
+    ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
+    hptr += sizeof(float*) * n_fabric_ranks;
+    ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs = reinterpret_cast<uint16_t**>(hptr);
+    hptr += sizeof(uint16_t*) * n_fabric_ranks;
+    ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
+
+    // Completion flags (2 uint32_t). Global rank 0 owns; others import fabric handle.
+    size_t flags_bytes = 2 * sizeof(uint32_t);
+    size_t flags_granularity = granularity;
+    size_t flags_aligned = fabric_round_up(flags_bytes, flags_granularity);
+    ep_group->ht_buffers.fabric_flags_aligned_size = flags_aligned;
+    if (rank == 0) {
+        CUmemGenericAllocationHandle flags_alloc = 0;
+        CU_CHECK(cuMemCreate(&flags_alloc, flags_aligned, &prop, 0));
+        ep_group->ht_buffers.fabric_flags_alloc = flags_alloc;
+        CUdeviceptr flags_va = 0;
+        CU_CHECK(cuMemAddressReserve(&flags_va, flags_aligned, flags_granularity, 0, 0));
+        CU_CHECK(cuMemMap(flags_va, flags_aligned, 0, flags_alloc, 0));
+        CU_CHECK(cuMemSetAccess(flags_va, flags_aligned, &access, 1));
+        ep_group->ht_buffers.fabric_flags_va = flags_va;
+        CUDACHECK_RET(cudaMemsetAsync(reinterpret_cast<void*>(flags_va), 0, flags_bytes, stream));
+        ep_group->ht_buffers.intra_node_write_completion_flags = reinterpret_cast<uint32_t*>(flags_va);
+        ep_group->ht_buffers.combine_intra_node_write_completion_flags = reinterpret_cast<uint32_t*>(flags_va) + 1;
+    }
+
+    // Grid barrier counter (local, not shared).
+    {
+        uint32_t* grid_barrier_base;
+        CUDACHECK_RET(ep_group->alloc_fn(reinterpret_cast<void**>(&grid_barrier_base), sizeof(uint32_t)));
+        CUDACHECK_RET(cudaMemsetAsync(grid_barrier_base, 0, sizeof(uint32_t), stream));
+        ep_group->ht_buffers.dispatch_grid_barrier_counter = grid_barrier_base;
+    }
+
+    // --- Phase 2: export local fabric handle, allgather to all ranks ---
+    CUmemFabricHandle local_mega_fh = {};
+    CU_CHECK(cuMemExportToShareableHandle(&local_mega_fh, local_alloc,
+                                          CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    CUmemFabricHandle local_flags_fh = {};
+    if (rank == 0) {
+        CU_CHECK(cuMemExportToShareableHandle(&local_flags_fh,
+                                              ep_group->ht_buffers.fabric_flags_alloc,
+                                              CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    }
+
+    static_assert(sizeof(CUmemFabricHandle) == 64, "CUmemFabricHandle expected to be 64 bytes");
+
+    // AllGather the two handles together (mega + flags). Use host buffer path.
+    const size_t FH_BYTES = sizeof(CUmemFabricHandle);
+    std::unique_ptr<uint8_t[]> gathered(new uint8_t[2 * FH_BYTES * nRanks]);
+    std::memset(gathered.get(), 0, 2 * FH_BYTES * nRanks);
+    // Place this rank's handles at its slot.
+    std::memcpy(gathered.get() + rank * 2 * FH_BYTES, &local_mega_fh, FH_BYTES);
+    std::memcpy(gathered.get() + rank * 2 * FH_BYTES + FH_BYTES, &local_flags_fh, FH_BYTES);
+    ncclAllGatherHost(gathered.get(), 2 * FH_BYTES, rank, nRanks, comm, stream);
+
+    // --- Phase 3: import peer handles, map into local VA per peer ---
+    CUDACHECK_RET(cudaHostAlloc(&ep_group->ht_buffers.peer_ipc_base_ptrs,
+                                sizeof(void*) * n_fabric_ranks, cudaHostAllocMapped));
+    std::memset(ep_group->ht_buffers.peer_ipc_base_ptrs, 0, sizeof(void*) * n_fabric_ranks);
+
+    ep_group->ht_buffers.fabric_peer_allocs =
+        static_cast<CUmemGenericAllocationHandle*>(std::calloc(n_fabric_ranks, sizeof(CUmemGenericAllocationHandle)));
+    ep_group->ht_buffers.fabric_peer_vas =
+        static_cast<CUdeviceptr*>(std::calloc(n_fabric_ranks, sizeof(CUdeviceptr)));
+    if (!ep_group->ht_buffers.fabric_peer_allocs || !ep_group->ht_buffers.fabric_peer_vas) {
+        fprintf(stderr, "init_hybridep_intranode_fabric: calloc failed for peer arrays\n");
+        return ncclSystemError;
+    }
+
+    for (int i = 0; i < n_fabric_ranks; i++) {
+        if (i == rank) {
+            // Own buffer already mapped.
+            ep_group->ht_buffers.fabric_peer_vas[i] = local_va;
+            ep_group->ht_buffers.fabric_peer_allocs[i] = 0; // sentinel: don't release own handle via peer cleanup
+            ep_group->ht_buffers.peer_ipc_base_ptrs[i] = reinterpret_cast<void*>(local_va);
+            ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_token;
+            ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i]  = ep_group->ht_buffers.expert_output_prob;
+            ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i]   = ep_group->ht_buffers.expert_input_token;
+            ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i]    = ep_group->ht_buffers.expert_input_prob;
+            continue;
+        }
+        CUmemFabricHandle peer_fh;
+        std::memcpy(&peer_fh, gathered.get() + i * 2 * FH_BYTES, FH_BYTES);
+
+        CUmemGenericAllocationHandle peer_alloc = 0;
+        CU_CHECK(cuMemImportFromShareableHandle(&peer_alloc, &peer_fh, CU_MEM_HANDLE_TYPE_FABRIC));
+        ep_group->ht_buffers.fabric_peer_allocs[i] = peer_alloc;
+
+        CUdeviceptr peer_va = 0;
+        CU_CHECK(cuMemAddressReserve(&peer_va, aligned_mega, granularity, 0, 0));
+        CU_CHECK(cuMemMap(peer_va, aligned_mega, 0, peer_alloc, 0));
+        CU_CHECK(cuMemSetAccess(peer_va, aligned_mega, &access, 1));
+        ep_group->ht_buffers.fabric_peer_vas[i] = peer_va;
+
+        uint8_t* pb = reinterpret_cast<uint8_t*>(peer_va);
+        ep_group->ht_buffers.peer_ipc_base_ptrs[i] = pb;
+        ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] =
+            pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
+        ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
+            reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_prob_offset);
+        ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
+            reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
+        ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
+            reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_combine_prob_offset);
+    }
+
+    // Non-rank-0 ranks import rank 0's flags fabric handle.
+    if (rank != 0) {
+        CUmemFabricHandle rank0_flags_fh;
+        std::memcpy(&rank0_flags_fh, gathered.get() + 0 * 2 * FH_BYTES + FH_BYTES, FH_BYTES);
+        CUmemGenericAllocationHandle flags_alloc_imp = 0;
+        CU_CHECK(cuMemImportFromShareableHandle(&flags_alloc_imp, &rank0_flags_fh, CU_MEM_HANDLE_TYPE_FABRIC));
+        ep_group->ht_buffers.fabric_flags_alloc = flags_alloc_imp;
+
+        CUdeviceptr flags_va = 0;
+        CU_CHECK(cuMemAddressReserve(&flags_va, flags_aligned, flags_granularity, 0, 0));
+        CU_CHECK(cuMemMap(flags_va, flags_aligned, 0, flags_alloc_imp, 0));
+        CU_CHECK(cuMemSetAccess(flags_va, flags_aligned, &access, 1));
+        ep_group->ht_buffers.fabric_flags_va = flags_va;
+        ep_group->ht_buffers.intra_node_write_completion_flags =
+            reinterpret_cast<uint32_t*>(flags_va);
+        ep_group->ht_buffers.combine_intra_node_write_completion_flags =
+            reinterpret_cast<uint32_t*>(flags_va) + 1;
+    }
+
+    ep_group->ht_buffers.initialized = true;
+    CUDACHECK_RET(cudaDeviceSynchronize());
+    return ncclSuccess;
+}
+
+static ncclResult_t destroy_hybridep_intranode_fabric(ncclEpGroup_t ep_group) {
+    int nRanks = ep_group->nRanks;
+    int rank = ep_group->rank;
+    size_t aligned_mega = ep_group->ht_buffers.fabric_aligned_size;
+    size_t flags_aligned = ep_group->ht_buffers.fabric_flags_aligned_size;
+
+    // Unmap and release peers.
+    if (ep_group->ht_buffers.fabric_peer_vas) {
+        for (int i = 0; i < nRanks; i++) {
+            if (i == rank) continue;
+            CUdeviceptr va = ep_group->ht_buffers.fabric_peer_vas[i];
+            if (va) {
+                cuMemUnmap(va, aligned_mega);
+                cuMemAddressFree(va, aligned_mega);
+            }
+            CUmemGenericAllocationHandle h = ep_group->ht_buffers.fabric_peer_allocs[i];
+            if (h) cuMemRelease(h);
+        }
+        std::free(ep_group->ht_buffers.fabric_peer_vas);
+        ep_group->ht_buffers.fabric_peer_vas = nullptr;
+        std::free(ep_group->ht_buffers.fabric_peer_allocs);
+        ep_group->ht_buffers.fabric_peer_allocs = nullptr;
+    }
+
+    // Release flags (rank 0 and imported ranks both have a va + alloc to release).
+    if (ep_group->ht_buffers.fabric_flags_va) {
+        cuMemUnmap(ep_group->ht_buffers.fabric_flags_va, flags_aligned);
+        cuMemAddressFree(ep_group->ht_buffers.fabric_flags_va, flags_aligned);
+        ep_group->ht_buffers.fabric_flags_va = 0;
+    }
+    if (ep_group->ht_buffers.fabric_flags_alloc) {
+        cuMemRelease(ep_group->ht_buffers.fabric_flags_alloc);
+        ep_group->ht_buffers.fabric_flags_alloc = 0;
+    }
+
+    // Grid barrier counter (local).
+    if (ep_group->ht_buffers.dispatch_grid_barrier_counter) {
+        ep_group->free_fn(ep_group->ht_buffers.dispatch_grid_barrier_counter);
+        ep_group->ht_buffers.dispatch_grid_barrier_counter = nullptr;
+    }
+
+    // Unmap local mega and release own alloc.
+    if (ep_group->ht_buffers.ipc_mega_buffer) {
+        CUdeviceptr va = reinterpret_cast<CUdeviceptr>(ep_group->ht_buffers.ipc_mega_buffer);
+        cuMemUnmap(va, aligned_mega);
+        cuMemAddressFree(va, aligned_mega);
+        ep_group->ht_buffers.ipc_mega_buffer = nullptr;
+    }
+    if (ep_group->ht_buffers.fabric_local_alloc) {
+        cuMemRelease(ep_group->ht_buffers.fabric_local_alloc);
+        ep_group->ht_buffers.fabric_local_alloc = 0;
+    }
+
     if (ep_group->ht_buffers.host_ptr_block) {
         cudaFreeHost(ep_group->ht_buffers.host_ptr_block);
         ep_group->ht_buffers.host_ptr_block = nullptr;
@@ -1013,10 +1357,25 @@ ncclResult_t ncclEpCreateGroup(
     }
 
     // Physical node properties
-    ep_group->gpus_per_node = ep_group->nRanks / ep_group->nNodes;
-    ep_group->rank_in_node  = ep_group->cuda_device_id;
-    ep_group->node_id       = ep_group->rank / ep_group->gpus_per_node;
-    ep_group->lsa_rank_count = ep_group->gpus_per_node;
+    // Normally computed from hostname-based nNodes. When HT is on and the MNNVL
+    // LSA domain covers ALL ranks (NVL72 pod intra-cluster), we treat the whole
+    // fabric as a single "node" so HT can share buffers directly via NVSwitch
+    // using fabric memory handles instead of falling through to RDMA.
+    bool mnnvl_full_coverage = hybridep_mode && (lsa_team_size == ep_group->nRanks) && (ep_group->nNodes > 1);
+    if (mnnvl_full_coverage) {
+        ep_group->nNodes         = 1;
+        ep_group->gpus_per_node  = ep_group->nRanks;
+        ep_group->rank_in_node   = ep_group->rank;
+        ep_group->node_id        = 0;
+        ep_group->lsa_rank_count = ep_group->nRanks;
+        ep_group->ht_buffers.use_fabric_memory = true;
+    } else {
+        ep_group->gpus_per_node  = ep_group->nRanks / ep_group->nNodes;
+        ep_group->rank_in_node   = ep_group->cuda_device_id;
+        ep_group->node_id        = ep_group->rank / ep_group->gpus_per_node;
+        ep_group->lsa_rank_count = ep_group->gpus_per_node;
+        ep_group->ht_buffers.use_fabric_memory = false;
+    }
 
     // LSA domain properties (used by LL path)
     ep_group->lsa_team_size  = lsa_team_size;
