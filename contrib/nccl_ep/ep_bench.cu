@@ -1058,7 +1058,10 @@ ValidationResult validateCombineOutputHT(
                     nr_cnt ? (double)nr_sum / (double)nr_cnt : 0.0,
                     nr_cnt, num_tokens);
 
-            // Show first 3 valid tokens: hidden[0..3] + token_id cols
+            // Show first 3 valid tokens: hidden[0..3] + token_id cols +
+            // target-rank breakdown (rank<8 vs rank>=8) to test the
+            // "uint8_t rank_mask truncates rank>=8" hypothesis.
+            const unsigned int num_local_experts_v = num_experts / (unsigned int)nRanks;
             int shown = 0;
             for (unsigned int t = 0; t < num_tokens && shown < 3; t++) {
                 int nr = unique_ranks[t];
@@ -1078,16 +1081,40 @@ ValidationResult validateCombineOutputHT(
                 double ratio_h0 = (expected_h != 0.0) ? a_h0 / expected_h : 0.0;
                 double ratio_hi = (expected_hi != 0.0) ? a_hi / expected_hi : 0.0;
                 double ratio_lo = (expected_lo != 0.0) ? a_lo / expected_lo : 0.0;
+                // Observed k = actual / rank_val  (rank_val is negative, so divide works)
+                double k_obs = (original_rank_val != 0.0f)
+                    ? a_h0 / (double)original_rank_val : 0.0;
+
+                // Decode this token's topk_idx into target ranks, split by "<8" vs ">=8"
+                std::set<int> ranks_lo, ranks_hi;
+                char ranks_buf[256];
+                int buf_off = 0;
+                ranks_buf[0] = '\0';
+                for (unsigned int k = 0; k < top_k; k++) {
+                    int64_t eid = topk_idx_host[t * top_k + k];
+                    if (eid < 0) continue;
+                    int target_rank = (int)(eid / (int64_t)num_local_experts_v);
+                    if (target_rank < 8) ranks_lo.insert(target_rank);
+                    else                 ranks_hi.insert(target_rank);
+                    int n = snprintf(ranks_buf + buf_off,
+                                     sizeof(ranks_buf) - buf_off,
+                                     "%s%d", (buf_off == 0) ? "" : ",", target_rank);
+                    if (n > 0 && (size_t)(buf_off + n) < sizeof(ranks_buf)) buf_off += n;
+                }
+
                 fprintf(stderr,
                         "[VALIDATE-DEBUG]   token[%u] unique_ranks=%d:\n"
                         "[VALIDATE-DEBUG]     hidden[0..3]:  actual={%.4f %.4f %.4f %.4f}  "
-                        "expected=%.4f  ratio[0]=%.4f\n"
+                        "expected=%.4f  ratio[0]=%.4f  k_observed=%.2f\n"
                         "[VALIDATE-DEBUG]     token_id cols: hi actual=%.4f expected=%.4f "
-                        "ratio=%.4f | lo actual=%.4f expected=%.4f ratio=%.4f\n",
+                        "ratio=%.4f | lo actual=%.4f expected=%.4f ratio=%.4f\n"
+                        "[VALIDATE-DEBUG]     target_ranks(dup)=[%s] "
+                        "unique_rank<8=%zu unique_rank>=8=%zu\n",
                         t, nr,
-                        a_h0, a_h1, a_h2, a_h3, expected_h, ratio_h0,
+                        a_h0, a_h1, a_h2, a_h3, expected_h, ratio_h0, k_obs,
                         a_hi, expected_hi, ratio_hi,
-                        a_lo, expected_lo, ratio_lo);
+                        a_lo, expected_lo, ratio_lo,
+                        ranks_buf, ranks_lo.size(), ranks_hi.size());
             }
             fflush(stderr);
         }
