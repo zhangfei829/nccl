@@ -26,6 +26,8 @@
 #     CUDA_HOME        default /usr/local/cuda
 #     LOG_DIR          default ./sweep_<ts>_ep<size>
 #     CSV_FILE         default $LOG_DIR/results.csv
+#     EXTRA_BENCH_ARGS extra args appended to every ep_bench invocation
+#                      (e.g. EXTRA_BENCH_ARGS="--validate" for Phase 0 checks)
 #
 # Output:
 #     <LOG_DIR>/ep{N}_{mode}_t{tokens}.log   raw ep_bench output
@@ -54,6 +56,7 @@ WARMUP_LL="${WARMUP_LL:-20}"
 ITERS_LL="${ITERS_LL:-50}"
 WARMUP_HT="${WARMUP_HT:-20}"
 ITERS_HT="${ITERS_HT:-30}"
+EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 
 NCCL_HOME="${NCCL_HOME:-$HOME/fizhang/nccl/build}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
@@ -94,6 +97,7 @@ echo "  hidden      : $HIDDEN"
 echo "  topk/experts: $TOPK / $EXPERTS"
 echo "  log dir     : $LOG_DIR"
 echo "  csv         : $CSV_FILE"
+echo "  extra bench : ${EXTRA_BENCH_ARGS:-<none>}"
 echo "  hostfile    :"
 sed 's/^/    /' "$HOSTFILE"
 echo "  LD_LIBRARY_PATH : $LD_LIBRARY_PATH"
@@ -181,7 +185,7 @@ for mode in $MODES; do
             "$EP_BENCH" --algorithm "$ALGO" \
                         --tokens "$t" --hidden "$HIDDEN" \
                         --top-k "$TOPK" --experts "$EXPERTS" \
-                        --warmup "$WARMUP" --iters "$ITERS" $EXTRA_ARGS \
+                        --warmup "$WARMUP" --iters "$ITERS" $EXTRA_ARGS $EXTRA_BENCH_ARGS \
             > "$logf" 2>&1
         rc=$?
         wall=$(( $(date +%s) - start ))

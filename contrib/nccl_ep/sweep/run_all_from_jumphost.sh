@@ -19,6 +19,10 @@
 #     TIME_LIMIT     default 02:00:00
 #     OUT_ROOT       default $HOME/fizhang/nccl-sweep-<ts>
 #     NCCL_REPO      default $HOME/fizhang/nccl
+#     EXTRA_BENCH_ARGS  default ""
+#                       Extra args passed through to every ep_bench call;
+#                       e.g. EXTRA_BENCH_ARGS="--validate" for Phase-0
+#                       correctness checks (pairs with [NV72-ADAPT] logs).
 #
 # Each EP_SIZE N is mapped to a topology:
 #     4 -> -N1 (single bay, 4 GPU)
@@ -34,6 +38,7 @@ MODES="${MODES:-ll ht_bf16 ht_fp8}"
 PARTITION="${PARTITION:-gb300}"
 TIME_LIMIT="${TIME_LIMIT:-02:00:00}"
 NCCL_REPO="${NCCL_REPO:-$HOME/fizhang/nccl}"
+EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_ROOT="${OUT_ROOT:-$HOME/fizhang/nccl-sweep-${TS}}"
 AGG_CSV="$OUT_ROOT/all_results.csv"
@@ -60,6 +65,7 @@ echo "  partition  : $PARTITION"
 echo "  time limit : $TIME_LIMIT"
 echo "  out_root   : $OUT_ROOT"
 echo "  master csv : $MASTER_CSV"
+echo "  extra args : ${EXTRA_BENCH_ARGS:-<none>}"
 echo "==========================================================="
 
 for sh in "$SWEEP_SH" "$PARSE_PY" "$MERGE_PY"; do
@@ -101,6 +107,7 @@ run_one_size() {
               export CUDA_HOME=\"${CUDA_HOME:-/usr/local/cuda}\"
               EP_SIZE=${ep} TOKENS='${TOKENS}' MODES='${MODES}' \
                   LOG_DIR='${outdir}' CSV_FILE='${csv}' \
+                  EXTRA_BENCH_ARGS='${EXTRA_BENCH_ARGS}' \
                   bash ep_sweep.sh
            "
     rc=$?
