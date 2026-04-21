@@ -3951,15 +3951,15 @@ static __device__ __forceinline__ bool bitmap_range_has_set_bit(
 }
 
 template<int LSA_TEAM_SIZE>
-static __device__ __forceinline__ uint32_t bitmap_row_to_rank_mask(
+static __device__ __forceinline__ uint8_t bitmap_row_to_rank_mask(
     const uint8_t* bitmap_row, int num_of_ranks_per_node, int experts_per_rank) {
-  uint32_t rank_mask = 0;
+  uint8_t rank_mask = 0;
   #pragma unroll
   for (int rank = 0; rank < LSA_TEAM_SIZE; rank++) {
     if (rank < num_of_ranks_per_node) {
       const int bit_begin = rank * experts_per_rank;
       if (bitmap_range_has_set_bit(bitmap_row, bit_begin, experts_per_rank)) {
-        rank_mask |= (1u << rank);
+        rank_mask |= static_cast<uint8_t>(1u << rank);
       }
     }
   }
@@ -3977,7 +3977,7 @@ __global__ void scan(const uint8_t* input_routing_map,
                      int32_t* sparse_to_dense_map,
                      bool* rdma_to_attn_map,
                      bool* attn_to_rdma_map,
-                     uint32_t* token_rank_mask,
+                     uint8_t* token_rank_mask,
                      int32_t* num_of_tokens_for_experts,
                      bool* local_expert_routing_map,
                      int32_t* per_expert_token_counts,
@@ -4084,7 +4084,7 @@ __global__ void scan(const uint8_t* input_routing_map,
                                 current_token_id * packed_row_bytes +
                                 node_rank * experts_per_node_packed;
     // Decode bitmap row once into compact per-token rank mask.
-    uint32_t rank_mask = bitmap_row_to_rank_mask<LSA_TEAM_SIZE>(bitmap_row, num_of_ranks_per_node, experts_per_rank);
+    uint8_t rank_mask = bitmap_row_to_rank_mask<LSA_TEAM_SIZE>(bitmap_row, num_of_ranks_per_node, experts_per_rank);
 
     // Accumulate per-rank sums from rank_mask bits.
     #pragma unroll
@@ -4198,7 +4198,7 @@ __global__ void scan(const uint8_t* input_routing_map,
     int current_token_local_rank = (current_token_id % (num_of_tokens_per_rank * num_of_ranks_per_node)) / num_of_tokens_per_rank;
     int current_token_local_id = current_token_id % num_of_tokens_per_rank;
 
-    uint32_t rank_mask = 0;
+    uint8_t rank_mask = 0;
     if(token_out_of_bound == 0){
       rank_mask = token_rank_mask[current_token_id];
     }
@@ -4384,7 +4384,7 @@ public:
                                      int32_t* sparse_to_dense_map,
                                      bool* rdma_to_attn_map,
                                      bool* attn_to_rdma_map,
-                                     uint32_t* token_rank_mask,
+                                     uint8_t* token_rank_mask,
                                      int32_t* num_of_tokens_for_experts,
                                      bool* local_expert_routing_map,
                                      int32_t* per_expert_token_counts,
