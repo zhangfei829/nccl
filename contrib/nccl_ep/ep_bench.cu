@@ -1027,6 +1027,70 @@ ValidationResult validateCombineOutputHT(
         snprintf(buf, sizeof(buf), "HT combine: calc_diff=%.6e (threshold=5e-6)%s",
                  diff, has_nan ? ", NaN detected" : "");
         result.message = buf;
+
+        // [NV72-ADAPT] Diagnostic dump: print actual vs ref for the first few
+        // valid tokens so we can tell whether this is a real combine-kernel bug
+        // or a validation-reference-formula mismatch. Only rank 0 prints to
+        // keep log small; only runs when validation already failed.
+        if (myRank == 0) {
+            // unique_ranks summary
+            int nr_min = 0, nr_max = 0;
+            long long nr_sum = 0;
+            unsigned int nr_cnt = 0;
+            bool first = true;
+            for (unsigned int t = 0; t < num_tokens; t++) {
+                int nr = unique_ranks[t];
+                if (nr > 0) {
+                    if (first) { nr_min = nr_max = nr; first = false; }
+                    else { if (nr < nr_min) nr_min = nr; if (nr > nr_max) nr_max = nr; }
+                    nr_sum += nr;
+                    nr_cnt++;
+                }
+            }
+            fprintf(stderr,
+                    "\n[VALIDATE-DEBUG] HT combine FAILED. nRanks=%d num_tokens=%u "
+                    "hidden=%u top_k=%u myRank=%d rank_val=%g\n"
+                    "[VALIDATE-DEBUG]   unique_ranks: min=%d max=%d avg=%.2f "
+                    "nonzero=%u/%u\n",
+                    nRanks, num_tokens, hidden, top_k, myRank,
+                    (double)original_rank_val,
+                    nr_min, nr_max,
+                    nr_cnt ? (double)nr_sum / (double)nr_cnt : 0.0,
+                    nr_cnt, num_tokens);
+
+            // Show first 3 valid tokens: hidden[0..3] + token_id cols
+            int shown = 0;
+            for (unsigned int t = 0; t < num_tokens && shown < 3; t++) {
+                int nr = unique_ranks[t];
+                if (nr == 0) continue;
+                shown++;
+                double expected_h  = (double)original_rank_val * (double)nr;
+                double expected_hi = (double)(t / 256) * (double)nr;
+                double expected_lo = (double)(t % 256) * (double)nr;
+                double a_h0 = (double)bf16ToFloat(combined_data[t * hidden + 0]);
+                double a_h1 = (double)bf16ToFloat(combined_data[t * hidden + 1]);
+                double a_h2 = (double)bf16ToFloat(combined_data[t * hidden + 2]);
+                double a_h3 = (double)bf16ToFloat(combined_data[t * hidden + 3]);
+                double a_hi = (double)bf16ToFloat(
+                    combined_data[t * hidden + (hidden - TOKEN_ID_COLS)]);
+                double a_lo = (double)bf16ToFloat(
+                    combined_data[t * hidden + (hidden - TOKEN_ID_COLS + 1)]);
+                double ratio_h0 = (expected_h != 0.0) ? a_h0 / expected_h : 0.0;
+                double ratio_hi = (expected_hi != 0.0) ? a_hi / expected_hi : 0.0;
+                double ratio_lo = (expected_lo != 0.0) ? a_lo / expected_lo : 0.0;
+                fprintf(stderr,
+                        "[VALIDATE-DEBUG]   token[%u] unique_ranks=%d:\n"
+                        "[VALIDATE-DEBUG]     hidden[0..3]:  actual={%.4f %.4f %.4f %.4f}  "
+                        "expected=%.4f  ratio[0]=%.4f\n"
+                        "[VALIDATE-DEBUG]     token_id cols: hi actual=%.4f expected=%.4f "
+                        "ratio=%.4f | lo actual=%.4f expected=%.4f ratio=%.4f\n",
+                        t, nr,
+                        a_h0, a_h1, a_h2, a_h3, expected_h, ratio_h0,
+                        a_hi, expected_hi, ratio_hi,
+                        a_lo, expected_lo, ratio_lo);
+            }
+            fflush(stderr);
+        }
     }
 
     delete[] ref;
