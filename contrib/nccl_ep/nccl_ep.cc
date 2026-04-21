@@ -1723,9 +1723,12 @@ struct ncclEpHandle {
             bool* attn_to_rdma_map;
 
             // Per-token per-rank bitmask cache produced during preprocessing.
-            // dtype: uint8_t
+            // dtype: uint32_t (was uint8_t; widened so each bit still maps to
+            // one rank for LSA_TEAM_SIZE up to 32; EP16/EP32 HT combine was
+            // silently dropping rank>=8 with uint8_t, see 1bfa83d for the
+            // [VALIDATE-DEBUG] evidence).
             // layout: [num_nodes * max_tokens_per_rank * ranks_per_node]
-            uint8_t* token_rank_mask;
+            uint32_t* token_rank_mask;
 
              // Local expert routing map: per-expert routing for tokens in this rank's buffer.
              // Used by subsequent expert MLP layers to route tokens to correct experts.
@@ -1951,7 +1954,7 @@ ncclResult_t ncclEpCreateHandle(
             size_t zero_region  = sz_routing + sz_r2a + sz_a2r + sz_ler + sz_ntfe;
 
             size_t sz_s2d       = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(int32_t));
-            size_t sz_rank_mask = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(uint8_t));
+            size_t sz_rank_mask = align256(static_cast<size_t>(nNodes) * max_tokens * n_ranks_per_node * sizeof(uint32_t));
 
             size_t sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(n_ranks_per_node));
             size_t sz_prob      = !is_internode_available(ep_group) ? align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
@@ -1985,7 +1988,7 @@ ncclResult_t ncclEpCreateHandle(
             handle->hybridep.sparse_to_dense_map = reinterpret_cast<int32_t*>(ptr + offset);
             offset += sz_s2d;
 
-            handle->hybridep.token_rank_mask = reinterpret_cast<uint8_t*>(ptr + offset);
+            handle->hybridep.token_rank_mask = reinterpret_cast<uint32_t*>(ptr + offset);
             offset += sz_rank_mask;
 
             handle->hybridep.preprocessing_scan_tmp = reinterpret_cast<void*>(ptr + offset);
