@@ -22,6 +22,7 @@ alwaysApply: true
 | "EP 当前只能跑 ≤ 8，因为 `rank_mask` 是 `uint8_t`" | 只看代码类型没看实测数据，与用户实测 EP16 跑通的事实矛盾 | 先 grep master CSV 里是否有 `ranks=16` 的行，再下结论 |
 | "EP32 没跑过也没合入" | 只翻了最近 1 个 transcript，漏看用户后续会话 | 翻完所有 `agent-transcripts/*.jsonl` + `awk -F, '$3==32' nccl_ep_master.csv` |
 | "mnnvl_full_coverage 路径还没验证" | 只看 `init_hybridep_intranode_fabric` 代码没看 EP16 实测 | 看 log 里 `rdma_*=0` 已经是路径生效的直接证据 |
+| "`uint8_t → uint32_t` 改动导致 cicc 卡 16 分钟是病态展开"（commit 75d5443 → 错误 revert ce96785 → 不得不 Reapply f8b0c6d，让用户白跑一次 23 分钟对照编译）| 只看到 cicc etime 达到 13+ 分钟就下结论"太慢肯定异常"，而没有"正常编译应该多久"的基线数据 | 当用户报告"编译慢"时，先测一次 revert 后的 baseline（或直接承认 "我没有正常编译时长的数据"），不要在没有对照 baseline 的前提下下"异常"结论。`hybridep_adapter.cu` 单文件实测 `real 23m37s`，这是真实基线。|
 | 把 `salloc` / `srun --pty` 和 `cd / git pull / make / export` 放进**同一个粘贴块** | 交互命令会启动新 shell，后续命令只是 stdin 文本，不会被执行（用户要手动再粘一次）| 见下一节"Slurm 命令生成规则" |
 
 ## Slurm 命令生成规则（必须遵守）
