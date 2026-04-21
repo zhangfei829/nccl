@@ -328,6 +328,23 @@ void call_metadata_preprocessing(
             per_expert_token_counts, 0, experts_per_rank * sizeof(int32_t), stream));
     }
 
+    // [NV72-ADAPT] Phase 0: confirm which scan kernel specialization is reached, and
+    // whether the current (nodes, ranks_per_node) combo fits the <=32 warp-scan limit.
+    // Printed at most once per process from (node_rank=0, local_rank=0).
+    if (node_rank == 0 && local_rank == 0) {
+        static int s_nv72_adapt_scan_printed = 0;
+        if (s_nv72_adapt_scan_printed == 0) {
+            s_nv72_adapt_scan_printed = 1;
+            fprintf(stderr,
+                    "[NV72-ADAPT] scan: LSA_TEAM_SIZE=%d NUM_LSA_TEAMS=%d "
+                    "(warp_limit_ok=%s will_assert=%s)\n",
+                    num_ranks_per_node, num_nodes,
+                    num_ranks_per_node <= 32 ? "yes" : "NO",
+                    num_ranks_per_node <= 32 ? "no" : "YES");
+            fflush(stderr);
+        }
+    }
+
     // MNNVL configurations (> 32 GPUs per LSA domain) are not yet supported: the scan
     // kernel uses warp-reduction (LSA_TEAM_SIZE <= 32) and HYBRIDEP_SWITCH_LSA_TEAM_SIZE
     // is only instantiated up to 32. Extend both when adding MNNVL support.

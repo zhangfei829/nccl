@@ -1397,6 +1397,21 @@ ncclResult_t ncclEpCreateGroup(
     ep_group->rdma_rank      = ep_group->rank / lsa_team_size;
     ep_group->rdma_buffer    = nullptr;
 
+    // [NV72-ADAPT] Phase 0 topology log: verify MNNVL full-coverage path and LSA sizing.
+    // Prints once at group-create time from rank 0 so we can tell which HT path is active
+    // (cudaIpc vs fabric-memory) and what LSA_TEAM_SIZE the scan kernel will end up using.
+    if (ep_group->rank == 0) {
+        fprintf(stderr,
+                "[NV72-ADAPT] topology: lsa_team_size=%d nRanks=%d nNodes=%d "
+                "mnnvl_full_coverage=%d -> lsa_rank_count=%d gpus_per_node=%d "
+                "rank_in_node=%d node_id=%d use_fabric_memory=%d\n",
+                lsa_team_size, ep_group->nRanks, ep_group->nNodes,
+                (int)mnnvl_full_coverage, ep_group->lsa_rank_count,
+                ep_group->gpus_per_node, ep_group->rank_in_node, ep_group->node_id,
+                (int)ep_group->ht_buffers.use_fabric_memory);
+        fflush(stderr);
+    }
+
     CUDA_CHECK(cudaSetDevice(ep_group->cuda_device_id));
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, ep_group->cuda_device_id));
@@ -2082,6 +2097,20 @@ ncclResult_t ncclEpCreateHandle(
             } else {
                 per_expert_counts_device = static_cast<int32_t*>(recv_expert_counter->data);
             }
+        }
+
+        // [NV72-ADAPT] Phase 0: log template params about to be instantiated.
+        // The pair (nNodes, n_ranks_per_node) is what HYBRIDEP_SWITCH_NUM_LSA_TEAMS +
+        // HYBRIDEP_SWITCH_LSA_TEAM_SIZE switch on, so this tells us exactly which
+        // template specialization the scan kernel will execute.
+        if (ep_group->rank == 0) {
+            fprintf(stderr,
+                    "[NV72-ADAPT] call_metadata_preprocessing: "
+                    "nNodes=%d n_ranks_per_node=%d experts_per_rank=%d hidden=%d tokens=%d "
+                    "-> LSA_TEAM_SIZE=%d NUM_LSA_TEAMS=%d\n",
+                    nNodes, n_ranks_per_node, experts_per_rank, ep_group->hidden,
+                    handle->num_tokens, n_ranks_per_node, nNodes);
+            fflush(stderr);
         }
 
         nccl_ep::hybridep::call_metadata_preprocessing(
