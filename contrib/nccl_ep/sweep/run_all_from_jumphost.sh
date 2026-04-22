@@ -23,6 +23,13 @@
 #                       Extra args passed through to every ep_bench call;
 #                       e.g. EXTRA_BENCH_ARGS="--validate" for Phase-0
 #                       correctness checks (pairs with [NV72-ADAPT] logs).
+#     NCCL_EP_SKIP_BUILD  default 0
+#                       Set to 1 to skip the auto-build step at start. By
+#                       default the driver checks whether any source under
+#                       contrib/nccl_ep is newer than the ep_bench binary
+#                       and, if so, allocates -N1 to run `make` before any
+#                       per-EP sweep salloc (cursor rule: C++/CUDA commits
+#                       must always be matched with a make).
 #
 # Each EP_SIZE N is mapped to a topology:
 #     4 -> -N1 (single bay, 4 GPU)
@@ -75,6 +82,70 @@ for sh in "$SWEEP_SH" "$PARSE_PY" "$MERGE_PY"; do
         exit 2
     fi
 done
+
+# ---------------------------------------------------------------------------
+# Auto-build: if any source under contrib/nccl_ep/ is newer than the ep_bench
+# binary (or the binary is missing), trigger a small salloc -N1 to rebuild
+# before the per-EP sweeps. Keeps the invariant from the cursor rule that
+# C++/CUDA commits must always be matched with a `make` before running.
+# Skip with NCCL_EP_SKIP_BUILD=1 if you know the binary is already current.
+# ---------------------------------------------------------------------------
+_autobuild_nccl_ep() {
+    local build_dir="${NCCL_HOME:-$HOME/fizhang/nccl/build}"
+    local bin="$build_dir/test/nccl_ep/ep_bench"
+
+    if [[ "${NCCL_EP_SKIP_BUILD:-0}" == "1" ]]; then
+        echo "[autobuild] NCCL_EP_SKIP_BUILD=1, skipping make"
+        return 0
+    fi
+
+    local need_build=0
+    if [[ ! -x "$bin" ]]; then
+        echo "[autobuild] ep_bench binary missing, will build"
+        need_build=1
+    else
+        # Any .cu/.cuh/.cc/.h/.hpp or Makefile newer than the binary triggers a build.
+        local newer
+        newer=$(find "$NCCL_REPO/contrib/nccl_ep" \
+                      -type f \( -name '*.cu' -o -name '*.cuh' \
+                               -o -name '*.cc' -o -name '*.h' \
+                               -o -name '*.hpp' -o -name 'Makefile' \) \
+                      -newer "$bin" 2>/dev/null | head -5)
+        if [[ -n "$newer" ]]; then
+            echo "[autobuild] sources newer than $bin:"
+            echo "$newer" | sed 's/^/  /'
+            need_build=1
+        else
+            echo "[autobuild] ep_bench up to date, skipping make"
+        fi
+    fi
+
+    if [[ $need_build -eq 0 ]]; then return 0; fi
+
+    echo "[autobuild] allocating -N1 to run make..."
+    salloc -p "$PARTITION" -N 1 --gres=gpu:4 --cpus-per-gpu=8 --time=00:15:00 \
+      srun --overlap -n 1 bash -lc "
+        set -e
+        cd ${NCCL_REPO}
+        export NCCL_HOME='${build_dir}'
+        export CUDA_HOME=\"\${CUDA_HOME:-/usr/local/cuda}\"
+        export NVCC_GENCODE=\"\${NVCC_GENCODE:--gencode=arch=compute_103,code=sm_103}\"
+        export MPI_HOME=\"\$(dirname \$(dirname \$(readlink -f \$(which mpirun))))\"
+        export LD_LIBRARY_PATH=\"\${CUDA_HOME}/lib64:\${CUDA_HOME}/extras/CUPTI/lib64:\${NCCL_HOME}/lib:\${LD_LIBRARY_PATH:-}\"
+        echo '[autobuild] building on '\$(hostname)
+        time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=\"\${NCCL_HOME}\" \
+                  NVCC_GENCODE=\"\${NVCC_GENCODE}\" MPI_HOME=\"\${MPI_HOME}\"
+        ls -l \"\${NCCL_HOME}/lib/libnccl_ep.so\" \"\${NCCL_HOME}/test/nccl_ep/ep_bench\"
+      "
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "[autobuild] FAILED rc=$rc" >&2
+        exit 3
+    fi
+    echo "[autobuild] done"
+}
+
+_autobuild_nccl_ep
 
 run_one_size() {
     local ep="$1"
