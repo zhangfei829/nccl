@@ -15,7 +15,12 @@
 #     TOKENS           Space-separated list of per-rank token counts
 #                      Default: "16 32 64 128 256 4096 8192"
 #     MODES            Which (algorithm,dtype) combos to run.
-#                      Valid tokens in MODES: ll ht_bf16 ht_fp8
+#                      Valid tokens in MODES:
+#                        ll / ht_bf16 / ht_fp8          -- production dispatch
+#                        slot_scan / slot_atomic /
+#                        slot_cumsum                    -- Phase 2 Stage 1
+#                                                         slot-alloc microbench;
+#                                                         writes slot_results.csv
 #                      Default: "ll ht_bf16 ht_fp8"
 #     HIDDEN           hidden dim (default 7168)
 #     TOPK             top-k per token (default 8)
@@ -156,12 +161,46 @@ mode_to_algo_args() {
             ALGO="ht"; WARMUP="$WARMUP_HT"; ITERS="$ITERS_HT"
             EXTRA_ARGS="--use-fp8"; DTYPE_TAG="fp8"
             ;;
+        slot_scan|slot_atomic|slot_cumsum)
+            # Phase 2 Stage 1 slot-alloc microbench. --algorithm is still
+            # passed but the slot-only code path in ep_bench.cu exits before
+            # looking at it, so "ht" is a harmless placeholder.
+            ALGO="ht"
+            WARMUP="${WARMUP_SLOT:-5}"; ITERS="${ITERS_SLOT:-20}"
+            local algo_suffix="${mode#slot_}"   # scan / atomic / cumsum
+            EXTRA_ARGS="--slot-only --slot-alloc=${algo_suffix}"
+            DTYPE_TAG="${mode}"
+            ;;
         *)
             echo "[ep_sweep] ERROR: unknown mode '$mode'" >&2
             return 1
             ;;
     esac
     return 0
+}
+
+# ep_bench with --slot-only emits a self-contained CSV line starting with
+# "CSV: <algo>,<kernel_us>,<collective_us>,<total_us>,<bytes>". We capture
+# this into a separate slot CSV (ep_parse.py is HT/LL-specific and cannot
+# parse slot-only output).
+emit_slot_csv_row() {
+    local mode="$1" tokens="$2" logf="$3" wall="$4"
+    local slot_csv="$LOG_DIR/slot_results.csv"
+    if [[ ! -f "$slot_csv" ]]; then
+        echo "timestamp,ep_size,tokens,mode,slot_alloc_algo,slot_kernel_us,slot_collective_us,slot_total_us,slot_bytes_collective,wall_s" > "$slot_csv"
+    fi
+    # Skip the header CSV line (the one whose second field is literally "slot_alloc_algo,...")
+    # and take the data row (whose first field after "CSV:" is the algo name).
+    local data
+    data=$(grep -E '^CSV: (scan|atomic|cumsum),' "$logf" | head -1 | sed 's/^CSV: //')
+    if [[ -z "$data" ]]; then
+        echo "[parse-slot] WARN: no CSV line found in $logf" | tee -a "$LOG_DIR/sweep.log"
+        return 1
+    fi
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "${ts},${EP_SIZE},${tokens},${mode},${data},${wall}" >> "$slot_csv"
+    echo "[parse-slot] EP=${EP_SIZE} t=${tokens} mode=${mode}  -> ${data}" | tee -a "$LOG_DIR/sweep.log"
 }
 
 # ------------------------ run loop ------------------------
@@ -191,10 +230,14 @@ for mode in $MODES; do
         wall=$(( $(date +%s) - start ))
         if [[ $rc -eq 0 ]]; then
             echo "OK (${wall}s)" | tee -a "$LOG_DIR/sweep.log"
-            python3 "$EP_PARSE" "$logf" "$CSV_FILE" \
-                    "mode=$mode" "dispatch_dtype_tag=$DTYPE_TAG" \
-                    "ep_size=$EP_SIZE" "wall_s=$wall" \
-                | tee -a "$LOG_DIR/sweep.log"
+            if [[ "$mode" == slot_* ]]; then
+                emit_slot_csv_row "$mode" "$t" "$logf" "$wall"
+            else
+                python3 "$EP_PARSE" "$logf" "$CSV_FILE" \
+                        "mode=$mode" "dispatch_dtype_tag=$DTYPE_TAG" \
+                        "ep_size=$EP_SIZE" "wall_s=$wall" \
+                    | tee -a "$LOG_DIR/sweep.log"
+            fi
             ran=$((ran+1))
         else
             echo "FAIL rc=$rc (${wall}s) -> $logf" | tee -a "$LOG_DIR/sweep.log"

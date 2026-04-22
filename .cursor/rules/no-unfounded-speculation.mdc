@@ -60,6 +60,20 @@ alwaysApply: true
 2. 只给"当前状态能直接粘贴跑到底"的单段命令（不带 salloc）
 3. 不让用户再 `exit` 再 `salloc` 重来 —— 直接利用已有 allocation
 
+## 跑 benchmark / sweep 必须走已验证脚本（硬规则）
+
+**禁止**让用户手搓 `mpirun` + `for` loop + `grep` 的一次性 pipeline 去跑 micro-benchmark。这种 hack 每次都可能出错（mpirun 参数、hostfile 生成、stderr 重定向、grep pattern、quoting 等），让用户扮演调试员。
+
+**正确做法**：
+
+1. 扩展 `contrib/nccl_ep/sweep/ep_sweep.sh` / `run_all_from_jumphost.sh`，把新 benchmark mode 加到 `mode_to_algo_args` 里，并在必要时加 `should_skip` 规则
+2. 让用户直接跑 `EP_SIZES="..." TOKENS="..." MODES="..." bash contrib/nccl_ep/sweep/run_all_from_jumphost.sh`
+3. 新指标的 CSV 解析：若 `ep_parse.py` 已支持的字段就复用；新字段则在 `ep_sweep.sh` 里 inline grep 写到 `slot_results.csv`（或扩展 `ep_parse.py`），不要让用户 grep
+
+### 本会话出现的违反
+
+`c7601e2` 之后让用户手搓 `for t in 128 4096 8192; do mpirun ... | grep ...; done` 跑 slot-only smoke test。输出被某个未知环节吞掉（可能是 mpirun stderr、可能是 grep pattern miss），用户看到空输出，正常怀疑是代码 bug。正确做法是先扩 `ep_sweep.sh` 支持 `MODES=slot_scan/slot_atomic/slot_cumsum`，让 sweep 脚本生成 hostfile、跑 run、抓 CSV，整套已验证过数次（Phase 0 已用它跑了 73/73 PASSED）。
+
 ## 回答前自检 checklist
 
 回答任何"X 是/不是 / 做过/没做过 / 合入/没合入"类问题前，回答里必须能指到：
