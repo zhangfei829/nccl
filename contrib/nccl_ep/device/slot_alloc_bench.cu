@@ -18,13 +18,18 @@
 // Value -1 means (t, k) is masked or does not target that dest.
 
 #include "slot_alloc_bench.cuh"
-#include "hybridep_adapter.cuh"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cub/device/device_scan.cuh>
+
+// NOTE: hybridep_adapter.cuh's convert_topk_to_routing_map lives in
+// libnccl_ep.so but is compiled with -fvisibility=hidden, so the symbol is
+// not exported. Rather than poke visibility on a product library for a
+// benchmark, we keep slot_alloc_bench self-contained and reimplement the
+// same 30-line bitmap kernel locally in an anonymous namespace below.
 
 #define SLOT_BENCH_CUDA_CHECK(expr) do {                                    \
     cudaError_t _e = (expr);                                                \
@@ -141,6 +146,41 @@ static void ensure_scan_state(const SlotAllocParams& p) {
     g_scan.initialized        = true;
 }
 
+// Kernel: local topk_idx -> local bitmap (mirror of
+// nccl_ep::hybridep::convert_topk_to_routing_map_kernel, copied here to avoid
+// depending on a -fvisibility=hidden symbol in libnccl_ep.so).
+// Caller must zero routing_bitmap before launch since we OR into it.
+__global__ void topk_to_bitmap_local_kernel(
+    const int64_t* __restrict__ topk_idx,
+    uint8_t*       __restrict__ routing_bitmap,
+    int tokens,
+    int top_k,
+    int experts_packed)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= tokens) return;
+
+    uint8_t* row = routing_bitmap + static_cast<size_t>(t) * experts_packed;
+    for (int k = 0; k < top_k; k++) {
+        int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
+        if (eid >= 0) {
+            row[eid >> 3] |= static_cast<uint8_t>(1u << (eid & 7));
+        }
+    }
+}
+
+static inline void topk_to_bitmap_local(
+    const int64_t* d_topk_idx,
+    uint8_t* d_bitmap,
+    int tokens, int top_k, int experts_packed,
+    cudaStream_t stream)
+{
+    int block = 256;
+    int grid  = (tokens + block - 1) / block;
+    topk_to_bitmap_local_kernel<<<grid, block, 0, stream>>>(
+        d_topk_idx, d_bitmap, tokens, top_k, experts_packed);
+}
+
 // Kernel: global_bitmap[N, experts_packed] -> routed_T[nRanks][N] bool.
 // routed_T[d][t_g] = 1 if any expert in [d*L, (d+1)*L) is set in bitmap row t_g.
 __global__ void bitmap_to_routed_T_kernel(
@@ -222,12 +262,12 @@ SlotAllocTiming run_scan_based(const SlotAllocParams& p) {
 
     SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_scan.ev_start, p.stream));
 
-    // Step 1: local topk_idx -> bitmap. convert_topk_to_routing_map uses
-    // bitwise OR so the row must be zeroed first (see nccl_ep.cc:2043 note).
+    // Step 1: local topk_idx -> bitmap. topk_to_bitmap_local uses bitwise OR
+    // so the row must be zeroed first (mirror of nccl_ep.cc:2043 pattern).
     SLOT_BENCH_CUDA_CHECK(cudaMemsetAsync(
         g_scan.d_local_bitmap, 0,
         static_cast<size_t>(p.tokens) * experts_packed, p.stream));
-    nccl_ep::hybridep::convert_topk_to_routing_map(
+    topk_to_bitmap_local(
         p.d_topk_idx, g_scan.d_local_bitmap,
         p.tokens, p.top_k, experts_packed, p.stream);
     SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_scan.ev_local_done, p.stream));
