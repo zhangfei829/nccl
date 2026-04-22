@@ -1943,31 +1943,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Phase 2 Stage 1: slot-only microbench shortcut.
-    // This commit lands only the CLI plumbing and stub algorithm entries,
-    // so here we just print the parsed configuration and exit. Follow-up
-    // commits will add the real benchmark loop (NCCL init, fabric buffer
-    // allocation, warmup/iter loop, CSV row emission).
-    if (slot_only) {
-        if (myRank == 0) {
-            printf("=== NCCL EP Slot-Alloc Microbench (Stage 1, commit 1 skeleton) ===\n");
-            printf("  Ranks:           %d\n", nRanks);
-            printf("  Tokens:          %u\n", num_tokens);
-            printf("  Top-k:           %u\n", top_k);
-            printf("  Experts:         %u (local: %u)\n", num_experts, num_experts / nRanks);
-            printf("  Warmup iters:    %d\n", num_warmup);
-            printf("  Benchmark iters: %d\n", num_iters);
-            printf("  Slot algorithm:  %s\n",
-                   nccl_ep::slot_bench::algo_name(slot_alloc_algo));
-            printf("  CSV header:      %s\n",
-                   nccl_ep::slot_bench::timing_csv_header());
-            printf("\n[slot-only] commit 1: benchmark loop not yet implemented; exiting.\n");
-            fflush(stdout);
-        }
-        MPI_Finalize();
-        return 0;
-    }
-
     unsigned int num_local_experts = num_experts / nRanks;
 
     // Calculate local rank based on hostname
@@ -2022,6 +1997,111 @@ int main(int argc, char* argv[]) {
     if (myRank == 0) ncclGetUniqueId(&id);
     MPICHECK(MPI_Bcast(static_cast<void*>(&id), sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
     NCCLCHECK(ncclCommInitRank(&comm, nRanks, id, myRank));
+
+    // ========================================================================
+    // Phase 2 Stage 1: slot-allocation microbench
+    // Runs AFTER ncclCommInitRank (we need the comm for the scan allgather
+    // and for the atomic/cumsum fabric-memory barrier in later commits) but
+    // BEFORE ncclEpCreateGroup (the bench deliberately does not touch
+    // LL/HT code paths; it only compares the three slot-alloc algorithms).
+    // ========================================================================
+    if (slot_only) {
+        if (myRank == 0) {
+            printf("=== NCCL EP Slot-Alloc Microbench (Stage 1) ===\n");
+            printf("  Algorithm:       %s\n",
+                   nccl_ep::slot_bench::algo_name(slot_alloc_algo));
+            printf("  Ranks:           %d\n", nRanks);
+            printf("  Tokens:          %u\n", num_tokens);
+            printf("  Top-k:           %u\n", top_k);
+            printf("  Experts:         %u (local: %u)\n", num_experts, num_local_experts);
+            printf("  Warmup iters:    %d\n", num_warmup);
+            printf("  Benchmark iters: %d\n", num_iters);
+            fflush(stdout);
+        }
+
+        // Inputs: int64 topk_idx (device) + int32 my_slot_at_dest (device).
+        int64_t*  d_topk_idx        = nullptr;
+        int32_t*  d_my_slot_at_dest = nullptr;
+        CUDACHECK(cudaMalloc(&d_topk_idx,
+                             static_cast<size_t>(num_tokens) * top_k * sizeof(int64_t)));
+        CUDACHECK(cudaMalloc(&d_my_slot_at_dest,
+                             static_cast<size_t>(num_tokens) * top_k * sizeof(int32_t)));
+
+        // HT-style uniform random topk_idx stresses all dest ranks roughly
+        // equally, which is what we want for a slot-alloc algorithm bench.
+        int64_t* topk_idx_host = new int64_t[static_cast<size_t>(num_tokens) * top_k];
+        generateTopkIndicesHT(topk_idx_host, num_tokens, num_experts, top_k, myRank);
+        CUDACHECK(cudaMemcpy(d_topk_idx, topk_idx_host,
+                             static_cast<size_t>(num_tokens) * top_k * sizeof(int64_t),
+                             cudaMemcpyHostToDevice));
+
+        nccl_ep::slot_bench::SlotAllocParams params{};
+        params.d_topk_idx        = d_topk_idx;
+        params.d_my_slot_at_dest = d_my_slot_at_dest;
+        params.tokens            = static_cast<int>(num_tokens);
+        params.top_k             = static_cast<int>(top_k);
+        params.num_experts       = static_cast<int>(num_experts);
+        params.num_local_experts = static_cast<int>(num_local_experts);
+        params.nRanks            = nRanks;
+        params.myRank            = myRank;
+        // fabric buffers unused by scan; atomic/cumsum in commits 3/4 will
+        // require a preallocated SlotAllocFabricBuffers block here.
+        params.comm              = comm;
+        params.stream            = stream;
+
+        // Warmup
+        for (int i = 0; i < num_warmup; i++) {
+            (void)nccl_ep::slot_bench::run(slot_alloc_algo, params);
+        }
+        CUDACHECK(cudaStreamSynchronize(stream));
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+        // Benchmark
+        float  sum_total_us = 0.f, sum_kernel_us = 0.f, sum_collective_us = 0.f;
+        float  min_total_us = 1e12f, max_total_us = 0.f;
+        size_t last_bytes_collective = 0;
+        for (int i = 0; i < num_iters; i++) {
+            nccl_ep::slot_bench::SlotAllocTiming t =
+                nccl_ep::slot_bench::run(slot_alloc_algo, params);
+            sum_total_us      += t.total_us;
+            sum_kernel_us     += t.kernel_us;
+            sum_collective_us += t.collective_us;
+            if (t.total_us < min_total_us) min_total_us = t.total_us;
+            if (t.total_us > max_total_us) max_total_us = t.total_us;
+            last_bytes_collective = t.bytes_collective;
+        }
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+        if (myRank == 0) {
+            const int iters = num_iters > 0 ? num_iters : 1;
+            float avg_total_us      = sum_total_us      / iters;
+            float avg_kernel_us     = sum_kernel_us     / iters;
+            float avg_collective_us = sum_collective_us / iters;
+            printf("\n=== Slot-Alloc Summary (algo=%s, EP=%d, tokens=%u, top_k=%u) ===\n",
+                   nccl_ep::slot_bench::algo_name(slot_alloc_algo),
+                   nRanks, num_tokens, top_k);
+            printf("  kernel_us     : avg=%.3f\n", avg_kernel_us);
+            printf("  collective_us : avg=%.3f  (bytes_recv=%zu)\n",
+                   avg_collective_us, last_bytes_collective);
+            printf("  total_us      : avg=%.3f  min=%.3f  max=%.3f\n",
+                   avg_total_us, min_total_us, max_total_us);
+            // CSV row matching timing_csv_header().
+            printf("CSV: %s\n", nccl_ep::slot_bench::timing_csv_header());
+            printf("CSV: %s,%.4f,%.4f,%.4f,%zu\n",
+                   nccl_ep::slot_bench::algo_name(slot_alloc_algo),
+                   avg_kernel_us, avg_collective_us, avg_total_us,
+                   last_bytes_collective);
+            fflush(stdout);
+        }
+
+        delete[] topk_idx_host;
+        CUDACHECK(cudaFree(d_topk_idx));
+        CUDACHECK(cudaFree(d_my_slot_at_dest));
+        NCCLCHECK(ncclCommDestroy(comm));
+        CUDACHECK(cudaStreamDestroy(stream));
+        MPI_Finalize();
+        return 0;
+    }
 
     // Create EP group
     if (myRank == 0) { printf("[DEBUG] Creating EP group...\n"); fflush(stdout); }
