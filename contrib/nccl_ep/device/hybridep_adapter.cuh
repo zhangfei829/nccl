@@ -118,8 +118,14 @@ void dense_to_sparse_prob_combine(
 
 
 
-// Switch on LSA team size (multiples of 4, up to 32).
+// Switch on LSA team size (power-of-2 sizes, up to 32).
 // Instantiates templates with LSA_TEAM_SIZE, sizing register-file arrays exactly.
+// Only 4/8/16/32 are instantiated because all observed NCCL deployments have
+// lsa_team_size in {nRanks_in_2^k, gpus_per_node=4}; non-power-of-2 sizes
+// (12/20/24/28) have never been seen in practice and instantiating them only
+// doubles compile time of hybridep_adapter.cu. Re-add the missing cases if a
+// future NCCL topology actually returns one of those values.
+//
 // MNNVL configurations (NVL72, LSA_TEAM_SIZE > 32) are not yet supported:
 // the scan kernel in metadata_preprocessing uses warp-reduction and requires
 // LSA_TEAM_SIZE <= 32. Extend this macro (and the scan kernel) when adding MNNVL support.
@@ -127,28 +133,25 @@ void dense_to_sparse_prob_combine(
     do { switch (lsa_val) { \
         case  4: { constexpr int LSA_TEAM_SIZE =  4; __VA_ARGS__; } break; \
         case  8: { constexpr int LSA_TEAM_SIZE =  8; __VA_ARGS__; } break; \
-        case 12: { constexpr int LSA_TEAM_SIZE = 12; __VA_ARGS__; } break; \
         case 16: { constexpr int LSA_TEAM_SIZE = 16; __VA_ARGS__; } break; \
-        case 20: { constexpr int LSA_TEAM_SIZE = 20; __VA_ARGS__; } break; \
-        case 24: { constexpr int LSA_TEAM_SIZE = 24; __VA_ARGS__; } break; \
-        case 28: { constexpr int LSA_TEAM_SIZE = 28; __VA_ARGS__; } break; \
         case 32: { constexpr int LSA_TEAM_SIZE = 32; __VA_ARGS__; } break; \
-        default: assert(false && "Unsupported LSA team size (must be multiple of 4, max 32)"); \
+        default: assert(false && "Unsupported LSA team size (power-of-2 in {4,8,16,32}; see HYBRIDEP_SWITCH_LSA_TEAM_SIZE comment)"); \
     } } while(0)
 
 // Switch on number of LSA domains (RDMA peers = nRanks / lsa_team_size).
 // Each LSA domain is one NVLink/MNNVL clique; domains communicate via RDMA.
+// Only power-of-2 domain counts are instantiated because typical cluster
+// allocations (nNodes * 4 GPU/node or mnnvl_full_coverage single domain)
+// always yield a power of 2. See LSA_TEAM_SIZE comment above for rationale.
 #define HYBRIDEP_SWITCH_NUM_LSA_TEAMS(num_lsa_domains_val, ...) \
     do { \
         switch (num_lsa_domains_val) { \
             case 1:  { constexpr int NUM_LSA_TEAMS = 1;  __VA_ARGS__; } break; \
             case 2:  { constexpr int NUM_LSA_TEAMS = 2;  __VA_ARGS__; } break; \
-            case 3:  { constexpr int NUM_LSA_TEAMS = 3;  __VA_ARGS__; } break; \
             case 4:  { constexpr int NUM_LSA_TEAMS = 4;  __VA_ARGS__; } break; \
             case 8:  { constexpr int NUM_LSA_TEAMS = 8;  __VA_ARGS__; } break; \
             default: \
-                assert(false && "Unsupported LSA domain count for HT (max=" \
-                       "NUM_MAX_RDMA_PEERS)"); \
+                assert(false && "Unsupported LSA domain count (power-of-2 in {1,2,4,8}; see HYBRIDEP_SWITCH_NUM_LSA_TEAMS comment)"); \
         } \
     } while(0)
 
