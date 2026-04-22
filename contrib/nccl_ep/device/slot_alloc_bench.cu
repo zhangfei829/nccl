@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cub/device/device_scan.cuh>
