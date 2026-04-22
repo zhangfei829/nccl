@@ -32,6 +32,7 @@ try:
     HAVE_NCCL_EP = True
     NCCL_EP_ALGO_LOW_LATENCY = ncclEpAlgorithm_t.NCCL_EP_ALGO_LOW_LATENCY
     NCCL_EP_ALGO_HIGH_THROUGHPUT = ncclEpAlgorithm_t.NCCL_EP_ALGO_HIGH_THROUGHPUT
+    NCCL_EP_ALGO_FULLMESH = ncclEpAlgorithm_t.NCCL_EP_ALGO_FULLMESH
 
 except ImportError as e:
     HAVE_NCCL_EP = False
@@ -39,6 +40,7 @@ except ImportError as e:
     _import_error = str(e)
     NCCL_EP_ALGO_LOW_LATENCY = 0
     NCCL_EP_ALGO_HIGH_THROUGHPUT = 1
+    NCCL_EP_ALGO_FULLMESH = 2
 
 __all__ = [
     '__version__',
@@ -59,6 +61,7 @@ __all__ = [
     'CUDA_ERROR_MEMORY_ALLOCATION',
     'NCCL_EP_ALGO_LOW_LATENCY',
     'NCCL_EP_ALGO_HIGH_THROUGHPUT',
+    'NCCL_EP_ALGO_FULLMESH',
 ]
 
 if not HAVE_NCCL_EP:

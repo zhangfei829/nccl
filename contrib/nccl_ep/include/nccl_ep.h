@@ -46,7 +46,13 @@ typedef enum {
     // Low-Latency (LL) mode
     NCCL_EP_ALGO_LOW_LATENCY = 0,
     // High-Throughput (HT) mode
-    NCCL_EP_ALGO_HIGH_THROUGHPUT = 1
+    NCCL_EP_ALGO_HIGH_THROUGHPUT = 1,
+    // Full-Mesh direct peer-store mode (NV72 MNNVL fabric).
+    // Requires lsa_team_size == nRanks (every rank reachable via fabric memory).
+    // Slot allocation uses per-(src,dest) atomicAdd on peer-mapped counters;
+    // payload is pushed directly into the destination rank's receive buffer
+    // via CUmemFabricHandle peer mapping. No RDMA, no hierarchical reduction.
+    NCCL_EP_ALGO_FULLMESH = 2
 } ncclEpAlgorithm_t;
 
 // Auto configuration constant for dynamic/automatic sizing

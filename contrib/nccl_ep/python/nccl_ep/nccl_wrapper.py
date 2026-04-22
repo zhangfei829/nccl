@@ -107,6 +107,9 @@ class ncclEpTensorTag_t:
 class ncclEpAlgorithm_t:
     NCCL_EP_ALGO_LOW_LATENCY = 0
     NCCL_EP_ALGO_HIGH_THROUGHPUT = 1
+    # Full-mesh direct peer-store (NV72 MNNVL fabric), Phase 2. Requires every
+    # rank reachable via CUmemFabricHandle peer mapping (lsa_team_size == nRanks).
+    NCCL_EP_ALGO_FULLMESH = 2
 
 
 # ncclNDTensor_t is an opaque pointer type

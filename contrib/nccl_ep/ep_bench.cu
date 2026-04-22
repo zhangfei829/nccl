@@ -1755,6 +1755,23 @@ void generateRandomTopkIndicesLL(
     }
 }
 
+// Helper: true for algorithms that share HT-style tensor layout / bytes accounting
+// in this benchmark (HT itself and, in Phase 2, FULLMESH which is Commit-1 stubbed
+// at the library layer but reuses the HT tensor setup and uniform topk_idx for
+// the CLI glue so we can run ./ep_bench --algorithm fullmesh end-to-end).
+static inline bool is_ht_like_algo(ncclEpAlgorithm_t a) {
+    return a == NCCL_EP_ALGO_HIGH_THROUGHPUT || a == NCCL_EP_ALGO_FULLMESH;
+}
+
+static inline const char* algo_name_str(ncclEpAlgorithm_t a) {
+    switch (a) {
+        case NCCL_EP_ALGO_LOW_LATENCY:     return "LOW_LATENCY";
+        case NCCL_EP_ALGO_HIGH_THROUGHPUT: return "HIGH_THROUGHPUT";
+        case NCCL_EP_ALGO_FULLMESH:        return "FULLMESH";
+        default:                           return "UNKNOWN";
+    }
+}
+
 void printUsage(const char* programName, int myRank) {
     if (myRank == 0) {
         printf("Usage: %s [OPTIONS]\n", programName);
@@ -1763,7 +1780,8 @@ void printUsage(const char* programName, int myRank) {
         printf("  --algorithm <mode>      Algorithm mode (default: ll)\n");
         printf("                          ll or low-latency:  Low latency mode\n");
         printf("                          ht or high-throughput:  High throughput mode\n");
-        printf("  --tokens <num>          Number of tokens (default: LL=128, HT=4096)\n");
+        printf("                          fullmesh or full-mesh: NV72 MNNVL direct peer-store (Phase 2, stub in commit 1)\n");
+        printf("  --tokens <num>          Number of tokens (default: LL=128, HT/FULLMESH=4096)\n");
         printf("  --hidden <num>          Hidden dimension (default: 7168)\n");
         printf("  --top-k <num>           Top-k experts per token (default: 8)\n");
         printf("  --experts <num>         Total number of experts (default: 256)\n");
@@ -1845,9 +1863,11 @@ int main(int argc, char* argv[]) {
                     algorithm = NCCL_EP_ALGO_LOW_LATENCY;
                 } else if (strcmp(optarg, "ht") == 0 || strcmp(optarg, "high-throughput") == 0) {
                     algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+                } else if (strcmp(optarg, "fullmesh") == 0 || strcmp(optarg, "full-mesh") == 0) {
+                    algorithm = NCCL_EP_ALGO_FULLMESH;
                 } else {
                     if (myRank == 0) {
-                        printf("Error: Invalid algorithm '%s'. Use 'll', 'low-latency', 'ht', or 'high-throughput'\n", optarg);
+                        printf("Error: Invalid algorithm '%s'. Use 'll', 'low-latency', 'ht', 'high-throughput', 'fullmesh', or 'full-mesh'\n", optarg);
                     }
                     MPI_Finalize();
                     return 1;
@@ -1917,7 +1937,7 @@ int main(int argc, char* argv[]) {
 
     // Set algorithm-specific default for num_tokens if not explicitly provided
     if (num_tokens == 0) {
-        num_tokens = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? 4096 : 128;
+        num_tokens = is_ht_like_algo(algorithm) ? 4096 : 128;
     }
 
     // Validate parameters
@@ -1931,13 +1951,31 @@ int main(int argc, char* argv[]) {
 
     // --dynamic-tokens (NCCL_EP_AUTO for max_tokens_per_rank) is intended for HT mode only.
     // Not yet supported in the current release; code paths are kept for future use.
+    // FULLMESH Phase 2 Commit 1 also rejects dynamic tokens explicitly so the Commit-1
+    // stub + static nRanks*max_tokens upper-bound path is the only one exercised.
     if (dynamic_tokens) {
         if (myRank == 0) {
-            if (algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT)
-                printf("Error: --dynamic-tokens is only applicable to HT mode (--algorithm ht)\n");
-            else
+            if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
                 printf("Error: --dynamic-tokens (NCCL_EP_AUTO for max_tokens_per_rank) is not yet supported.\n"
                        "       This feature will be available in a future release for HT mode.\n");
+            } else if (algorithm == NCCL_EP_ALGO_FULLMESH) {
+                printf("Error: --dynamic-tokens is not supported for FULLMESH in Phase 2 Commit 1.\n"
+                       "       FULLMESH uses static nRanks*max_tokens_per_rank recv-buffer sizing.\n");
+            } else {
+                printf("Error: --dynamic-tokens is only applicable to HT/FULLMESH modes\n");
+            }
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    // FULLMESH Commit 1 is a library-layer stub: dispatch/combine are no-ops, so
+    // --validate has nothing meaningful to check. Refuse it loudly instead of
+    // producing a spurious "PASSED" (no mutation == identical to the init buffer).
+    if (validate_data && algorithm == NCCL_EP_ALGO_FULLMESH) {
+        if (myRank == 0) {
+            printf("Error: --validate is not yet supported for FULLMESH (commit-1 stub is a no-op).\n"
+                   "       Re-run without --validate; validation will arrive with commit-4/5 kernels.\n");
         }
         MPI_Finalize();
         return 1;
@@ -1958,7 +1996,7 @@ int main(int argc, char* argv[]) {
 
     // Print configuration
     if (myRank == 0) {
-        const char* algo_name = (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT";
+        const char* algo_name = algo_name_str(algorithm);
         printf("=== NCCL EP Performance Benchmark ===\n");
         printf("Configuration:\n");
         printf("  Algorithm:       %s\n", algo_name);
@@ -2137,7 +2175,7 @@ int main(int argc, char* argv[]) {
     config.num_channels = NCCL_EP_AUTO;
 
     printf("Rank %d: Testing ncclEpCreateGroup with algorithm: %s\n", myRank,
-           (algorithm == NCCL_EP_ALGO_LOW_LATENCY) ? "LOW_LATENCY" : "HIGH_THROUGHPUT");
+           algo_name_str(algorithm));
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     double group_create_start = MPI_Wtime();
     NCCLCHECK(ncclEpCreateGroup(&ep_group, comm, &config, stream, cudaAllocCallback, cudaFreeCallback));
@@ -2159,10 +2197,11 @@ int main(int argc, char* argv[]) {
     // LL: abs(randn)+1 scores + topk + -1 masking, consistent with DeepEP (test_low_latency.py)
     int64_t *topk_idx_host = new int64_t[num_tokens * top_k];
 
-    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+    if (is_ht_like_algo(algorithm)) {
         generateTopkIndicesHT(topk_idx_host, num_tokens, num_experts, top_k, myRank);
         if (myRank == 0) {
-            printf("Using randperm topk_idx for HT mode (uniform distribution)\n\n");
+            printf("Using randperm topk_idx for %s mode (uniform distribution)\n\n",
+                   algo_name_str(algorithm));
         }
     } else {
         generateRandomTopkIndicesLL(topk_idx_host, num_tokens, num_experts, top_k, myRank);
@@ -2235,15 +2274,20 @@ int main(int argc, char* argv[]) {
     }
     assert(num_recv_tokens);
 
-    // HT recv bytes are pre-computed in calculateHighThroughputBytes via routing simulation
-    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && myRank == 0) {
-        printf("[DEBUG] HT bytes: send=%u tokens, rdma_send=%u, total_recv=%u tokens, rdma_recv=%u (buffer=%u)\n",
+    // HT-style (HT + FULLMESH) recv bytes are pre-computed via routing simulation.
+    // FULLMESH Commit 1 reuses the HT formula as a placeholder; the true FULLMESH
+    // send/recv accounting arrives with the real dispatch kernel in commit 4.
+    if (is_ht_like_algo(algorithm) && myRank == 0) {
+        printf("[DEBUG] HT-like bytes (%s): send=%u tokens, rdma_send=%u, total_recv=%u tokens, rdma_recv=%u (buffer=%u)\n",
+               algo_name_str(algorithm),
                ht_bytes.total_send_tokens, ht_bytes.rdma_send_tokens,
                ht_bytes.total_recv_tokens, ht_bytes.rdma_recv_tokens, num_recv_tokens);
         fflush(stdout);
     }
 
-    // Setup benchmark tensors based on algorithm mode
+    // Setup benchmark tensors based on algorithm mode. FULLMESH reuses the HT
+    // tensor layout in commit 1; the library stub ignores them but allocating
+    // keeps the CLI path identical for side-by-side HT/FULLMESH sweeps.
     BenchmarkTensors tensors = {};
 
     if (myRank == 0) { printf("[DEBUG] Setting up tensors...\n"); fflush(stdout); }
@@ -2256,7 +2300,9 @@ int main(int argc, char* argv[]) {
     }
     if (myRank == 0) { printf("[DEBUG] Tensors set up\n"); fflush(stdout); }
 
-    // Initialize validation data if enabled (fills tensors with rank-based patterns)
+    // Initialize validation data if enabled (fills tensors with rank-based patterns).
+    // FULLMESH with --validate was already rejected above, so reaching here implies
+    // algorithm is LL or HT; the is_ht flag toggles HT-specific init patterns.
     if (validate_data) {
         if (myRank == 0) { printf("[DEBUG] Initializing validation data...\n"); fflush(stdout); }
         initializeValidationData(tensors, num_tokens, hidden, top_k, myRank,
@@ -2271,14 +2317,17 @@ int main(int argc, char* argv[]) {
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     CUDACHECK(cudaStreamSynchronize(stream));
 
-    // Calculate data sizes for bandwidth calculation based on algorithm mode
+    // Calculate data sizes for bandwidth calculation based on algorithm mode.
+    // FULLMESH reuses the HT byte formula in commit 1; commit 6 will replace it
+    // with the FULLMESH-specific send=hidden+meta*nRanks*topk recv=hidden*nRanks*max_tokens
+    // formula once the real dispatch kernel is landed.
     size_t dispatch_data_bytes, combine_data_bytes;
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         // LL mode: FP8 for dispatch, BF16 for combine
         dispatch_data_bytes = ll_bytes.dispatch_bytes;
         combine_data_bytes = ll_bytes.combine_bytes;
     } else {
-        // HT mode: RDMA_send + total_recv (matches DeepEP methodology)
+        // HT / FULLMESH: RDMA_send + total_recv (matches DeepEP methodology)
         dispatch_data_bytes = ht_bytes.rdma_send_bytes + ht_bytes.total_recv_bytes;
         combine_data_bytes = dispatch_data_bytes;  // Symmetric
     }
@@ -2287,19 +2336,21 @@ int main(int argc, char* argv[]) {
     // Always run dispatch and combine paired to ensure correct internal state
     // (matching DeepEP's benchmarking approach)
 
-    // Debug: print tensor setup for HT mode
-    int num_dispatch_local = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? 0 : 1;
-    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && myRank == 0) {
-        printf("HT Dispatch: %d inputs, %d outputs, %d local_tensors\n",
+    // Debug: print tensor setup for HT-like modes (HT and FULLMESH)
+    int num_dispatch_local = is_ht_like_algo(algorithm) ? 0 : 1;
+    if (is_ht_like_algo(algorithm) && myRank == 0) {
+        printf("%s Dispatch: %d inputs, %d outputs, %d local_tensors\n",
+               algo_name_str(algorithm),
                tensors.num_dispatch_inputs, tensors.num_dispatch_outputs, num_dispatch_local);
-        printf("HT Combine: %d inputs, %d outputs, %d local_tensors\n",
+        printf("%s Combine: %d inputs, %d outputs, %d local_tensors\n",
+               algo_name_str(algorithm),
                tensors.num_combine_inputs, tensors.num_combine_outputs, tensors.num_combine_local_tensors);
         fflush(stdout);
     }
     if (myRank == 0) { printf("[DEBUG] Starting benchmark...\n"); fflush(stdout); }
 
-    // HT mode: 0 local tensors, LL mode: 1 local tensor (tokens_per_experts)
-    int num_dispatch_local_tensors = (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) ? 0 : 1;
+    // HT/FULLMESH: 0 local tensors, LL mode: 1 local tensor (tokens_per_experts)
+    int num_dispatch_local_tensors = is_ht_like_algo(algorithm) ? 0 : 1;
 
     auto dispatch_fn = [&]() {
         NCCLCHECK(ncclEpDispatch(ep_handle, tensors.inputs, tensors.num_dispatch_inputs,
@@ -2359,10 +2410,10 @@ int main(int argc, char* argv[]) {
     MPI_Reduce(&dispatch_kernel_us, &global_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&combine_kernel_us,  &global_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    // Aggregate byte counts across ranks (HT only)
+    // Aggregate byte counts across ranks (HT-like: HT and FULLMESH)
     size_t global_total_send = 0, global_rdma_send = 0;
     size_t global_total_recv = 0, global_rdma_recv = 0;
-    if (algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+    if (is_ht_like_algo(algorithm)) {
         MPI_Reduce(&ht_bytes.total_send_bytes, &global_total_send, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&ht_bytes.rdma_send_bytes,  &global_rdma_send,  1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
         MPI_Reduce(&ht_bytes.total_recv_bytes, &global_total_recv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0, MPI_COMM_WORLD);

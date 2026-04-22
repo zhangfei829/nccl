@@ -1300,20 +1300,24 @@ ncclResult_t ncclEpCreateGroup(
     assert(comm != nullptr && ncclCommCount(comm, &nRanks) == ncclSuccess && nRanks > 0);
     assert(in_config->version == 1 && "ncclEpCreateGroup: invalid config version (expected 1)");
     assert((in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY ||
-            in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) &&
-           "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput");
+            in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT ||
+            in_config->algorithm == NCCL_EP_ALGO_FULLMESH) &&
+           "ncclEpCreateGroup: invalid algorithm, supported: low_latency, high_throughput, fullmesh");
 
     bool low_latency_mode = (in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY);
     bool hybridep_mode = (in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
+    bool fullmesh_mode = (in_config->algorithm == NCCL_EP_ALGO_FULLMESH);
     assert(in_config->num_experts > 0 && "ncclEpCreateGroup: num_experts must be greater than 0");
     assert(in_config->token_size_bytes > 0 && "ncclEpCreateGroup: token_size_bytes must be greater than 0");
-    assert(!(in_config->algorithm == NCCL_EP_ALGO_LOW_LATENCY && in_config->max_tokens_per_rank == 0) &&
+    assert(!(low_latency_mode && in_config->max_tokens_per_rank == 0) &&
             "ncclEpCreateGroup: max_tokens_per_rank must be greater than 0 for low latency mode");
-    assert(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && in_config->max_tokens_per_rank == 0) &&
+    assert(!(hybridep_mode && in_config->max_tokens_per_rank == 0) &&
              "ncclEpCreateGroup: max_tokens_per_rank must be set for HT backend");
-    assert(!(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
+    assert(!(hybridep_mode &&
              in_config->max_tokens_per_rank > MAX_SUPPORTED_TOKENS_PER_RANK) &&
              "ncclEpCreateGroup: HT max_tokens_per_rank exceeds build-time MAX_SUPPORTED_TOKENS_PER_RANK");
+    assert(!(fullmesh_mode && in_config->max_tokens_per_rank == 0) &&
+             "ncclEpCreateGroup: max_tokens_per_rank must be set for FULLMESH backend");
     // Query LSA team size: number of ranks reachable via NVLink/LSA from this rank.
     ncclTeam lsa_team = ncclTeamLsa(comm);
     const int lsa_team_size = lsa_team.nRanks;
@@ -1321,6 +1325,14 @@ ncclResult_t ncclEpCreateGroup(
     if (hybridep_mode) {
         assert((nRanks % lsa_team_size) == 0 &&
                "ncclEpCreateGroup: HT requires nRanks divisible by lsa_team_size");
+    }
+    // FULLMESH requires every rank reachable via CUmemFabricHandle peer mapping.
+    // On NV72 / MNNVL this means lsa_team_size == nRanks. Reject multi-LSA topologies
+    // explicitly so we fail fast instead of corrupting peer buffers later.
+    if (fullmesh_mode) {
+        assert(lsa_team_size == nRanks &&
+               "ncclEpCreateGroup: FULLMESH requires lsa_team_size == nRanks "
+               "(NV72 MNNVL full-coverage fabric)");
     }
 
     // Allocate EP group structure
@@ -1374,8 +1386,11 @@ ncclResult_t ncclEpCreateGroup(
     // Normally computed from hostname-based nNodes. When HT is on and the MNNVL
     // LSA domain covers ALL ranks (NVL72 pod intra-cluster), we treat the whole
     // fabric as a single "node" so HT can share buffers directly via NVSwitch
-    // using fabric memory handles instead of falling through to RDMA.
-    bool mnnvl_full_coverage = hybridep_mode && (lsa_team_size == ep_group->nRanks) && (ep_group->nNodes > 1);
+    // using fabric memory handles instead of falling through to RDMA. FULLMESH
+    // is MNNVL-only by assertion above, so it always enters this branch.
+    bool mnnvl_full_coverage = (hybridep_mode || fullmesh_mode) &&
+                               (lsa_team_size == ep_group->nRanks) &&
+                               (ep_group->nNodes > 1 || fullmesh_mode);
     if (mnnvl_full_coverage) {
         ep_group->nNodes         = 1;
         ep_group->gpus_per_node  = ep_group->nRanks;
@@ -1400,12 +1415,17 @@ ncclResult_t ncclEpCreateGroup(
     // [NV72-ADAPT] Phase 0 topology log: verify MNNVL full-coverage path and LSA sizing.
     // Prints once at group-create time from rank 0 so we can tell which HT path is active
     // (cudaIpc vs fabric-memory) and what LSA_TEAM_SIZE the scan kernel will end up using.
+    // Phase 2 extends the log with the algorithm name so FULLMESH traces are
+    // distinguishable from HT in the same codebase.
     if (ep_group->rank == 0) {
+        const char* algo_str = low_latency_mode ? "LL"
+                             : (hybridep_mode    ? "HT"
+                             : (fullmesh_mode    ? "FULLMESH" : "UNKNOWN"));
         fprintf(stderr,
-                "[NV72-ADAPT] topology: lsa_team_size=%d nRanks=%d nNodes=%d "
+                "[NV72-ADAPT] topology: algo=%s lsa_team_size=%d nRanks=%d nNodes=%d "
                 "mnnvl_full_coverage=%d -> lsa_rank_count=%d gpus_per_node=%d "
                 "rank_in_node=%d node_id=%d use_fabric_memory=%d\n",
-                lsa_team_size, ep_group->nRanks, ep_group->nNodes,
+                algo_str, lsa_team_size, ep_group->nRanks, ep_group->nNodes,
                 (int)mnnvl_full_coverage, ep_group->lsa_rank_count,
                 ep_group->gpus_per_node, ep_group->rank_in_node, ep_group->node_id,
                 (int)ep_group->ht_buffers.use_fabric_memory);
@@ -1431,6 +1451,22 @@ ncclResult_t ncclEpCreateGroup(
     if (hybridep_mode) {
         NCCL_CHECK_RESULT(init_hybridep_intranode(ep_group, in_config, stream));
         NCCL_CHECK_RESULT(init_hybridep_internode(ep_group, in_config, stream));
+    }
+
+    // [FULLMESH] Phase 2 commit 1 stub: no resources allocated in this commit.
+    // init_fullmesh_intranode_fabric arrives in commit 2 and will set up the
+    // [nRanks][max_tokens][hidden_bytes] peer recv buffers plus the atomic
+    // counter row via CUmemFabricHandle peer mapping. For now we only log
+    // the entry so the sweep can confirm the CLI + algorithm routing is live.
+    if (fullmesh_mode) {
+        if (ep_group->rank == 0) {
+            fprintf(stderr,
+                    "[FULLMESH] init stub: commit 1 skeleton, no buffers allocated. "
+                    "nRanks=%d max_tokens_per_rank=%u hidden=%d num_experts=%u\n",
+                    ep_group->nRanks, ep_group->config.max_tokens_per_rank,
+                    ep_group->hidden, ep_group->config.num_experts);
+            fflush(stderr);
+        }
     }
 
     if (ep_group->config.rdma_buffer_size > 0 && low_latency_mode) {
@@ -1918,6 +1954,23 @@ ncclResult_t ncclEpCreateHandle(
         handle->ll.layout = nccl_ep::LowLatencyLayout(handle->group->rdma_buffer, handle->group->config.max_tokens_per_rank, handle->group->hidden, handle->group->nRanks, handle->group->config.num_experts);
 
         assert(handle->ll.layout.total_bytes <= handle->group->config.rdma_buffer_size);
+    } else if (ep_group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+        // [FULLMESH] Phase 2 commit 1 stub: zero-preprocess handle.
+        // Real preprocess (counter reset, per-iter topk cache, optional local slot
+        // table for the src-side path) arrives with the dispatch kernel in commit 4.
+        // For now we only record num_tokens/num_topk and leave every union field
+        // at its default so ncclEpHandleDestroy has nothing to free.
+        assert(num_local_tensors == 0 && "FULLMESH commit-1 stub does not accept local tensors");
+        assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) &&
+               "FULLMESH: token count exceeds buffer capacity");
+        if (ep_group->rank == 0) {
+            fprintf(stderr,
+                    "[FULLMESH] ncclEpCreateHandle stub: num_tokens=%d num_topk=%d "
+                    "num_experts=%u nRanks=%d (no preprocessing, commit-1 skeleton)\n",
+                    handle->num_tokens, handle->num_topk,
+                    ep_group->config.num_experts, ep_group->nRanks);
+            fflush(stderr);
+        }
     } else { // HT
         assert(ep_group->config.max_tokens_per_rank > 0 && "HT requires max_tokens_per_rank > 0");
         assert(handle->num_tokens <= static_cast<int>(ep_group->config.max_tokens_per_rank) && "Token count exceeds HT buffer capacity");
@@ -2175,6 +2228,9 @@ ncclResult_t ncclEpHandleDestroy(
             handle->hybridep.preprocessing_block = nullptr;
         }
     }
+    // FULLMESH commit-1 stub allocates nothing in ncclEpCreateHandle, so destroy
+    // is a no-op. Per-handle resources (my_slot_at_dest cache, counter reset
+    // state) arrive with commit 3 and will be cleaned up here.
 
     delete handle;
     return ncclSuccess;
@@ -2311,6 +2367,24 @@ ncclResult_t ncclEpDispatch(
         if (send_only) {
             handle->ll.continue_fn = dispatch_fn;
         }
+    } else if (group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+        // [FULLMESH] Phase 2 commit 1 stub: no kernel launched, no data moved.
+        // The real dispatch kernel (atomicAdd slot allocation on fabric-mapped
+        // counter row + TMA payload push to peer recv buffer) lands in commit 4.
+        // This stub prints a one-shot log per rank so we can confirm the CLI +
+        // algorithm routing + handle create all line up before we touch kernels.
+        assert(num_local_tensors == 0 && "FULLMESH dispatch does not accept local_tensors");
+        static bool logged = false;
+        if (!logged && group->rank == 0) {
+            fprintf(stderr,
+                    "[FULLMESH] ncclEpDispatch stub: send_only=%u num_inputs=%u "
+                    "num_outputs=%u num_tokens=%d num_topk=%d (no-op, commit-1 skeleton)\n",
+                    send_only, num_inputs, num_outputs,
+                    handle->num_tokens, handle->num_topk);
+            fflush(stderr);
+            logged = true;
+        }
+        (void)inputs; (void)outputs; (void)config; (void)stream;
     } else { // HT
 
         bool is_single_node = !is_internode_available(group);
@@ -2693,6 +2767,22 @@ ncclResult_t ncclEpCombine(
         if (send_only) {
                 handle->ll.continue_fn = combine_fn;
             }
+    } else if (handle->group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+        // [FULLMESH] Phase 2 commit 1 stub: no kernel launched, no data moved.
+        // The real combine kernel (dest-initiated push of expert FFN output back
+        // to the src rank using the (src_rank, src_token_id) header embedded in
+        // the dispatch payload, plus ncclBarrier for completion sync) lands in
+        // commit 5. Here we just confirm routing is live.
+        static bool logged_combine = false;
+        if (!logged_combine && handle->group->rank == 0) {
+            fprintf(stderr,
+                    "[FULLMESH] ncclEpCombine stub: send_only=%u num_inputs=%u "
+                    "num_outputs=%u num_local_tensors=%u (no-op, commit-1 skeleton)\n",
+                    send_only, num_inputs, num_outputs, num_local_tensors);
+            fflush(stderr);
+            logged_combine = true;
+        }
+        (void)inputs; (void)outputs; (void)local_tensors; (void)config; (void)stream;
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         // ===== HT mode =====
         // Combine: gather expert outputs back to original token positions
@@ -2880,9 +2970,15 @@ ncclResult_t ncclEpComplete(
         }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         // HT mode - no continue needed (synchronous)
-        }
-        return ncclSuccess;
+    } else if (handle->group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+        // FULLMESH Phase 2 commit 1 stub: dispatch is synchronous (single kernel),
+        // no deferred continue_fn. ncclBarrier (Q1=C) will be added in commit 4
+        // and called directly from ncclEpDispatch/ncclEpCombine for cross-rank
+        // completion sync, not here.
     }
+    (void)config; (void)stream;
+    return ncclSuccess;
+}
 
 ncclResult_t ncclEpHandleGetNumRecvTokens(
         ncclEpHandle_t handle,
@@ -2908,6 +3004,13 @@ ncclResult_t ncclEpHandleGetNumRecvTokens(
         assert(actual_recv_tokens >= 0);
         assert(actual_recv_tokens <= handle->group->max_recv_tokens);
         *num_recv_tokens = static_cast<unsigned int>(actual_recv_tokens);
+    } else if (handle->group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+        // FULLMESH Phase 2 commit 1: dynamic num_recv_tokens is not supported.
+        // Callers compute the static upper bound nRanks * max_tokens_per_rank
+        // directly (same as HT non-dynamic path in ep_bench). Return invalid
+        // usage so accidental dynamic-mode wiring fails fast during phase 2
+        // rollout instead of producing a silently-zero counter.
+        return ncclInvalidUsage;
     } else { // LL
         return ncclInvalidUsage;
     }
