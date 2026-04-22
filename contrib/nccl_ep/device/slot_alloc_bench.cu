@@ -519,10 +519,257 @@ SlotAllocTiming run_atomic_based(const SlotAllocParams& p) {
     return t;
 }
 
+// ============================================================================
+// cumsum-based: two MPI barriers over a direct-write fabric-memory matrix
+// ============================================================================
+//
+// Each rank's fabric block has two int32[nRanks] regions:
+//   offset 0                  count_row [nRanks] -- "src has sent me this many"
+//   offset nRanks * 4         offset_row[nRanks] -- "src should start at this slot"
+//
+// Flow (per iter):
+//   1. local kernel: compute my_send_count[dest] for dest in 0..nRanks-1
+//   2. write kernel: for each dest, direct write peer_bufs[dest][myRank] =
+//      my_send_count[dest]  (fills dest's count_row[myRank] via fabric mapping)
+//   3. MPI_Barrier   (every rank has all its incoming count_row entries written)
+//   4. cumsum kernel on self: read local count_row[*], exclusive prefix ->
+//      write local offset_row[*]
+//   5. MPI_Barrier   (every rank has published its offset_row)
+//   6. compute_slot kernel: for each (t, k), read my_base_at_dest =
+//      peer_bufs[dest][nRanks + myRank], then assign my_slot_at_dest[t, k] =
+//      my_base_at_dest + local_sequence_of_this_send
+//
+// Output slot semantics: "layout 3" - absolute slot in the compact packing
+// where tokens from src ordered before src' come first at every dest.
+
+namespace {
+
+struct CumsumImpl {
+    bool        initialized    = false;
+    int         nRanks_cached  = 0;
+
+    int32_t*    d_send_count   = nullptr;  // [nRanks], my per-dest counts
+    int32_t*    d_local_seq    = nullptr;  // [nRanks], per-dest sequence counter for Step 6
+
+    cudaEvent_t ev_start       = nullptr;
+    cudaEvent_t ev_k1_done     = nullptr;   // after count kernel
+    cudaEvent_t ev_k2_done     = nullptr;   // after write send_count kernel
+    cudaEvent_t ev_after_b1    = nullptr;   // after MPI_Barrier #1
+    cudaEvent_t ev_k3_done     = nullptr;   // after cumsum
+    cudaEvent_t ev_after_b2    = nullptr;   // after MPI_Barrier #2
+    cudaEvent_t ev_k4_done     = nullptr;   // after compute_slot
+};
+
+static CumsumImpl g_cumsum;
+
+static void ensure_cumsum_state(const SlotAllocParams& p) {
+    bool same_shape = g_cumsum.initialized && g_cumsum.nRanks_cached == p.nRanks;
+    if (same_shape) return;
+    if (g_cumsum.initialized) {
+        cudaFree(g_cumsum.d_send_count);
+        cudaFree(g_cumsum.d_local_seq);
+        cudaEventDestroy(g_cumsum.ev_start);
+        cudaEventDestroy(g_cumsum.ev_k1_done);
+        cudaEventDestroy(g_cumsum.ev_k2_done);
+        cudaEventDestroy(g_cumsum.ev_after_b1);
+        cudaEventDestroy(g_cumsum.ev_k3_done);
+        cudaEventDestroy(g_cumsum.ev_after_b2);
+        cudaEventDestroy(g_cumsum.ev_k4_done);
+        g_cumsum = CumsumImpl{};
+    }
+    SLOT_BENCH_CUDA_CHECK(cudaMalloc(&g_cumsum.d_send_count,
+        static_cast<size_t>(p.nRanks) * sizeof(int32_t)));
+    SLOT_BENCH_CUDA_CHECK(cudaMalloc(&g_cumsum.d_local_seq,
+        static_cast<size_t>(p.nRanks) * sizeof(int32_t)));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_start));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_k1_done));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_k2_done));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_after_b1));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_k3_done));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_after_b2));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_cumsum.ev_k4_done));
+    g_cumsum.nRanks_cached = p.nRanks;
+    g_cumsum.initialized   = true;
+}
+
+// Step 1: count local sends per dest
+__global__ void cumsum_count_send_kernel(
+    const int64_t* __restrict__ topk_idx,
+    int32_t*       __restrict__ send_count,
+    int tokens,
+    int top_k,
+    int num_local_experts)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = tokens * top_k;
+    if (gid >= total) return;
+
+    int64_t eid = topk_idx[gid];
+    if (eid < 0) return;
+    int dest = static_cast<int>(eid / static_cast<int64_t>(num_local_experts));
+    atomicAdd(&send_count[dest], 1);
+}
+
+// Step 2: direct write send_count[dest] to dest's count_row[myRank] via fabric
+__global__ void cumsum_write_send_count_kernel(
+    const int32_t* __restrict__ send_count,
+    void* const*   __restrict__ peer_bufs,  // [nRanks] VA of each peer's fabric block
+    int nRanks,
+    int myRank)
+{
+    int dest = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dest >= nRanks) return;
+    int32_t c = send_count[dest];
+    int32_t* dest_count_row = reinterpret_cast<int32_t*>(peer_bufs[dest]);
+    // Layout: count_row starts at offset 0 of the block. Slot [myRank] is mine.
+    dest_count_row[myRank] = c;
+}
+
+// Step 4: exclusive prefix over local count_row -> local offset_row
+__global__ void cumsum_prefix_kernel(
+    void*   local_buf,   // this rank's own fabric block base
+    int     nRanks)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int32_t* count_row  = reinterpret_cast<int32_t*>(local_buf);
+    int32_t* offset_row = count_row + nRanks;
+    int32_t running = 0;
+    for (int s = 0; s < nRanks; s++) {
+        offset_row[s] = running;
+        running += count_row[s];
+    }
+}
+
+// Step 6: compute my_slot_at_dest by reading dest's offset_row[myRank] and
+// bumping a local per-dest counter for within-send sequence.
+__global__ void cumsum_compute_slot_kernel(
+    const int64_t* __restrict__ topk_idx,
+    int32_t*       __restrict__ my_slot_at_dest,
+    int32_t*       __restrict__ local_seq,      // [nRanks], zeroed before launch
+    void* const*   __restrict__ peer_bufs,
+    int tokens,
+    int top_k,
+    int nRanks,
+    int myRank,
+    int num_local_experts)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y;
+    if (t >= tokens || k >= top_k) return;
+
+    int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
+    int32_t slot = -1;
+    if (eid >= 0) {
+        int dest = static_cast<int>(eid / static_cast<int64_t>(num_local_experts));
+        // Read dest's offset_row[myRank] via the peer mapping.
+        int32_t* dest_block     = reinterpret_cast<int32_t*>(peer_bufs[dest]);
+        int32_t  my_base_at_d   = dest_block[nRanks + myRank];
+        int32_t  local_i        = atomicAdd(&local_seq[dest], 1);
+        slot = my_base_at_d + local_i;
+    }
+    my_slot_at_dest[static_cast<size_t>(t) * top_k + k] = slot;
+}
+
+}  // anonymous namespace
+
 SlotAllocTiming run_cumsum_based(const SlotAllocParams& p) {
-    announce_stub_once("cumsum", p.myRank);
-    fill_output_minus_one(p);
-    return {0.f, 0.f, 0.f, 0};
+    ensure_cumsum_state(p);
+
+    if (!p.fabric.initialized || p.fabric.d_peer_bufs_dev == nullptr) {
+        if (p.myRank == 0) {
+            fprintf(stderr,
+                "[slot_bench] cumsum: fabric buffers not initialized\n");
+        }
+        fill_output_minus_one(p);
+        return {0.f, 0.f, 0.f, 0};
+    }
+
+    // Pre-zero per-iter state.
+    SLOT_BENCH_CUDA_CHECK(cudaMemsetAsync(
+        g_cumsum.d_send_count, 0,
+        static_cast<size_t>(p.nRanks) * sizeof(int32_t), p.stream));
+    SLOT_BENCH_CUDA_CHECK(cudaMemsetAsync(
+        g_cumsum.d_local_seq, 0,
+        static_cast<size_t>(p.nRanks) * sizeof(int32_t), p.stream));
+    // Zero this rank's count_row + offset_row (first 2*nRanks*4 bytes) so
+    // stale values from prior iter do not leak.
+    SLOT_BENCH_CUDA_CHECK(cudaMemsetAsync(
+        p.fabric.local_buf, 0,
+        static_cast<size_t>(p.nRanks) * 2 * sizeof(int32_t), p.stream));
+    SLOT_BENCH_CUDA_CHECK(cudaStreamSynchronize(p.stream));
+    SLOT_BENCH_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_start, p.stream));
+
+    // Step 1: local count kernel
+    {
+        int block = 256;
+        int grid  = (p.tokens * p.top_k + block - 1) / block;
+        cumsum_count_send_kernel<<<grid, block, 0, p.stream>>>(
+            p.d_topk_idx, g_cumsum.d_send_count,
+            p.tokens, p.top_k, p.num_local_experts);
+    }
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_k1_done, p.stream));
+
+    // Step 2: direct-write send_count into every dest's count_row[myRank]
+    {
+        int block = 128;
+        int grid  = (p.nRanks + block - 1) / block;
+        cumsum_write_send_count_kernel<<<grid, block, 0, p.stream>>>(
+            g_cumsum.d_send_count, p.fabric.d_peer_bufs_dev,
+            p.nRanks, p.myRank);
+    }
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_k2_done, p.stream));
+
+    // Host barrier #1: wait until every rank finished writing count_row entries
+    SLOT_BENCH_CUDA_CHECK(cudaStreamSynchronize(p.stream));
+    SLOT_BENCH_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_after_b1, p.stream));
+
+    // Step 4: prefix sum my count_row -> my offset_row
+    cumsum_prefix_kernel<<<1, 1, 0, p.stream>>>(
+        p.fabric.local_buf, p.nRanks);
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_k3_done, p.stream));
+
+    // Host barrier #2: wait until every rank has published offset_row
+    SLOT_BENCH_CUDA_CHECK(cudaStreamSynchronize(p.stream));
+    SLOT_BENCH_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_after_b2, p.stream));
+
+    // Step 6: compute my_slot_at_dest
+    {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((p.tokens + block.x - 1) / block.x),
+                  static_cast<unsigned>(p.top_k));
+        cumsum_compute_slot_kernel<<<grid, block, 0, p.stream>>>(
+            p.d_topk_idx, p.d_my_slot_at_dest, g_cumsum.d_local_seq,
+            p.fabric.d_peer_bufs_dev,
+            p.tokens, p.top_k, p.nRanks, p.myRank, p.num_local_experts);
+    }
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_cumsum.ev_k4_done, p.stream));
+    SLOT_BENCH_CUDA_CHECK(cudaEventSynchronize(g_cumsum.ev_k4_done));
+
+    float ms_k1 = 0, ms_k2 = 0, ms_b1 = 0, ms_k3 = 0, ms_b2 = 0, ms_k4 = 0;
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&ms_k1,
+        g_cumsum.ev_start,      g_cumsum.ev_k1_done));
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&ms_k2,
+        g_cumsum.ev_k1_done,    g_cumsum.ev_k2_done));
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&ms_b1,
+        g_cumsum.ev_k2_done,    g_cumsum.ev_after_b1));
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&ms_k3,
+        g_cumsum.ev_after_b1,   g_cumsum.ev_k3_done));
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&ms_b2,
+        g_cumsum.ev_k3_done,    g_cumsum.ev_after_b2));
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&ms_k4,
+        g_cumsum.ev_after_b2,   g_cumsum.ev_k4_done));
+
+    SlotAllocTiming t;
+    t.kernel_us        = (ms_k1 + ms_k2 + ms_k3 + ms_k4) * 1000.0f;
+    t.collective_us    = (ms_b1 + ms_b2) * 1000.0f;   // two MPI_Barriers
+    t.total_us         = t.kernel_us + t.collective_us;
+    // No payload collective; two barriers only sync, no bytes.
+    t.bytes_collective = 0;
+    return t;
 }
 
 SlotAllocTiming run(SlotAllocAlgorithm algo, const SlotAllocParams& p) {
