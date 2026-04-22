@@ -74,6 +74,34 @@ alwaysApply: true
 
 `c7601e2` 之后让用户手搓 `for t in 128 4096 8192; do mpirun ... | grep ...; done` 跑 slot-only smoke test。输出被某个未知环节吞掉（可能是 mpirun stderr、可能是 grep pattern miss），用户看到空输出，正常怀疑是代码 bug。正确做法是先扩 `ep_sweep.sh` 支持 `MODES=slot_scan/slot_atomic/slot_cumsum`，让 sweep 脚本生成 hostfile、跑 run、抓 CSV，整套已验证过数次（Phase 0 已用它跑了 73/73 PASSED）。
 
+## 改 C++/CUDA 后必须先 make 才能跑（硬规则）
+
+NCCL EP 的 sweep 脚本（`ep_sweep.sh` / `run_all_from_jumphost.sh`）**不调 make**，它们只 salloc + `mpirun ep_bench`。所以任何修改 `.cc` / `.cu` / `.cuh` 的 commit 推到远端后，给用户的运行命令**必须在 sweep 之前显式包含一次 `make`**。否则 pod 上 `ep_bench` 二进制仍是上一次编译的版本，新 commit 的代码路径根本没跑，但 sweep 会静默成功并吐出看似合理的数字（对 stub 路径会返回 0；对 kernel 签名未变的修改更隐蔽，输出像是没问题但行为是旧的）。
+
+### 做法
+
+提交 C++ 代码改动后，给用户的命令块**必须**分两步或一把梭：
+
+```bash
+# 1. 编译（salloc -N1 单节点，跑 make 后自动释放）
+salloc -p gb300 -N1 --gres=gpu:4 --cpus-per-gpu=8 --time=00:15:00 \
+  srun --overlap -n 1 bash -c '
+    cd ~/fizhang/nccl && git pull origin master
+    export NCCL_HOME=...; export CUDA_HOME=...; export NVCC_GENCODE=...; export MPI_HOME=...
+    make -j3 -C contrib/nccl_ep MPI=1 ...
+  '
+
+# 2. 再跑 sweep
+cd ~/fizhang/nccl
+EP_SIZES=... MODES=... bash contrib/nccl_ep/sweep/run_all_from_jumphost.sh
+```
+
+长期方案：把 "git pull + conditional make" 合进 `run_all_from_jumphost.sh` 的第一步，source 比 binary 新时自动编译，让用户永远不用记得这件事。本会话后续 commit 必须做这件事，不能只靠每次提醒。
+
+### 本会话出现的违反
+
+commit 3 `196e88e`（加 atomic + fabric helper）之后，让用户直接 `git pull + run_all_from_jumphost.sh`，没提醒先 make。Pod 上 `ep_bench` 仍是 commit 2 的版本，atomic 走的是 stub 路径（`fill_output_minus_one + return {0,0,0,0}`），sweep 会"跑完"并写假数据到 `slot_results.csv`。用户看到输出没编译步骤才发现。正确做法是给命令时**永远**带 make，或者 `run_all_from_jumphost.sh` 自带 build 步骤。
+
 ## 回答前自检 checklist
 
 回答任何"X 是/不是 / 做过/没做过 / 合入/没合入"类问题前，回答里必须能指到：
