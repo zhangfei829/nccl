@@ -28,6 +28,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
+#include "device/slot_alloc_bench.cuh"
 
 
 #define MPICHECK(cmd) do {                          \
@@ -1773,6 +1774,11 @@ void printUsage(const char* programName, int myRank) {
         printf("  --disable-nvlink        Disable NVLink, force RDMA for intranode communication (LL only)\n");
         printf("  --validate              Validate dispatch/combine data correctness\n");
         printf("  --dynamic-tokens        Enable dynamic token allocation (HT only, required for random topk)\n");
+        printf("  --slot-only             Phase 2 Stage 1: skip dispatch/combine, run only slot-alloc microbench\n");
+        printf("  --slot-alloc <algo>     Phase 2 Stage 1 slot-alloc algorithm (default: scan)\n");
+        printf("                          scan   : reuse preprocessing scan kernel\n");
+        printf("                          atomic : dest-side remote atomicAdd on fabric memory\n");
+        printf("                          cumsum : hand-written fabric-memory alltoall + local cumsum\n");
         printf("  --help                  Show this help message\n");
     }
 }
@@ -1794,12 +1800,23 @@ int main(int argc, char* argv[]) {
     bool validate_data = false;  // Validate dispatch/combine correctness
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
 
+    // Phase 2 Stage 1: slot-allocation micro-benchmark
+    // --slot-only       : skip dispatch/combine entirely, run only the slot-alloc loop
+    // --slot-alloc=..   : choose algorithm: scan (default) / atomic / cumsum
+    bool slot_only = false;
+    nccl_ep::slot_bench::SlotAllocAlgorithm slot_alloc_algo = nccl_ep::slot_bench::SLOT_SCAN;
+
     // Initialize MPI
     MPICHECK(MPI_Init(&argc, &argv));
     MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
     MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
 
     // Parse command line arguments
+    // Phase 2 Stage 1: long-only options for slot-alloc microbench (vals > 255
+    // so they can't collide with any short-option char).
+    constexpr int OPT_SLOT_ONLY  = 1000;
+    constexpr int OPT_SLOT_ALLOC = 1001;
+
     static struct option long_options[] = {
         {"algorithm",      required_argument, 0, 'a'},
         {"tokens",         required_argument, 0, 't'},
@@ -1813,6 +1830,8 @@ int main(int argc, char* argv[]) {
         {"use-fp8",        no_argument,       0, 'f'},
         {"validate",       no_argument,       0, 'V'},
         {"dynamic-tokens", no_argument,       0, 'M'},
+        {"slot-only",      no_argument,       0, OPT_SLOT_ONLY},
+        {"slot-alloc",     required_argument, 0, OPT_SLOT_ALLOC},
         {"help",           no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -1867,6 +1886,24 @@ int main(int argc, char* argv[]) {
             case 'M':
                 dynamic_tokens = true;
                 break;
+            case OPT_SLOT_ONLY:
+                slot_only = true;
+                break;
+            case OPT_SLOT_ALLOC:
+                if (strcmp(optarg, "scan") == 0) {
+                    slot_alloc_algo = nccl_ep::slot_bench::SLOT_SCAN;
+                } else if (strcmp(optarg, "atomic") == 0) {
+                    slot_alloc_algo = nccl_ep::slot_bench::SLOT_ATOMIC;
+                } else if (strcmp(optarg, "cumsum") == 0) {
+                    slot_alloc_algo = nccl_ep::slot_bench::SLOT_CUMSUM;
+                } else {
+                    if (myRank == 0) {
+                        printf("Error: Invalid --slot-alloc '%s'. Use scan, atomic, or cumsum\n", optarg);
+                    }
+                    MPI_Finalize();
+                    return 1;
+                }
+                break;
             case 'h':
                 printUsage(argv[0], myRank);
                 MPI_Finalize();
@@ -1904,6 +1941,31 @@ int main(int argc, char* argv[]) {
         }
         MPI_Finalize();
         return 1;
+    }
+
+    // Phase 2 Stage 1: slot-only microbench shortcut.
+    // This commit lands only the CLI plumbing and stub algorithm entries,
+    // so here we just print the parsed configuration and exit. Follow-up
+    // commits will add the real benchmark loop (NCCL init, fabric buffer
+    // allocation, warmup/iter loop, CSV row emission).
+    if (slot_only) {
+        if (myRank == 0) {
+            printf("=== NCCL EP Slot-Alloc Microbench (Stage 1, commit 1 skeleton) ===\n");
+            printf("  Ranks:           %d\n", nRanks);
+            printf("  Tokens:          %u\n", num_tokens);
+            printf("  Top-k:           %u\n", top_k);
+            printf("  Experts:         %u (local: %u)\n", num_experts, num_experts / nRanks);
+            printf("  Warmup iters:    %d\n", num_warmup);
+            printf("  Benchmark iters: %d\n", num_iters);
+            printf("  Slot algorithm:  %s\n",
+                   nccl_ep::slot_bench::algo_name(slot_alloc_algo));
+            printf("  CSV header:      %s\n",
+                   nccl_ep::slot_bench::timing_csv_header());
+            printf("\n[slot-only] commit 1: benchmark loop not yet implemented; exiting.\n");
+            fflush(stdout);
+        }
+        MPI_Finalize();
+        return 0;
     }
 
     unsigned int num_local_experts = num_experts / nRanks;

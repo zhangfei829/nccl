@@ -144,10 +144,18 @@ $(DST_DIR)/ep_bench.o: ep_bench.cu
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
 
-$(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
+# Phase 2 Stage 1 slot-allocation microbenchmark. Only linked into ep_bench
+# (not libnccl_ep.so), so the benchmark stubs cannot leak into the product
+# library. Later commits fill in the real algorithm implementations.
+$(DST_DIR)/slot_alloc_bench.o: device/slot_alloc_bench.cu device/slot_alloc_bench.cuh
+	@printf "Compiling  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
+
+$(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(DST_DIR)/slot_alloc_bench.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $< $(EP_BENCH_NVLDFLAGS)
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $(DST_DIR)/ep_bench.o $(DST_DIR)/slot_alloc_bench.o $(EP_BENCH_NVLDFLAGS)
 else
 ifeq ($(MPI_IBM),1)
 MPI_CFLAGS := -DMPI_SUPPORT
@@ -175,10 +183,18 @@ $(DST_DIR)/ep_bench.o: ep_bench.cu
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
 
-$(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
+# Phase 2 Stage 1 slot-allocation microbenchmark. Only linked into ep_bench
+# (not libnccl_ep.so), so the benchmark stubs cannot leak into the product
+# library. Later commits fill in the real algorithm implementations.
+$(DST_DIR)/slot_alloc_bench.o: device/slot_alloc_bench.cu device/slot_alloc_bench.cuh
+	@printf "Compiling  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) -c $<
+
+$(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(DST_DIR)/slot_alloc_bench.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
-	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $< $(EP_BENCH_NVLDFLAGS)
+	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $(DST_DIR)/ep_bench.o $(DST_DIR)/slot_alloc_bench.o $(EP_BENCH_NVLDFLAGS)
 else
 ep_test ep_bench:
 	@echo "Skipping ep_test/ep_bench (MPI not enabled). Use MPI=1 to build."
