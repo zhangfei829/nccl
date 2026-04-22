@@ -2044,10 +2044,24 @@ int main(int argc, char* argv[]) {
         params.num_local_experts = static_cast<int>(num_local_experts);
         params.nRanks            = nRanks;
         params.myRank            = myRank;
-        // fabric buffers unused by scan; atomic/cumsum in commits 3/4 will
-        // require a preallocated SlotAllocFabricBuffers block here.
         params.comm              = comm;
         params.stream            = stream;
+
+        // Allocate symmetric fabric buffers for atomic and cumsum paths.
+        // scan does not use them but we always init for uniform bench loops.
+        // Each per-rank block layout:
+        //   int32 count_row [nRanks] | int32 offset_row [nRanks] | uint32 flag [1]
+        // Add generous slack rounded up by the fabric granularity inside init.
+        {
+            size_t per_rank_bytes =
+                static_cast<size_t>(nRanks) * sizeof(int32_t)          // count_row
+              + static_cast<size_t>(nRanks) * sizeof(int32_t)          // offset_row
+              + 1                          * sizeof(uint32_t);         // barrier flag
+            nccl_ep::slot_bench::init_slot_fabric_buffers(
+                params.fabric, nRanks, myRank,
+                localRank,              // cuda_device_id
+                per_rank_bytes, stream);
+        }
 
         // Warmup
         for (int i = 0; i < num_warmup; i++) {
@@ -2094,6 +2108,7 @@ int main(int argc, char* argv[]) {
             fflush(stdout);
         }
 
+        nccl_ep::slot_bench::destroy_slot_fabric_buffers(params.fabric);
         delete[] topk_idx_host;
         CUDACHECK(cudaFree(d_topk_idx));
         CUDACHECK(cudaFree(d_my_slot_at_dest));

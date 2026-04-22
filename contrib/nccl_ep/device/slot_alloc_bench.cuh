@@ -33,16 +33,42 @@ enum SlotAllocAlgorithm {
     SLOT_CUMSUM = 2,
 };
 
-// Symmetric fabric-memory buffers, allocated once per ep_bench run and
-// reused across all benchmark iterations. Populated by the host-side
-// initializer in ep_bench.cu (commit 3 lands the actual allocator).
+// Per-rank fabric-memory allocation shared across all ranks via
+// CU_MEM_HANDLE_TYPE_FABRIC. Each rank has its own allocation of
+// `per_rank_bytes`; peers access it by mapping the imported handle into
+// their own address space. `d_peer_bufs_dev[d]` gives the VA, as seen from
+// THIS rank, of rank d's allocation. Layout inside each per-rank block:
+//
+//   offset 0                    : int32 count_row  [nRanks]
+//     count_row[src]            = "src has sent me this many tokens so far"
+//                                 (atomic) or "src will send me this many"
+//                                 (cumsum).
+//   offset nRanks*4             : int32 offset_row [nRanks]
+//     offset_row[src]           = dest-side recv_offset for src (cumsum only)
+//   offset 2*nRanks*4           : uint32 barrier_flag [1]
+//
+// Allocated once in ep_bench.cu before warmup, destroyed before exit.
 struct SlotAllocFabricBuffers {
-    int32_t*  count_matrix;      // [nRanks * nRanks] int32, row = this rank's send_count to each dest
-    int32_t*  offset_matrix;     // [nRanks * nRanks] int32, row = this rank's (as dest) recv_offset for each src
-    uint32_t* barrier_flags;     // [nRanks] uint32, one flag per rank for fabric-memory barrier
-    size_t    aligned_size_bytes;
-    bool      initialized;
+    void**   d_peer_bufs_dev;      // device[nRanks] of void*, peer_bufs[d] = VA of rank d's buffer as mapped here
+    void**   h_peer_bufs_host;     // host[nRanks] copy of the same for cleanup/memset
+    void*    local_buf;            // == h_peer_bufs_host[myRank], convenience
+    size_t   per_rank_bytes;       // size of each rank's fabric allocation (aligned)
+    int      nRanks;
+    bool     initialized;
 };
+
+// Allocates a symmetric fabric buffer (one per-rank block, plus this rank's
+// import of every peer's block). Uses MPI_Allgather over CUmemFabricHandle.
+// Must be called collectively by all ranks. Stream is used for cudaMemset.
+void init_slot_fabric_buffers(
+    SlotAllocFabricBuffers& buf,
+    int nRanks,
+    int myRank,
+    int cuda_device_id,
+    size_t per_rank_bytes_hint,
+    cudaStream_t stream);
+
+void destroy_slot_fabric_buffers(SlotAllocFabricBuffers& buf);
 
 struct SlotAllocParams {
     // Device pointers (owned by caller)

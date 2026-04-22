@@ -22,8 +22,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cub/device/device_scan.cuh>
+#include <mpi.h>
 
 // NOTE: hybridep_adapter.cuh's convert_topk_to_routing_map lives in
 // libnccl_ep.so but is compiled with -fvisibility=hidden, so the symbol is
@@ -45,6 +47,26 @@
     if (_r != ncclSuccess) {                                                \
         fprintf(stderr, "[slot_bench] NCCL error %s:%d: %s\n",              \
                 __FILE__, __LINE__, ncclGetErrorString(_r));                \
+        std::abort();                                                       \
+    }                                                                       \
+} while (0)
+
+#define SLOT_BENCH_CU_CHECK(expr) do {                                      \
+    CUresult _r = (expr);                                                   \
+    if (_r != CUDA_SUCCESS) {                                               \
+        const char* _msg = nullptr;                                         \
+        cuGetErrorString(_r, &_msg);                                        \
+        fprintf(stderr, "[slot_bench] CU error %s:%d: %s\n",                \
+                __FILE__, __LINE__, _msg ? _msg : "?");                     \
+        std::abort();                                                       \
+    }                                                                       \
+} while (0)
+
+#define SLOT_BENCH_MPI_CHECK(expr) do {                                     \
+    int _r = (expr);                                                        \
+    if (_r != MPI_SUCCESS) {                                                \
+        fprintf(stderr, "[slot_bench] MPI error %s:%d: %d\n",               \
+                __FILE__, __LINE__, _r);                                    \
         std::abort();                                                       \
     }                                                                       \
 } while (0)
@@ -375,10 +397,125 @@ void announce_stub_once(const char* name, int myRank) {
 
 }  // anonymous namespace
 
+// ============================================================================
+// atomic-based: dest-side remote atomicAdd on a fabric-memory counter matrix
+// ============================================================================
+//
+// Each rank owns `per_rank_bytes` of fabric memory. The first nRanks*4 bytes
+// are an int32 count_row where count_row[src] is the number of tokens src
+// has pushed to ME so far this iteration. Source ranks increment count_row
+// on the DEST rank's allocation via remote atomicAdd through the fabric
+// mapping (peer_bufs[dest]), each returning the pre-add value as the
+// absolute slot of that (token, topk) pair.
+//
+// Output slot semantics: "layout 2" - absolute slot in the dest recv buffer
+// assigned by atomic arrival order. Different (non-deterministic across
+// iterations wrt scan/cumsum), but still a valid absolute slot and still
+// comparable on per-iter timing.
+
+namespace {
+
+struct AtomicImpl {
+    bool        initialized = false;
+    cudaEvent_t ev_start    = nullptr;
+    cudaEvent_t ev_kernel_done = nullptr;
+};
+
+static AtomicImpl g_atomic;
+
+static void ensure_atomic_state() {
+    if (g_atomic.initialized) return;
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_atomic.ev_start));
+    SLOT_BENCH_CUDA_CHECK(cudaEventCreate(&g_atomic.ev_kernel_done));
+    g_atomic.initialized = true;
+}
+
+// Kernel: for each (t, k) pair, compute dest rank from topk_idx and do a
+// remote atomicAdd on dest's fabric-memory counter. my_slot_at_dest[t,k]
+// receives the pre-add value (absolute slot in dest's recv buffer).
+//
+// peer_bufs[d] must point at rank d's fabric allocation (per-rank base VA).
+// The first nRanks * int32 of each allocation is the count_row for that
+// rank; count_row[my_rank] is the counter ME bumps when sending to peer d.
+__global__ void atomic_slot_kernel(
+    const int64_t* __restrict__ topk_idx,
+    int32_t*       __restrict__ my_slot_at_dest,
+    void* const*   __restrict__ peer_bufs,   // [nRanks], device array
+    int tokens,
+    int top_k,
+    int nRanks,
+    int myRank,
+    int num_local_experts)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y;
+    if (t >= tokens || k >= top_k) return;
+
+    int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
+    int32_t slot = -1;
+    if (eid >= 0) {
+        int dest = static_cast<int>(eid / static_cast<int64_t>(num_local_experts));
+        int32_t* dest_counter = reinterpret_cast<int32_t*>(peer_bufs[dest]);
+        // dest_counter[my_rank] is the per-(dest, src) counter inside dest's
+        // block. atomicAdd returns the pre-increment value.
+        slot = atomicAdd(&dest_counter[myRank], 1);
+    }
+    my_slot_at_dest[static_cast<size_t>(t) * top_k + k] = slot;
+}
+
+}  // anonymous namespace
+
 SlotAllocTiming run_atomic_based(const SlotAllocParams& p) {
-    announce_stub_once("atomic", p.myRank);
-    fill_output_minus_one(p);
-    return {0.f, 0.f, 0.f, 0};
+    ensure_atomic_state();
+
+    if (!p.fabric.initialized || p.fabric.d_peer_bufs_dev == nullptr) {
+        if (p.myRank == 0) {
+            fprintf(stderr,
+                "[slot_bench] atomic: fabric buffers not initialized; "
+                "ep_bench must call init_slot_fabric_buffers before running "
+                "--slot-alloc=atomic\n");
+        }
+        fill_output_minus_one(p);
+        return {0.f, 0.f, 0.f, 0};
+    }
+
+    // Reset the count_row in MY block to zero. Each rank only resets its own
+    // block; a host-side MPI_Barrier ensures all resets complete before any
+    // rank starts incrementing peer counters.
+    SLOT_BENCH_CUDA_CHECK(cudaMemsetAsync(
+        p.fabric.local_buf, 0,
+        static_cast<size_t>(p.nRanks) * sizeof(int32_t), p.stream));
+    SLOT_BENCH_CUDA_CHECK(cudaStreamSynchronize(p.stream));
+    SLOT_BENCH_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_atomic.ev_start, p.stream));
+    {
+        dim3 block(256);
+        dim3 grid(static_cast<unsigned>((p.tokens + block.x - 1) / block.x),
+                  static_cast<unsigned>(p.top_k));
+        atomic_slot_kernel<<<grid, block, 0, p.stream>>>(
+            p.d_topk_idx, p.d_my_slot_at_dest,
+            p.fabric.d_peer_bufs_dev,
+            p.tokens, p.top_k, p.nRanks, p.myRank, p.num_local_experts);
+    }
+    SLOT_BENCH_CUDA_CHECK(cudaEventRecord(g_atomic.ev_kernel_done, p.stream));
+    SLOT_BENCH_CUDA_CHECK(cudaEventSynchronize(g_atomic.ev_kernel_done));
+
+    // A host MPI_Barrier AFTER the kernel keeps iters isolated from each
+    // other (so the next iter's memset does not race a peer still finishing
+    // its atomicAdd). This barrier is NOT counted in kernel_us.
+    SLOT_BENCH_MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+    float kernel_ms = 0.f;
+    SLOT_BENCH_CUDA_CHECK(cudaEventElapsedTime(&kernel_ms,
+        g_atomic.ev_start, g_atomic.ev_kernel_done));
+
+    SlotAllocTiming t;
+    t.kernel_us        = kernel_ms * 1000.0f;
+    t.collective_us    = 0.f;        // no NCCL/alltoall, atomicAdd overlaps with compute
+    t.total_us         = t.kernel_us;
+    t.bytes_collective = 0;          // no collective payload; remote atomics only
+    return t;
 }
 
 SlotAllocTiming run_cumsum_based(const SlotAllocParams& p) {
@@ -398,6 +535,166 @@ SlotAllocTiming run(SlotAllocAlgorithm algo, const SlotAllocParams& p) {
     }
     fill_output_minus_one(p);
     return {0.f, 0.f, 0.f, 0};
+}
+
+// ============================================================================
+// Fabric-memory symmetric allocation helper used by atomic and cumsum paths.
+// ============================================================================
+//
+// Pattern mirrors nccl_ep.cc:init_hybridep_intranode_fabric but is stripped
+// to what the slot-alloc microbench needs:
+//   - one per-rank CUmemCreate(FABRIC) allocation of `per_rank_bytes`
+//   - export + MPI_Allgather of CUmemFabricHandle (64 B each)
+//   - each rank imports every peer's handle and maps it into a fresh VA
+//   - d_peer_bufs_dev is a device array [nRanks] of void* (VAs in THIS
+//     rank's address space) so kernels can do `peer_bufs[dest_rank]` to
+//     find dest's buffer.
+//
+// Lifecycle assumption: ep_bench creates at most one fabric buffer per
+// process (one --slot-only run per ep_bench invocation). The raw CU handles
+// and VAs used for cleanup are parked in file-scope static vectors; init
+// writes them, destroy reads and releases.
+
+namespace {
+
+static std::vector<CUmemGenericAllocationHandle>& slot_fabric_allocs_storage() {
+    static std::vector<CUmemGenericAllocationHandle> v;
+    return v;
+}
+static std::vector<CUdeviceptr>& slot_fabric_vas_storage() {
+    static std::vector<CUdeviceptr> v;
+    return v;
+}
+
+static size_t slot_fabric_round_up(size_t sz, size_t gran) {
+    if (gran == 0) gran = 1;
+    return (sz + gran - 1) & ~(gran - 1);
+}
+
+}  // anonymous namespace
+
+void init_slot_fabric_buffers(
+    SlotAllocFabricBuffers& buf,
+    int nRanks,
+    int myRank,
+    int cuda_device_id,
+    size_t per_rank_bytes_hint,
+    cudaStream_t stream)
+{
+    if (buf.initialized) {
+        destroy_slot_fabric_buffers(buf);
+    }
+    std::memset(&buf, 0, sizeof(buf));
+    buf.nRanks = nRanks;
+
+    CUmemAllocationProp prop = {};
+    prop.type                 = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type        = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id          = cuda_device_id;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    size_t gran = 0;
+    SLOT_BENCH_CU_CHECK(cuMemGetAllocationGranularity(
+        &gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    size_t aligned = slot_fabric_round_up(per_rank_bytes_hint, gran);
+    buf.per_rank_bytes = aligned;
+
+    // Phase 1: allocate local fabric block and map into our own VA, zero it.
+    CUmemGenericAllocationHandle local_alloc = 0;
+    SLOT_BENCH_CU_CHECK(cuMemCreate(&local_alloc, aligned, &prop, 0));
+    CUdeviceptr local_va = 0;
+    SLOT_BENCH_CU_CHECK(cuMemAddressReserve(&local_va, aligned, gran, 0, 0));
+    SLOT_BENCH_CU_CHECK(cuMemMap(local_va, aligned, 0, local_alloc, 0));
+    CUmemAccessDesc access = {};
+    access.location = prop.location;
+    access.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    SLOT_BENCH_CU_CHECK(cuMemSetAccess(local_va, aligned, &access, 1));
+    SLOT_BENCH_CUDA_CHECK(cudaMemsetAsync(
+        reinterpret_cast<void*>(local_va), 0, aligned, stream));
+    SLOT_BENCH_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Phase 2: export local handle, allgather all ranks' handles via MPI.
+    CUmemFabricHandle local_fh = {};
+    SLOT_BENCH_CU_CHECK(cuMemExportToShareableHandle(
+        &local_fh, local_alloc, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+
+    static_assert(sizeof(CUmemFabricHandle) == 64,
+                  "CUmemFabricHandle must be 64 B");
+    std::vector<CUmemFabricHandle> all_fh(nRanks);
+    SLOT_BENCH_MPI_CHECK(MPI_Allgather(
+        &local_fh,       sizeof(CUmemFabricHandle), MPI_BYTE,
+        all_fh.data(),   sizeof(CUmemFabricHandle), MPI_BYTE,
+        MPI_COMM_WORLD));
+
+    // Phase 3: import each peer handle, map each to a fresh VA here.
+    buf.h_peer_bufs_host =
+        static_cast<void**>(std::malloc(sizeof(void*) * nRanks));
+    std::memset(buf.h_peer_bufs_host, 0, sizeof(void*) * nRanks);
+
+    auto& allocs = slot_fabric_allocs_storage();
+    auto& vas    = slot_fabric_vas_storage();
+    allocs.assign(nRanks, CUmemGenericAllocationHandle{0});
+    vas   .assign(nRanks, CUdeviceptr{0});
+
+    for (int r = 0; r < nRanks; r++) {
+        if (r == myRank) {
+            allocs[r] = local_alloc;
+            vas   [r] = local_va;
+            buf.h_peer_bufs_host[r] = reinterpret_cast<void*>(local_va);
+        } else {
+            CUmemGenericAllocationHandle h = 0;
+            SLOT_BENCH_CU_CHECK(cuMemImportFromShareableHandle(
+                &h, &all_fh[r], CU_MEM_HANDLE_TYPE_FABRIC));
+            CUdeviceptr va = 0;
+            SLOT_BENCH_CU_CHECK(cuMemAddressReserve(&va, aligned, gran, 0, 0));
+            SLOT_BENCH_CU_CHECK(cuMemMap(va, aligned, 0, h, 0));
+            SLOT_BENCH_CU_CHECK(cuMemSetAccess(va, aligned, &access, 1));
+            allocs[r] = h;
+            vas   [r] = va;
+            buf.h_peer_bufs_host[r] = reinterpret_cast<void*>(va);
+        }
+    }
+    buf.local_buf = buf.h_peer_bufs_host[myRank];
+
+    // Copy peer-buf pointer array to device so kernels can index peer_bufs[d].
+    SLOT_BENCH_CUDA_CHECK(cudaMalloc(&buf.d_peer_bufs_dev,
+                                     sizeof(void*) * nRanks));
+    SLOT_BENCH_CUDA_CHECK(cudaMemcpy(buf.d_peer_bufs_dev, buf.h_peer_bufs_host,
+                                     sizeof(void*) * nRanks,
+                                     cudaMemcpyHostToDevice));
+
+    buf.initialized = true;
+    (void)stream;
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void destroy_slot_fabric_buffers(SlotAllocFabricBuffers& buf) {
+    if (!buf.initialized) return;
+
+    auto& allocs   = slot_fabric_allocs_storage();
+    auto& vas      = slot_fabric_vas_storage();
+    const size_t aligned = buf.per_rank_bytes;
+    const int    nR      = buf.nRanks;
+
+    for (int r = 0; r < nR; r++) {
+        if (r < static_cast<int>(vas.size())) {
+            CUdeviceptr va = vas[r];
+            if (va) {
+                cuMemUnmap(va, aligned);
+                cuMemAddressFree(va, aligned);
+            }
+        }
+        if (r < static_cast<int>(allocs.size())) {
+            CUmemGenericAllocationHandle h = allocs[r];
+            if (h) cuMemRelease(h);
+        }
+    }
+    allocs.clear();
+    vas.clear();
+
+    if (buf.d_peer_bufs_dev)  cudaFree(buf.d_peer_bufs_dev);
+    if (buf.h_peer_bufs_host) std::free(buf.h_peer_bufs_host);
+    std::memset(&buf, 0, sizeof(buf));
 }
 
 }}  // namespace nccl_ep::slot_bench
