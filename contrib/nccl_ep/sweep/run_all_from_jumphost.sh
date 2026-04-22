@@ -42,6 +42,7 @@ EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_ROOT="${OUT_ROOT:-$HOME/fizhang/nccl-sweep-${TS}}"
 AGG_CSV="$OUT_ROOT/all_results.csv"
+AGG_SLOT_CSV="$OUT_ROOT/all_slot_results.csv"   # Phase 2 Stage 1 slot-alloc rows
 
 SWEEP_SH="${NCCL_REPO}/contrib/nccl_ep/sweep/ep_sweep.sh"
 PARSE_PY="${NCCL_REPO}/contrib/nccl_ep/sweep/ep_parse.py"
@@ -115,7 +116,15 @@ run_one_size() {
         echo "EP=$ep salloc/run failed (rc=$rc), continuing next size"
     fi
 
-    # Aggregate CSV for this sweep run (under OUT_ROOT, keeps historical)
+    # Aggregate CSV for this sweep run (under OUT_ROOT, keeps historical).
+    # Two CSVs may be produced depending on which modes were run:
+    #   results.csv       -- LL / HT production dispatch (ep_parse.py schema)
+    #   slot_results.csv  -- Phase 2 Stage 1 slot-alloc microbench (inline schema)
+    # Each has its own aggregator path; they are never merged together because
+    # the column schemas are different.
+    local slot_csv="$outdir/slot_results.csv"
+    local any_produced=0
+
     if [[ -f "$csv" ]]; then
         if [[ ! -f "$AGG_CSV" ]]; then
             cp "$csv" "$AGG_CSV"
@@ -133,7 +142,20 @@ run_one_size() {
         else
             echo "EP=$ep -> WARN: merge into master failed (csv kept in $csv)"
         fi
-    else
+        any_produced=1
+    fi
+
+    if [[ -f "$slot_csv" ]]; then
+        if [[ ! -f "$AGG_SLOT_CSV" ]]; then
+            cp "$slot_csv" "$AGG_SLOT_CSV"
+        else
+            tail -n +2 "$slot_csv" >> "$AGG_SLOT_CSV"
+        fi
+        echo "EP=$ep -> appended $(wc -l <"$slot_csv") slot rows to $AGG_SLOT_CSV"
+        any_produced=1
+    fi
+
+    if [[ $any_produced -eq 0 ]]; then
         echo "EP=$ep produced no csv"
     fi
 }
@@ -144,6 +166,9 @@ done
 
 echo
 echo "==========================================================="
-echo "ALL DONE. Combined CSV: $AGG_CSV"
-ls -l "$AGG_CSV" 2>/dev/null || echo "(no CSV produced)"
+echo "ALL DONE."
+echo "  Combined HT/LL CSV   : $AGG_CSV"
+ls -l "$AGG_CSV" 2>/dev/null || echo "    (no HT/LL CSV produced)"
+echo "  Combined slot CSV    : $AGG_SLOT_CSV"
+ls -l "$AGG_SLOT_CSV" 2>/dev/null || echo "    (no slot CSV produced)"
 echo "==========================================================="
