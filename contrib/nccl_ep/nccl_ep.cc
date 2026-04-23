@@ -25,6 +25,7 @@
 // HT (High Throughput) includes
 #include "device/hybridep_adapter.cuh"
 #include "device/hybridep_configs.cuh"
+#include "device/fullmesh.cuh"
 
 // Internal definition of the opaque ncclNDTensor type
 struct ncclNDTensor {
@@ -2683,23 +2684,88 @@ ncclResult_t ncclEpDispatch(
             handle->ll.continue_fn = dispatch_fn;
         }
     } else if (group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
-        // [FULLMESH] Phase 2 commit 1 stub: no kernel launched, no data moved.
-        // The real dispatch kernel (atomicAdd slot allocation on fabric-mapped
-        // counter row + TMA payload push to peer recv buffer) lands in commit 4.
-        // This stub prints a one-shot log per rank so we can confirm the CLI +
-        // algorithm routing + handle create all line up before we touch kernels.
+        // [FULLMESH] Phase 2 commit 3: real dispatch path.
+        //   (a) cudaMemsetAsync on this rank's counter_row so peers start
+        //       every iter from slot 0. On-stream; ncclBarrier below forces
+        //       cross-rank ordering.
+        //   (b) ncclBarrier (Q1=C host wrapper): cudaDeviceSynchronize inside
+        //       makes sure every rank has finished its counter reset before
+        //       any rank issues an atomicAdd at a peer.
+        //   (c) launch_dispatch_kernel: per (token, k) pair, atomicAdd on
+        //       peer_counter_vas_dev[dest][myRank] for a slot, then store
+        //       (meta, payload) at peer_recv_vas_dev[dest] entry.
+        //   (d) ncclBarrier (Q1=C host wrapper): kernel completion + cross-
+        //       rank readiness before this rank reads its own recv_buf.
+        //   (e) launch_compact_to_output: cudaMemcpy2D strips 8B per-entry
+        //       meta and writes the payload into the user's dense output
+        //       tensor ([nRanks * max_tokens_per_rank, hidden]).
+        //
+        // Two ncclBarrier calls per dispatch is the commit-3 correctness-first
+        // design; each contains a cudaDeviceSynchronize so CUDA Graph capture
+        // is NOT supported yet. If profiling shows this to be the dominant
+        // cost, commit 6 can revisit with ncclBarrierSession (Q1=C2) which is
+        // stream-only. Functional correctness first.
         assert(num_local_tensors == 0 && "FULLMESH dispatch does not accept local_tensors");
-        static bool logged = false;
-        if (!logged && group->rank == 0) {
-            fprintf(stderr,
-                    "[FULLMESH] ncclEpDispatch stub: send_only=%u num_inputs=%u "
-                    "num_outputs=%u num_tokens=%d num_topk=%d (no-op, commit-1 skeleton)\n",
-                    send_only, num_inputs, num_outputs,
-                    handle->num_tokens, handle->num_topk);
-            fflush(stderr);
-            logged = true;
-        }
-        (void)inputs; (void)outputs; (void)config; (void)stream;
+        assert(group->fullmesh_buffers.initialized && "FULLMESH buffers not init'd");
+
+        ncclNDTensor_t x       = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOKENS);
+        ncclNDTensor_t topk    = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOPK_IDX);
+        ncclNDTensor_t recv_x  = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
+        assert(x      != nullptr && "FULLMESH dispatch missing input TOKENS tensor");
+        assert(topk   != nullptr && "FULLMESH dispatch missing input TOPK_IDX tensor");
+        assert(recv_x != nullptr && "FULLMESH dispatch missing output TOKENS tensor");
+        assert(x->ndim    == 2 && tensor_is_contiguous(x));
+        assert(topk->ndim == 2 && tensor_is_contiguous(topk) && topk->datatype == ncclInt64);
+        assert(recv_x->ndim == 2 && tensor_is_contiguous(recv_x));
+        assert(x->sizes[0] == handle->num_tokens);
+        assert(x->sizes[0] <= group->config.max_tokens_per_rank);
+
+        auto& fb = group->fullmesh_buffers;
+        const int nRanks           = group->nRanks;
+        const int myRank           = group->rank;
+        const int max_tokens       = static_cast<int>(group->config.max_tokens_per_rank);
+        const int hidden_bytes     = static_cast<int>(group->config.token_size_bytes);
+        const int num_local_exps   = group->num_local_experts;
+
+        // (a) Reset this rank's counter row on the group stream.
+        CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(fb.counter_local_va),
+                                   0, fb.bytes_per_counter_row, stream));
+
+        // (b) Cross-rank barrier so no peer atomicAdds our counter before reset finishes.
+        NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+
+        // (c) Fused atomicAdd-slot + payload push kernel.
+        nccl_ep::fullmesh::launch_dispatch_kernel(
+            x->data,
+            static_cast<const int64_t*>(topk->data),
+            fb.peer_recv_vas_dev,
+            fb.peer_counter_vas_dev,
+            handle->num_tokens,
+            handle->num_topk,
+            num_local_exps,
+            myRank,
+            nRanks,
+            max_tokens,
+            hidden_bytes,
+            static_cast<int>(fb.bytes_per_entry),
+            static_cast<int>(fb.meta_bytes),
+            stream);
+
+        // (d) Cross-rank barrier so every peer has finished writing into my recv_buf.
+        NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+
+        // (e) Strip per-entry meta and project payload to the dense output tensor.
+        nccl_ep::fullmesh::launch_compact_to_output(
+            reinterpret_cast<const void*>(fb.recv_local_va),
+            recv_x->data,
+            nRanks,
+            max_tokens,
+            hidden_bytes,
+            static_cast<int>(fb.bytes_per_entry),
+            static_cast<int>(fb.meta_bytes),
+            stream);
+
+        (void)config; (void)send_only;
     } else { // HT
 
         bool is_single_node = !is_internode_available(group);

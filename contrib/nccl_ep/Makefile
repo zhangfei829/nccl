@@ -43,7 +43,8 @@ DEPFLAGS = -MMD -MP
 # Source files for library
 HOST_SRC := nccl_ep.cc
 DEVICE_SRC := device/low_latency.cu \
-              device/hybridep_adapter.cu
+              device/hybridep_adapter.cu \
+              device/fullmesh.cu
 # Object files
 HOST_OBJ := $(HOST_SRC:%.cc=$(OBJDIR)/%.o)
 DEVICE_OBJ := $(DEVICE_SRC:%.cu=$(OBJDIR)/%.o)
