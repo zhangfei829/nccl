@@ -1,0 +1,66 @@
+---
+description: 性能优化前必须先做 per-stage 耗时拆解，按证据排 ROI，不做无根据的整体优化
+alwaysApply: true
+---
+
+# 性能优化前必须先做 per-stage 耗时拆解
+
+当一个 backend / kernel 的 total latency 和 baseline 相比偏高时，**绝对不**基于
+"应该是 barrier 慢 / 应该是 kernel 慢" 这种整体判断直接改代码。先用 CUDA event
+/ CUPTI / nsys 把时间拆到每个 stream op，拿到每一阶段的 us 数字，按 size-proportional
+vs. fixed 两类分类，再按 ROI 排优先级。
+
+这是 Phase 2 FULLMESH 对齐 HT 时踩过的坑：前几轮分析都在笼统说 "2× ncclBarrier 拖慢"，
+但真做 breakdown 才发现 EP32 t=8192 的 dispatch non-kernel 2223 us 里，**~2100 us
+是 cudaMemcpy2D（size-proportional），只有 ~120 us 是 barrier（fixed）**。先把
+memcpy2D 干掉比先换 barrier 实现的 ROI 高一个数量级。
+
+## 硬性规则
+
+1. **把 total 拆成 kernel + non-kernel**：
+   - `ktimer.get_avg_us(...)` (CUPTI) -> kernel 部分
+   - `total - kernel` -> non-kernel stream op 部分（包括 memset/memcpy/stream-op-part-of-ncclAllReduce 等；不包括 host `cudaDeviceSynchronize` 等 host wait，因为 cudaEvent 不计它们）
+
+2. **把 non-kernel 再拆成 fixed + variable**：
+   - 跑至少 2 组 workload（一小一大，如 tokens=128 和 tokens=8192），同一 EP size
+   - fixed ≈ 小 workload 的 non-kernel 时间
+   - variable ≈ (大 workload non-kernel - 小 workload non-kernel) / (size 差)
+   - 结果能直接回答 "是固定开销拖慢还是线性开销拖慢"
+
+3. **对每个 stream op 给出估计占比的证据**：
+   - 按代码读出所有 stream op，列出数据量
+   - memset/memcpy 用测得的 effective rate 反算耗时（或用 nsys profile 直接读）
+   - 单个 op 占 total 超过 10% 的，必须列出来
+
+4. **按 ROI 排优化顺序**：
+   - ROI = (预期节省 us) / (实现成本)
+   - 绝不优先做 "代码干净但节省几 us" 的改动
+   - 已知 EP32 t=8192 的例子：memcpy2D ~2100us > memset combine ~500-2500us > 4×barrier ~120-250us > kernel ~150-300us 潜在节省
+
+5. **每个优化 commit 必须预测节省 + 实测验证**：
+   - commit message 里写 "预期节省 X us @ (EP, tokens)"
+   - 落地后重跑 sweep，把 actual 和 predicted 都贴回来
+   - 差 2× 以上说明模型错，回头再分析
+
+## 反模式（都是这次 Phase 2 实际犯过的）
+
+- ❌ "D+C total FM/HT ratio 1.4-1.8×，归因到 2× ncclBarrier"  
+  错：barrier 只占 fixed ~120us；真正大头是 size-proportional 的 memcpy2D
+  ~2100us 和 memset ~500-2500us。先拆数据再归因。
+- ❌ 写一个"整体优化"的大 commit，同时改 barrier + kernel + layout  
+  错：不可 bisect，失败时不知道哪部分有问题。每个瓶颈独立一个 commit。
+- ❌ 用 "percentage better than baseline" 单一指标衡量 backend  
+  错：同一个 "快 10%" 可以来自节省 fixed cost（小 workload 收益大，大 workload 无）
+  或 variable cost（反之）。必须拆开报告。
+
+## 举例：Phase 2 Commit 3/4 应该做什么（复盘）
+
+当时 ep_bench 第一次 EP8 t=1024 跑完得到 D=370us K=178us 后，正确操作是：
+- 先跑 t=128 和 t=8192 两组，拿到 non-kernel 的 fixed 部分 (~70us) 和 variable
+  部分 (~variable rate);
+- 对 variable 部分的具体 op（memcpy2D size, memset size）用 byte/rate 反算；
+- 做完 breakdown 才决定 commit 5 优化哪里。
+
+而不是像当时那样直接 "commit 5 = sweep glue + kernel rename"，把优化推到
+"Phase 3" 的含糊 plan 里。下次类似情况：**breakdown 先行**，优化根据 breakdown
+排序。
