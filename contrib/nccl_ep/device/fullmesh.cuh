@@ -5,11 +5,20 @@
 //
 // Layout contract (mirrors ncclEpGroup::fullmesh_buffers in nccl_ep.cc):
 //   recv_buf[dest][src][slot]  with entry size = meta_bytes + hidden_bytes
-//     bytes 0..meta_bytes-1      : (int32 src_rank, int32 src_token_id)
+//     bytes 0..7                 : (int32 src_rank, int32 src_token_id)
+//     bytes 8..meta_bytes-1      : reserved padding (not read by combine)
 //     bytes meta_bytes..end      : hidden payload (dtype opaque)
 //   counter_row[dest][src]       : int32 atomic counter, src atomicAdd(1) to
 //                                  carve its next slot inside its per-src
 //                                  block at dest.
+//
+// ALIGNMENT INVARIANT (enforced in nccl_ep.cc:init_fullmesh_intranode_fabric):
+//   meta_bytes % 16 == 0  AND  hidden_bytes % 16 == 0
+//   => bytes_per_entry    % 16 == 0
+//   => entry+meta_bytes   is 16B-aligned for every (src, slot)
+//   Required because the dispatch kernel streams the payload with 32-lane
+//   cooperative uint4 stores. Breaking either invariant traps the kernel
+//   with "misaligned address" on all slots where entry_idx is odd.
 //
 // The dispatch kernel is a single fused launch that, per (token, k) pair:
 //   (1) computes dest rank from topk_idx / num_local_experts,

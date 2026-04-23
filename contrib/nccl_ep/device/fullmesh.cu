@@ -125,6 +125,18 @@ void launch_dispatch_kernel(
                 hidden_bytes);
         return;
     }
+    // Same 16B alignment requirement applies to meta_bytes: dst_payload is
+    // entry + meta_bytes, so if meta_bytes % 16 != 0 the uint4 stores trap.
+    // init_fullmesh_intranode_fabric pads meta to 16 specifically for this;
+    // this assert catches any future caller that forgets.
+    if ((meta_bytes & 15) != 0) {
+        fprintf(stderr,
+                "[FULLMESH] launch_dispatch_kernel: meta_bytes=%d is not 16B "
+                "aligned; uint4 stores at entry+meta_bytes would trap. "
+                "Aborting launch.\n",
+                meta_bytes);
+        return;
+    }
     int hidden_u4 = hidden_bytes >> 4;
 
     // top_k bounded by 32 warps/block keeps us under the 1024-thread block

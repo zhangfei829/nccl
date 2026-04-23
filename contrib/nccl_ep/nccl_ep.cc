@@ -1080,12 +1080,17 @@ static ncclResult_t init_fullmesh_intranode_fabric(ncclEpGroup_t ep_group,
     auto& fb = ep_group->fullmesh_buffers;
     fb.initialized = false;
 
-    // Layout: 8 bytes of metadata (int32 src_rank + int32 src_token_id) per
-    // entry, followed by the hidden payload at whatever dtype width the group
-    // is configured with (token_size_bytes). hidden bytes is already whatever
-    // the caller declared in config.token_size_bytes. We don't pick bf16 here
-    // so FP8 / FP16 callers downstream all work.
-    fb.meta_bytes           = 8;
+    // Layout: 16 bytes of metadata per entry (core 8B = int32 src_rank +
+    // int32 src_token_id, followed by 8B reserved-for-padding), then the
+    // hidden payload at whatever dtype width the group is configured with
+    // (token_size_bytes). We pick meta_bytes == 16 instead of the natural 8
+    // because the dispatch kernel uses uint4 (16-byte) vector stores to
+    // stream the payload; entry+meta_bytes MUST be 16-byte aligned or every
+    // store past slot 0 traps with "misaligned address". hidden_bytes is
+    // required to be 16B-aligned on its own (ep_bench enforces this at tensor
+    // setup), so making meta_bytes also a multiple of 16 is the full fix.
+    // Commit 4 combine reads only the first 8 bytes of the 16B meta header.
+    fb.meta_bytes           = 16;
     fb.bytes_per_entry      = fb.meta_bytes + token_bytes;
     fb.bytes_per_src_block  = max_tokens * fb.bytes_per_entry;
     fb.bytes_per_recv_buf   = static_cast<size_t>(nRanks) * fb.bytes_per_src_block;
