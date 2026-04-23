@@ -5,12 +5,26 @@
 //
 // Layout contract (mirrors ncclEpGroup::fullmesh_buffers in nccl_ep.cc):
 //   recv_buf[dest][src][slot]  with entry size = meta_bytes + hidden_bytes
-//     bytes 0..7                 : (int32 src_rank, int32 src_token_id)
-//     bytes 8..meta_bytes-1      : reserved padding (not read by combine)
+//     bytes 0..3                 : int32 src_rank   (= author of the push)
+//     bytes 4..7                 : int32 src_token_id  (= t inside src rank)
+//     bytes 8..11                : int32 k_in_topk  (commit 4 combine uses
+//                                                    this to route the FFN
+//                                                    output back to the
+//                                                    src's combine_recv_buf
+//                                                    at [src_token_id][k])
+//     bytes 12..meta_bytes-1     : reserved padding (currently 0)
 //     bytes meta_bytes..end      : hidden payload (dtype opaque)
 //   counter_row[dest][src]       : int32 atomic counter, src atomicAdd(1) to
 //                                  carve its next slot inside its per-src
-//                                  block at dest.
+//                                  block at dest. Also the combine kernel's
+//                                  "how many slots from src do I have to
+//                                  push back?" read-only source of truth.
+//   combine_recv_buf[src_token_id][k_in_topk]
+//                                : hidden-only payload (no meta), one slot
+//                                  per (my own token, topk contribution).
+//                                  dest rank writes a weighted or raw FFN
+//                                  output here; src rank reduces across k
+//                                  into combined_output.
 //
 // ALIGNMENT INVARIANT (enforced in nccl_ep.cc:init_fullmesh_intranode_fabric):
 //   meta_bytes % 16 == 0  AND  hidden_bytes % 16 == 0
@@ -74,10 +88,10 @@ void launch_dispatch_kernel(
     cudaStream_t      stream);
 
 // Project this rank's recv_buf payload column into a dense user output tensor
-// shaped [nRanks * max_tokens_per_rank, hidden_bytes], skipping the 8-byte
-// meta prefix at each entry. Rows beyond sum(counter_row) are undefined;
-// callers currently treat the tensor as non-compacted which matches MoE
-// semantics where downstream kernels read only valid slots.
+// shaped [nRanks * max_tokens_per_rank, hidden_bytes], skipping the meta prefix
+// at each entry. Rows beyond sum(counter_row) are undefined; callers currently
+// treat the tensor as non-compacted which matches MoE semantics where
+// downstream kernels read only valid slots.
 //
 // This is literally a cudaMemcpy2DAsync wrapper kept on the device side to
 // mirror HT's convention of keeping tensor shape translation near the kernels.
@@ -89,6 +103,78 @@ void launch_compact_to_output(
     int               hidden_bytes,
     int               bytes_per_entry,
     int               meta_bytes,
+    cudaStream_t      stream);
+
+// ============================================================================
+// Combine kernels (Phase 2 commit 4)
+// ----------------------------------------------------------------------------
+// Combine is the reverse direction of dispatch: expert FFN outputs at dest
+// ranks need to be aggregated back to the src rank and weighted-summed by
+// topk_weights. FULLMESH's Q2=B choice means dest rank reads its own dispatch
+// recv_buf meta to learn the (src, src_token_id, k) triple, then pushes the
+// FFN output slot to the src rank's combine_recv_buf. After a cross-rank
+// barrier the src rank's combine_reduce_kernel weighted-sums across the k
+// dimension into combined_output.
+
+// Kernel: dest-initiated combine push.
+//
+// Grid:  (nRanks, max_tokens_per_rank)   -- (src_in_dest_layout, slot)
+// Block: (32,)                           -- one warp per slot cooperatively
+//                                           streams the hidden payload
+//
+// Per block:
+//   src   = blockIdx.x
+//   slot  = blockIdx.y
+//   counter_local_va[src] is read to decide whether (src, slot) holds a real
+//   entry. If slot >= counter, the warp exits; this is the main way masked-
+//   token slots (topk_idx == -1) and unused slots are skipped without adding
+//   a separate slot map.
+//
+//   Meta at recv_local_va + (src * max_tokens + slot) * bytes_per_entry holds
+//     (src_rank, src_token_id, k_in_topk). dest FFN output for the same i =
+//     src * max_tokens + slot is at ffn_output + i * hidden_bytes.
+//
+// The kernel then writes ffn_output[i] to the src rank's combine_recv_buf at
+// peer_combine_vas_dev[src_rank][(src_token_id * max_topk + k_in_topk) *
+// hidden_bytes]. Pushed at bf16 precision; the src-side reduce kernel does
+// the fp32 accumulation.
+void launch_combine_push_kernel(
+    const void*       ffn_output,             // [nRanks*max_tokens, hidden] dense bf16
+    const void*       recv_local_va,          // this rank's dispatch recv_buf (for meta read)
+    const int32_t*    counter_local_va,       // this rank's counter_row[nRanks]
+    void* const*      peer_combine_vas_dev,   // device [nRanks] void*, src->combine VAs
+    int               nRanks,
+    int               myRank,
+    int               max_tokens_per_rank,
+    int               max_topk_for_combine,
+    int               hidden_bytes,
+    int               bytes_per_entry,
+    int               meta_bytes,
+    cudaStream_t      stream);
+
+// Kernel: src-side weighted sum across k.
+//
+// Grid:  (num_tokens,)
+// Block: (threads_per_block,)
+//
+// Per block:
+//   t = blockIdx.x  (this rank's local token id, 0..num_tokens-1)
+//   For each k in 0..num_topk-1:
+//     load combine_local_va[t * max_topk + k] (hidden bf16)
+//     accumulate weighted by topk_weights[t * num_topk + k] in fp32
+//   Store acc -> combined_output[t] in bf16.
+//
+// Assumes the user cudaMemsetAsync'd combine_local_va to zero before combine
+// push so slots for k beyond the actual routed count are 0 and contribute
+// nothing to the sum. That memset is the caller's job.
+void launch_combine_reduce_kernel(
+    const void*       combine_local_va,       // src-local [num_tokens][max_topk][hidden]
+    const float*      topk_weights,           // [num_tokens, num_topk]
+    void*             combined_output,        // [num_tokens, hidden] bf16 dst
+    int               num_tokens,
+    int               num_topk,
+    int               max_topk_for_combine,
+    int               hidden_bytes,
     cudaStream_t      stream);
 
 }  // namespace fullmesh

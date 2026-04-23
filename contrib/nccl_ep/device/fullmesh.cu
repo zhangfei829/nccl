@@ -83,12 +83,20 @@ __global__ void dispatch_kernel(
     size_t   entry_idx = static_cast<size_t>(myRank) * max_tokens_per_rank + slot;
     uint8_t* entry     = dest_recv + entry_idx * static_cast<size_t>(bytes_per_entry);
 
+    // Lane-0 writes the 16-byte meta header as a single uint4 store (aligned):
+    //   uint32[0]: src_rank    (this rank, push author)
+    //   uint32[1]: src_token_id (= t in this block's grid index)
+    //   uint32[2]: k_in_topk   (= warp_id; commit 4 combine uses this to
+    //                           route the FFN output back to the src's
+    //                           combine_recv_buf[src_token_id][k_in_topk])
+    //   uint32[3]: reserved    (0; future use)
     if (lane == 0) {
-        uint32_t lo = static_cast<uint32_t>(myRank);
-        uint32_t hi = static_cast<uint32_t>(t);
-        uint64_t meta = static_cast<uint64_t>(lo) |
-                        (static_cast<uint64_t>(hi) << 32);
-        *reinterpret_cast<uint64_t*>(entry) = meta;
+        uint4 meta_vec;
+        meta_vec.x = static_cast<uint32_t>(myRank);
+        meta_vec.y = static_cast<uint32_t>(t);
+        meta_vec.z = static_cast<uint32_t>(k);
+        meta_vec.w = 0;
+        *reinterpret_cast<uint4*>(entry) = meta_vec;
     }
 
     uint4*       dst_payload = reinterpret_cast<uint4*>(entry + meta_bytes);
@@ -192,6 +200,175 @@ void launch_compact_to_output(
         num_recv_tokens_cap,                     // height
         cudaMemcpyDeviceToDevice,
         stream);
+}
+
+// ============================================================================
+// Combine (Phase 2 commit 4)
+// ============================================================================
+
+namespace {
+
+// Dest-initiated combine push. One block per (src, slot); warp cooperatively
+// streams the hidden payload of the FFN output to the src rank's combine_recv
+// _buf at [src_token_id, k_in_topk]. See fullmesh.cuh for full contract.
+__global__ void combine_push_kernel(
+    const uint4*    __restrict__ ffn_output,            // [nRanks*max_tokens, hidden_u4]
+    const uint8_t*  __restrict__ recv_local_va,         // this rank's dispatch recv_buf
+    const int32_t*  __restrict__ counter_local_va,      // this rank's counter_row[nRanks]
+    void* const*    __restrict__ peer_combine_vas_dev,  // [nRanks]
+    int nRanks,
+    int myRank,
+    int max_tokens_per_rank,
+    int max_topk_for_combine,
+    int hidden_u4,
+    int bytes_per_entry,
+    int meta_bytes)
+{
+    int src  = blockIdx.x;
+    int slot = blockIdx.y;
+    if (src >= nRanks || slot >= max_tokens_per_rank) return;
+
+    // Only (src, slot) pairs that a peer actually filled during dispatch are
+    // valid. counter_local_va[src] is the total count src pushed into us.
+    int filled = counter_local_va[src];
+    if (slot >= filled) return;
+
+    int lane = static_cast<int>(threadIdx.x & 31);
+
+    // Read meta off this rank's own dispatch recv buf.
+    const uint8_t* entry = recv_local_va +
+                           (static_cast<size_t>(src) * max_tokens_per_rank + slot)
+                           * static_cast<size_t>(bytes_per_entry);
+    uint4 meta_vec = *reinterpret_cast<const uint4*>(entry);
+    int src_rank     = static_cast<int>(meta_vec.x);
+    int src_token_id = static_cast<int>(meta_vec.y);
+    int k_in_topk    = static_cast<int>(meta_vec.z);
+
+    // Defensive: malformed meta (src_rank mismatch) would route the push to
+    // the wrong rank. In practice dispatch writes src_rank == src always, but
+    // if a future change breaks that invariant the combine would silently
+    // corrupt unrelated tokens.
+    if (src_rank != src) return;
+    if (k_in_topk < 0 || k_in_topk >= max_topk_for_combine) return;
+    if (src_token_id < 0 || src_token_id >= max_tokens_per_rank) return;
+
+    // Peer target: src_rank's combine_recv_buf at [src_token_id][k_in_topk].
+    uint8_t* peer_combine = reinterpret_cast<uint8_t*>(peer_combine_vas_dev[src_rank]);
+    size_t   combine_slot = static_cast<size_t>(src_token_id) * max_topk_for_combine
+                          + static_cast<size_t>(k_in_topk);
+    uint4*   dst_payload  = reinterpret_cast<uint4*>(
+                              peer_combine + combine_slot * static_cast<size_t>(hidden_u4) * 16);
+
+    // Source: this rank's FFN output at the dense row (src * max + slot).
+    size_t i = static_cast<size_t>(src) * max_tokens_per_rank + slot;
+    const uint4* src_payload = ffn_output + i * hidden_u4;
+
+    for (int j = lane; j < hidden_u4; j += 32) {
+        dst_payload[j] = src_payload[j];
+    }
+}
+
+// Src-side weighted sum across the k dimension.
+// Grid (num_tokens,), block cooperative streams hidden_u4 entries.
+__global__ void combine_reduce_kernel(
+    const uint16_t* __restrict__ combine_local,    // [num_tokens*max_topk*hidden] bf16
+    const float*    __restrict__ topk_weights,     // [num_tokens, num_topk]
+    uint16_t*       __restrict__ combined_output,  // [num_tokens, hidden] bf16
+    int num_tokens,
+    int num_topk,
+    int max_topk_for_combine,
+    int hidden)
+{
+    int t = blockIdx.x;
+    if (t >= num_tokens) return;
+
+    int tid       = threadIdx.x;
+    int nthreads  = blockDim.x;
+
+    // Each thread covers a strided slice of the hidden dim. For each assigned
+    // h, loop over k, accumulate weights[k] * combine[t,k,h] in fp32, then
+    // write bf16 result to combined_output[t,h].
+    for (int h = tid; h < hidden; h += nthreads) {
+        float acc = 0.f;
+        for (int k = 0; k < num_topk; ++k) {
+            size_t slot_idx = ((static_cast<size_t>(t) * max_topk_for_combine) + k)
+                            * hidden + h;
+            // bf16 -> float via bit shift into upper 16 of fp32. This is the
+            // standard bf16 load pattern used elsewhere in the project.
+            uint16_t bf   = combine_local[slot_idx];
+            uint32_t bits = static_cast<uint32_t>(bf) << 16;
+            float    v    = __int_as_float(static_cast<int>(bits));
+            float    w    = topk_weights[static_cast<size_t>(t) * num_topk + k];
+            acc += w * v;
+        }
+        // bf16 round-to-nearest-even via "add 0x7fff + lsb" trick.
+        uint32_t acc_bits = static_cast<uint32_t>(__float_as_int(acc));
+        uint32_t lsb      = (acc_bits >> 16) & 1u;
+        uint32_t bias     = 0x7fffu + lsb;
+        uint16_t out      = static_cast<uint16_t>((acc_bits + bias) >> 16);
+        combined_output[static_cast<size_t>(t) * hidden + h] = out;
+    }
+}
+
+}  // anonymous namespace
+
+void launch_combine_push_kernel(
+    const void*  ffn_output_void,
+    const void*  recv_local_va,
+    const int32_t* counter_local_va,
+    void* const* peer_combine_vas_dev,
+    int nRanks,
+    int myRank,
+    int max_tokens_per_rank,
+    int max_topk_for_combine,
+    int hidden_bytes,
+    int bytes_per_entry,
+    int meta_bytes,
+    cudaStream_t stream)
+{
+    if ((hidden_bytes & 15) != 0) {
+        fprintf(stderr,
+                "[FULLMESH] launch_combine_push_kernel: hidden_bytes=%d not "
+                "16B aligned. Aborting.\n", hidden_bytes);
+        return;
+    }
+    int hidden_u4 = hidden_bytes >> 4;
+
+    dim3 grid(nRanks, max_tokens_per_rank);
+    dim3 block(32);
+    combine_push_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const uint4*>(ffn_output_void),
+        reinterpret_cast<const uint8_t*>(recv_local_va),
+        counter_local_va,
+        peer_combine_vas_dev,
+        nRanks, myRank, max_tokens_per_rank, max_topk_for_combine,
+        hidden_u4, bytes_per_entry, meta_bytes);
+}
+
+void launch_combine_reduce_kernel(
+    const void*  combine_local_va_void,
+    const float* topk_weights,
+    void*        combined_output_void,
+    int num_tokens,
+    int num_topk,
+    int max_topk_for_combine,
+    int hidden_bytes,
+    cudaStream_t stream)
+{
+    if (num_tokens <= 0) return;
+    // hidden is number of bf16 elements, not bytes. combined_output is bf16
+    // and combine_local is bf16 (dest pushed bf16 in combine_push).
+    int hidden = hidden_bytes / 2;
+
+    // 256 threads covers 7168-hidden in 28-element stripes. Power of two keeps
+    // the common-case tail of the loop simple.
+    dim3 grid(num_tokens);
+    dim3 block(256);
+    combine_reduce_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(combine_local_va_void),
+        topk_weights,
+        reinterpret_cast<uint16_t*>(combined_output_void),
+        num_tokens, num_topk, max_topk_for_combine, hidden);
 }
 
 }  // namespace fullmesh

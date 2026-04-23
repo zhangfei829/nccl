@@ -364,32 +364,48 @@ struct ncclEpGroup {
         size_t bytes_per_recv_buf = 0;   // nRanks * bytes_per_src_block
         size_t bytes_per_counter_row = 0;  // nRanks * sizeof(int32)
 
+        // Combine layout: per-src block of [max_tokens][top_k][hidden_bytes].
+        // No meta is stored here because src rank already owns (t, k), so the
+        // dest push target is just the hidden slab. bytes_per_combine_buf is
+        // computed from config at init time once top_k bound is known (we
+        // upper-bound it to NCCL_EP_MAX_TOPK so the allocation is fixed per
+        // group regardless of which handle is currently in flight).
+        size_t max_topk_for_combine = 0;
+        size_t bytes_per_combine_token = 0;  // top_k * hidden_bytes
+        size_t bytes_per_combine_buf = 0;    // max_tokens * bytes_per_combine_token
+
         // Granularity-aligned sizes actually passed to cuMemCreate.
         size_t recv_aligned_size = 0;
         size_t counter_aligned_size = 0;
+        size_t combine_aligned_size = 0;
 
-        // Local-owned fabric allocations (this rank's recv + counter).
+        // Local-owned fabric allocations.
         CUmemGenericAllocationHandle recv_local_alloc = 0;
         CUdeviceptr                  recv_local_va   = 0;
         CUmemGenericAllocationHandle counter_local_alloc = 0;
         CUdeviceptr                  counter_local_va   = 0;
+        // Combine: this rank's OWN combine_recv_buf (src viewpoint -- peers,
+        // acting as dest, push FFN outputs back here). Shape
+        //   [max_tokens_per_rank][max_topk_for_combine][hidden_bytes]
+        CUmemGenericAllocationHandle combine_local_alloc = 0;
+        CUdeviceptr                  combine_local_va   = 0;
 
-        // Peer mappings (indexed by dest rank; self entry == local_va above).
-        // peer_recv_vas[dest]      = VA of dest rank's recv buffer mapped here
-        // peer_counter_vas[dest]   = VA of dest rank's counter row mapped here
-        // peer_recv_allocs / peer_counter_allocs hold the imported handles so
-        // destroy_fullmesh_intranode_fabric can cuMemRelease them.
+        // Peer mappings (indexed by rank; self entry points at local_va).
+        // peer_recv_vas[dest]     = peer's dispatch recv buffer (src pushes here)
+        // peer_counter_vas[dest]  = peer's counter row           (src atomicAdd here)
+        // peer_combine_vas[src]   = peer's combine_recv_buf      (dest pushes here)
+        // peer_*_allocs hold the imported handles for destroy()  cleanup.
         CUdeviceptr*                  peer_recv_vas = nullptr;
         CUdeviceptr*                  peer_counter_vas = nullptr;
+        CUdeviceptr*                  peer_combine_vas = nullptr;
         CUmemGenericAllocationHandle* peer_recv_allocs = nullptr;
         CUmemGenericAllocationHandle* peer_counter_allocs = nullptr;
+        CUmemGenericAllocationHandle* peer_combine_allocs = nullptr;
 
-        // Device-side pointer arrays (for kernel access). A single cudaMalloc
-        // of two CUdeviceptr*[nRanks] arrays lets commit-4 dispatch kernel
-        // read peer_recv_vas_dev[dest] and peer_counter_vas_dev[dest] with
-        // one indirection.
+        // Device-side pointer arrays for one-indirection access from kernels.
         void** peer_recv_vas_dev = nullptr;        // [nRanks]
         void** peer_counter_vas_dev = nullptr;     // [nRanks]
+        void** peer_combine_vas_dev = nullptr;     // [nRanks]
     } fullmesh_buffers;
 
     // Constructor to properly initialize all members
@@ -1051,20 +1067,38 @@ static ncclResult_t destroy_hybridep_intranode_fabric(ncclEpGroup_t ep_group) {
 // ============================================================================
 // FULLMESH (Phase 2): direct peer-store fabric-memory init / destroy
 // ----------------------------------------------------------------------------
-// Allocates two independent FABRIC-exported buffers per rank:
-//   (1) recv_buf[nRanks][max_tokens_per_rank][meta_bytes + hidden_bytes]
+// Allocates three independent FABRIC-exported buffers per rank. All three are
+// imported by every other rank via cuMemImportFromShareableHandle so every
+// rank can load / store every other rank's dispatch recv, counter row and
+// combine recv with a single peer-mapped VA per buffer per rank.
+//
+//   (1) dispatch_recv_buf[nRanks][max_tokens_per_rank][meta_bytes + hidden_bytes]
 //       Big. Every src rank atomicAdd-carves a slot in its own per-src block
-//       on the dest rank, then TMA-pushes (meta, payload) into that slot in
-//       commit 4. Layout keeps src blocks disjoint so the atomic contention
-//       is per-(src,dest) not per-dest, matching the stage-1 winner.
+//       at dest, then cooperatively vec-stores (meta, payload) into that slot.
+//       Layout keeps src blocks disjoint so atomicAdd contention is
+//       per-(src,dest), not per-dest, matching the Phase 2 Stage 1 winner.
+//
 //   (2) counter_row[nRanks]                                       (int32)
 //       Small. One 32-bit counter per (dest, src). dest rank owns the whole
-//       row; every src rank atomicAdd(1) remotely via its peer mapping to
-//       pull a slot, then writes to (1) at the returned offset.
+//       row; every src rank atomicAdd(1) remotely to pull a slot. Commit 4
+//       combine ALSO reads this row (as a dest reading its own counter) to
+//       know how many slots each src filled and therefore how many entries
+//       to push back.
 //
-// Handles are exchanged with a single ncclAllGatherHost of 2*FH_BYTES per
-// rank (recv + counter packed); import + map mirrors init_hybridep_intranode
-// _fabric(). Commit 2 scope ends here: no kernel, no data, no reset.
+//   (3) combine_recv_buf[max_tokens_per_rank][max_topk_for_combine][hidden_bytes]
+//       Big. src-owned buffer into which peer dest ranks push weighted FFN
+//       outputs during commit-4 combine. No meta header (src already knows
+//       the (t, k) coordinate; dest knows where to push by reading meta off
+//       its own dispatch recv). A src-local reduce kernel then sums across
+//       the k dimension weighted by topk_weights to produce combined_output.
+//       max_topk_for_combine is a group-level upper bound so the allocation
+//       is stable across handles regardless of per-handle top_k.
+//
+// Handles are exchanged with one ncclAllGatherHost of 3*FH_BYTES per rank
+// (recv + counter + combine packed). All three peer maps get local-device
+// READWRITE access so the dispatch kernel (src pushes to peer recv/counter)
+// and the combine kernel (dest pushes to peer combine) both work without
+// any per-call additional access descriptor changes.
 // ============================================================================
 static ncclResult_t init_fullmesh_intranode_fabric(ncclEpGroup_t ep_group,
                                                     const ncclEpGroupConfig_t* in_config,
@@ -1080,21 +1114,23 @@ static ncclResult_t init_fullmesh_intranode_fabric(ncclEpGroup_t ep_group,
     auto& fb = ep_group->fullmesh_buffers;
     fb.initialized = false;
 
-    // Layout: 16 bytes of metadata per entry (core 8B = int32 src_rank +
-    // int32 src_token_id, followed by 8B reserved-for-padding), then the
-    // hidden payload at whatever dtype width the group is configured with
-    // (token_size_bytes). We pick meta_bytes == 16 instead of the natural 8
-    // because the dispatch kernel uses uint4 (16-byte) vector stores to
-    // stream the payload; entry+meta_bytes MUST be 16-byte aligned or every
-    // store past slot 0 traps with "misaligned address". hidden_bytes is
-    // required to be 16B-aligned on its own (ep_bench enforces this at tensor
-    // setup), so making meta_bytes also a multiple of 16 is the full fix.
-    // Commit 4 combine reads only the first 8 bytes of the 16B meta header.
+    // Meta header layout is 16B, see device/fullmesh.cuh for the exact uint32
+    // slot assignment. meta_bytes % 16 == 0 is load-bearing: the dispatch
+    // kernel uses uint4 (16-byte) cooperative stores at entry+meta_bytes,
+    // which traps with "misaligned address" if the invariant is violated.
     fb.meta_bytes           = 16;
     fb.bytes_per_entry      = fb.meta_bytes + token_bytes;
     fb.bytes_per_src_block  = max_tokens * fb.bytes_per_entry;
     fb.bytes_per_recv_buf   = static_cast<size_t>(nRanks) * fb.bytes_per_src_block;
     fb.bytes_per_counter_row = static_cast<size_t>(nRanks) * sizeof(int32_t);
+
+    // Group-level upper bound on top_k. Commit 4 combine kernel asserts the
+    // per-handle num_topk does not exceed this. 32 matches the dispatch
+    // kernel's warps-per-block cap and covers every production MoE top_k
+    // we've seen (k=1, 2, 4, 6, 8, 16); revisit only if a caller needs more.
+    fb.max_topk_for_combine     = 32;
+    fb.bytes_per_combine_token  = fb.max_topk_for_combine * token_bytes;
+    fb.bytes_per_combine_buf    = max_tokens * fb.bytes_per_combine_token;
 
     // Fabric allocation prop (FABRIC handle + device-pinned).
     CUmemAllocationProp prop = {};
@@ -1110,54 +1146,67 @@ static ncclResult_t init_fullmesh_intranode_fabric(ncclEpGroup_t ep_group,
         if (g == 0) g = 1;
         return (sz + g - 1) & ~(g - 1);
     };
-    fb.recv_aligned_size    = round_up(fb.bytes_per_recv_buf,    gran);
-    fb.counter_aligned_size = round_up(fb.bytes_per_counter_row, gran);
+    fb.recv_aligned_size    = round_up(fb.bytes_per_recv_buf,     gran);
+    fb.counter_aligned_size = round_up(fb.bytes_per_counter_row,  gran);
+    fb.combine_aligned_size = round_up(fb.bytes_per_combine_buf,  gran);
 
-    // --- Allocate local recv + counter, map into local VA ---
+    // --- Allocate local 3 buffers, map into local VA, grant self access ---
     CU_CHECK(cuMemCreate(&fb.recv_local_alloc,    fb.recv_aligned_size,    &prop, 0));
     CU_CHECK(cuMemCreate(&fb.counter_local_alloc, fb.counter_aligned_size, &prop, 0));
+    CU_CHECK(cuMemCreate(&fb.combine_local_alloc, fb.combine_aligned_size, &prop, 0));
 
     CU_CHECK(cuMemAddressReserve(&fb.recv_local_va,    fb.recv_aligned_size,    gran, 0, 0));
     CU_CHECK(cuMemMap(fb.recv_local_va,    fb.recv_aligned_size,    0, fb.recv_local_alloc,    0));
     CU_CHECK(cuMemAddressReserve(&fb.counter_local_va, fb.counter_aligned_size, gran, 0, 0));
     CU_CHECK(cuMemMap(fb.counter_local_va, fb.counter_aligned_size, 0, fb.counter_local_alloc, 0));
+    CU_CHECK(cuMemAddressReserve(&fb.combine_local_va, fb.combine_aligned_size, gran, 0, 0));
+    CU_CHECK(cuMemMap(fb.combine_local_va, fb.combine_aligned_size, 0, fb.combine_local_alloc, 0));
 
     CUmemAccessDesc access = {};
     access.location = prop.location;  // local device
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     CU_CHECK(cuMemSetAccess(fb.recv_local_va,    fb.recv_aligned_size,    &access, 1));
     CU_CHECK(cuMemSetAccess(fb.counter_local_va, fb.counter_aligned_size, &access, 1));
+    CU_CHECK(cuMemSetAccess(fb.combine_local_va, fb.combine_aligned_size, &access, 1));
 
-    // Zero the local counter row so the very first dispatch (commit 4) sees
-    // clean slots. recv_buf is left undefined intentionally — dispatch writes
-    // to only the slots carved by atomicAdd, combine reads only from those.
+    // Zero counter so the very first dispatch sees slot 0 for every src.
+    // recv / combine are left undefined on purpose — kernels write before
+    // anyone reads.
     CUDACHECK_RET(cudaMemsetAsync(reinterpret_cast<void*>(fb.counter_local_va),
                                   0, fb.bytes_per_counter_row, stream));
 
-    // --- Export local fabric handles (both in one allgather) ---
+    // --- Export 3 local fabric handles and allgather them in one shot ---
     CUmemFabricHandle local_recv_fh = {};
     CUmemFabricHandle local_counter_fh = {};
+    CUmemFabricHandle local_combine_fh = {};
     CU_CHECK(cuMemExportToShareableHandle(&local_recv_fh,    fb.recv_local_alloc,
                                           CU_MEM_HANDLE_TYPE_FABRIC, 0));
     CU_CHECK(cuMemExportToShareableHandle(&local_counter_fh, fb.counter_local_alloc,
                                           CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    CU_CHECK(cuMemExportToShareableHandle(&local_combine_fh, fb.combine_local_alloc,
+                                          CU_MEM_HANDLE_TYPE_FABRIC, 0));
 
     static_assert(sizeof(CUmemFabricHandle) == 64, "CUmemFabricHandle expected to be 64 bytes");
     const size_t FH_BYTES = sizeof(CUmemFabricHandle);
+    const size_t SLOT_BYTES = 3 * FH_BYTES;  // recv | counter | combine
 
-    std::unique_ptr<uint8_t[]> gathered(new uint8_t[2 * FH_BYTES * nRanks]);
-    std::memset(gathered.get(), 0, 2 * FH_BYTES * nRanks);
-    std::memcpy(gathered.get() + rank * 2 * FH_BYTES,              &local_recv_fh,    FH_BYTES);
-    std::memcpy(gathered.get() + rank * 2 * FH_BYTES + FH_BYTES,   &local_counter_fh, FH_BYTES);
-    ncclAllGatherHost(gathered.get(), 2 * FH_BYTES, rank, nRanks, comm, stream);
+    std::unique_ptr<uint8_t[]> gathered(new uint8_t[SLOT_BYTES * nRanks]);
+    std::memset(gathered.get(), 0, SLOT_BYTES * nRanks);
+    uint8_t* my_slot = gathered.get() + rank * SLOT_BYTES;
+    std::memcpy(my_slot + 0 * FH_BYTES, &local_recv_fh,    FH_BYTES);
+    std::memcpy(my_slot + 1 * FH_BYTES, &local_counter_fh, FH_BYTES);
+    std::memcpy(my_slot + 2 * FH_BYTES, &local_combine_fh, FH_BYTES);
+    ncclAllGatherHost(gathered.get(), SLOT_BYTES, rank, nRanks, comm, stream);
 
-    // --- Import peer handles + map per-peer VA ---
+    // --- Import peer handles + map per-peer VA for all 3 buffers ---
     fb.peer_recv_vas        = static_cast<CUdeviceptr*>(std::calloc(nRanks, sizeof(CUdeviceptr)));
     fb.peer_counter_vas     = static_cast<CUdeviceptr*>(std::calloc(nRanks, sizeof(CUdeviceptr)));
+    fb.peer_combine_vas     = static_cast<CUdeviceptr*>(std::calloc(nRanks, sizeof(CUdeviceptr)));
     fb.peer_recv_allocs     = static_cast<CUmemGenericAllocationHandle*>(std::calloc(nRanks, sizeof(CUmemGenericAllocationHandle)));
     fb.peer_counter_allocs  = static_cast<CUmemGenericAllocationHandle*>(std::calloc(nRanks, sizeof(CUmemGenericAllocationHandle)));
-    if (!fb.peer_recv_vas || !fb.peer_counter_vas ||
-        !fb.peer_recv_allocs || !fb.peer_counter_allocs) {
+    fb.peer_combine_allocs  = static_cast<CUmemGenericAllocationHandle*>(std::calloc(nRanks, sizeof(CUmemGenericAllocationHandle)));
+    if (!fb.peer_recv_vas || !fb.peer_counter_vas || !fb.peer_combine_vas ||
+        !fb.peer_recv_allocs || !fb.peer_counter_allocs || !fb.peer_combine_allocs) {
         fprintf(stderr, "init_fullmesh_intranode_fabric: calloc failed for peer arrays\n");
         return ncclSystemError;
     }
@@ -1166,70 +1215,86 @@ static ncclResult_t init_fullmesh_intranode_fabric(ncclEpGroup_t ep_group,
         if (i == rank) {
             fb.peer_recv_vas[i]       = fb.recv_local_va;
             fb.peer_counter_vas[i]    = fb.counter_local_va;
+            fb.peer_combine_vas[i]    = fb.combine_local_va;
             fb.peer_recv_allocs[i]    = 0;  // sentinel: don't release own handle via peer cleanup
             fb.peer_counter_allocs[i] = 0;
+            fb.peer_combine_allocs[i] = 0;
             continue;
         }
-        CUmemFabricHandle peer_recv_fh, peer_counter_fh;
-        std::memcpy(&peer_recv_fh,    gathered.get() + i * 2 * FH_BYTES,            FH_BYTES);
-        std::memcpy(&peer_counter_fh, gathered.get() + i * 2 * FH_BYTES + FH_BYTES, FH_BYTES);
+        const uint8_t* peer_slot = gathered.get() + i * SLOT_BYTES;
+        CUmemFabricHandle peer_recv_fh, peer_counter_fh, peer_combine_fh;
+        std::memcpy(&peer_recv_fh,    peer_slot + 0 * FH_BYTES, FH_BYTES);
+        std::memcpy(&peer_counter_fh, peer_slot + 1 * FH_BYTES, FH_BYTES);
+        std::memcpy(&peer_combine_fh, peer_slot + 2 * FH_BYTES, FH_BYTES);
 
-        CUmemGenericAllocationHandle peer_recv_h = 0, peer_counter_h = 0;
+        CUmemGenericAllocationHandle peer_recv_h = 0, peer_counter_h = 0, peer_combine_h = 0;
         CU_CHECK(cuMemImportFromShareableHandle(&peer_recv_h,    &peer_recv_fh,
                                                 CU_MEM_HANDLE_TYPE_FABRIC));
         CU_CHECK(cuMemImportFromShareableHandle(&peer_counter_h, &peer_counter_fh,
                                                 CU_MEM_HANDLE_TYPE_FABRIC));
+        CU_CHECK(cuMemImportFromShareableHandle(&peer_combine_h, &peer_combine_fh,
+                                                CU_MEM_HANDLE_TYPE_FABRIC));
         fb.peer_recv_allocs[i]    = peer_recv_h;
         fb.peer_counter_allocs[i] = peer_counter_h;
+        fb.peer_combine_allocs[i] = peer_combine_h;
 
-        CUdeviceptr peer_recv_va = 0, peer_counter_va = 0;
+        CUdeviceptr peer_recv_va = 0, peer_counter_va = 0, peer_combine_va = 0;
         CU_CHECK(cuMemAddressReserve(&peer_recv_va,    fb.recv_aligned_size,    gran, 0, 0));
         CU_CHECK(cuMemMap           ( peer_recv_va,    fb.recv_aligned_size,    0, peer_recv_h,    0));
         CU_CHECK(cuMemSetAccess     ( peer_recv_va,    fb.recv_aligned_size,    &access, 1));
         CU_CHECK(cuMemAddressReserve(&peer_counter_va, fb.counter_aligned_size, gran, 0, 0));
         CU_CHECK(cuMemMap           ( peer_counter_va, fb.counter_aligned_size, 0, peer_counter_h, 0));
         CU_CHECK(cuMemSetAccess     ( peer_counter_va, fb.counter_aligned_size, &access, 1));
+        CU_CHECK(cuMemAddressReserve(&peer_combine_va, fb.combine_aligned_size, gran, 0, 0));
+        CU_CHECK(cuMemMap           ( peer_combine_va, fb.combine_aligned_size, 0, peer_combine_h, 0));
+        CU_CHECK(cuMemSetAccess     ( peer_combine_va, fb.combine_aligned_size, &access, 1));
 
         fb.peer_recv_vas[i]    = peer_recv_va;
         fb.peer_counter_vas[i] = peer_counter_va;
+        fb.peer_combine_vas[i] = peer_combine_va;
     }
 
-    // --- Build device-side peer pointer arrays so commit-4 dispatch kernel
-    // can do peer_recv_vas_dev[dest] with a single indirection. ---
+    // --- Build device-side peer pointer arrays for kernel one-indirection ---
     std::vector<void*> peer_recv_host(nRanks, nullptr);
     std::vector<void*> peer_counter_host(nRanks, nullptr);
+    std::vector<void*> peer_combine_host(nRanks, nullptr);
     for (int i = 0; i < nRanks; ++i) {
         peer_recv_host[i]    = reinterpret_cast<void*>(fb.peer_recv_vas[i]);
         peer_counter_host[i] = reinterpret_cast<void*>(fb.peer_counter_vas[i]);
+        peer_combine_host[i] = reinterpret_cast<void*>(fb.peer_combine_vas[i]);
     }
     CUDACHECK_RET(ep_group->alloc_fn(reinterpret_cast<void**>(&fb.peer_recv_vas_dev),    nRanks * sizeof(void*)));
     CUDACHECK_RET(ep_group->alloc_fn(reinterpret_cast<void**>(&fb.peer_counter_vas_dev), nRanks * sizeof(void*)));
+    CUDACHECK_RET(ep_group->alloc_fn(reinterpret_cast<void**>(&fb.peer_combine_vas_dev), nRanks * sizeof(void*)));
     CUDACHECK_RET(cudaMemcpyAsync(fb.peer_recv_vas_dev,    peer_recv_host.data(),
                                   nRanks * sizeof(void*), cudaMemcpyHostToDevice, stream));
     CUDACHECK_RET(cudaMemcpyAsync(fb.peer_counter_vas_dev, peer_counter_host.data(),
                                   nRanks * sizeof(void*), cudaMemcpyHostToDevice, stream));
+    CUDACHECK_RET(cudaMemcpyAsync(fb.peer_combine_vas_dev, peer_combine_host.data(),
+                                  nRanks * sizeof(void*), cudaMemcpyHostToDevice, stream));
 
-    // Rank-0 trace: verify layout + first 4 peer addresses so the sweep can
-    // grep this line to confirm every rank saw every peer (commit 2 has no
-    // kernel yet, so this log is the only functional check available).
+    // Rank-0 trace for the sweep to grep and confirm all 3 buffers were
+    // exchanged + mapped, including the newly-added combine buffer.
     if (rank == 0) {
         fprintf(stderr,
                 "[FULLMESH] init_fullmesh_intranode_fabric OK: "
                 "nRanks=%d max_tokens_per_rank=%zu hidden=%d token_bytes=%zu "
                 "meta_bytes=%zu bytes_per_entry=%zu bytes_per_src_block=%zu "
                 "recv_total=%zu (aligned=%zu) counter_total=%zu (aligned=%zu) "
-                "granularity=%zu\n",
+                "combine_total=%zu (aligned=%zu, max_topk=%zu) granularity=%zu\n",
                 nRanks, max_tokens, hidden, token_bytes,
                 fb.meta_bytes, fb.bytes_per_entry, fb.bytes_per_src_block,
                 fb.bytes_per_recv_buf, fb.recv_aligned_size,
                 fb.bytes_per_counter_row, fb.counter_aligned_size,
+                fb.bytes_per_combine_buf, fb.combine_aligned_size, fb.max_topk_for_combine,
                 gran);
         for (int i = 0; i < nRanks && i < 4; ++i) {
             fprintf(stderr,
-                    "[FULLMESH] peer[%d] recv_va=%p counter_va=%p\n",
+                    "[FULLMESH] peer[%d] recv_va=%p counter_va=%p combine_va=%p\n",
                     i,
                     reinterpret_cast<void*>(fb.peer_recv_vas[i]),
-                    reinterpret_cast<void*>(fb.peer_counter_vas[i]));
+                    reinterpret_cast<void*>(fb.peer_counter_vas[i]),
+                    reinterpret_cast<void*>(fb.peer_combine_vas[i]));
         }
         fflush(stderr);
     }
@@ -1244,7 +1309,7 @@ static ncclResult_t destroy_fullmesh_intranode_fabric(ncclEpGroup_t ep_group) {
     int rank = ep_group->rank;
     auto& fb = ep_group->fullmesh_buffers;
 
-    // Unmap + release peers (skip self sentinel handle).
+    // Unmap + release peers (skip self sentinel handle) for all 3 buffers.
     if (fb.peer_recv_vas) {
         for (int i = 0; i < nRanks; ++i) {
             if (i == rank) continue;
@@ -1262,14 +1327,23 @@ static ncclResult_t destroy_fullmesh_intranode_fabric(ncclEpGroup_t ep_group) {
             if (fb.peer_counter_allocs && fb.peer_counter_allocs[i]) {
                 cuMemRelease(fb.peer_counter_allocs[i]);
             }
+            if (fb.peer_combine_vas && fb.peer_combine_vas[i]) {
+                cuMemUnmap(fb.peer_combine_vas[i], fb.combine_aligned_size);
+                cuMemAddressFree(fb.peer_combine_vas[i], fb.combine_aligned_size);
+            }
+            if (fb.peer_combine_allocs && fb.peer_combine_allocs[i]) {
+                cuMemRelease(fb.peer_combine_allocs[i]);
+            }
         }
         std::free(fb.peer_recv_vas);        fb.peer_recv_vas = nullptr;
         std::free(fb.peer_counter_vas);     fb.peer_counter_vas = nullptr;
+        std::free(fb.peer_combine_vas);     fb.peer_combine_vas = nullptr;
         std::free(fb.peer_recv_allocs);     fb.peer_recv_allocs = nullptr;
         std::free(fb.peer_counter_allocs);  fb.peer_counter_allocs = nullptr;
+        std::free(fb.peer_combine_allocs);  fb.peer_combine_allocs = nullptr;
     }
 
-    // Release local allocations.
+    // Release local allocations (recv + counter + combine).
     if (fb.recv_local_va) {
         cuMemUnmap(fb.recv_local_va, fb.recv_aligned_size);
         cuMemAddressFree(fb.recv_local_va, fb.recv_aligned_size);
@@ -1288,6 +1362,15 @@ static ncclResult_t destroy_fullmesh_intranode_fabric(ncclEpGroup_t ep_group) {
         cuMemRelease(fb.counter_local_alloc);
         fb.counter_local_alloc = 0;
     }
+    if (fb.combine_local_va) {
+        cuMemUnmap(fb.combine_local_va, fb.combine_aligned_size);
+        cuMemAddressFree(fb.combine_local_va, fb.combine_aligned_size);
+        fb.combine_local_va = 0;
+    }
+    if (fb.combine_local_alloc) {
+        cuMemRelease(fb.combine_local_alloc);
+        fb.combine_local_alloc = 0;
+    }
 
     // Device-side pointer arrays.
     if (fb.peer_recv_vas_dev) {
@@ -1297,6 +1380,10 @@ static ncclResult_t destroy_fullmesh_intranode_fabric(ncclEpGroup_t ep_group) {
     if (fb.peer_counter_vas_dev) {
         ep_group->free_fn(fb.peer_counter_vas_dev);
         fb.peer_counter_vas_dev = nullptr;
+    }
+    if (fb.peer_combine_vas_dev) {
+        ep_group->free_fn(fb.peer_combine_vas_dev);
+        fb.peer_combine_vas_dev = nullptr;
     }
 
     fb.initialized = false;
@@ -3154,21 +3241,83 @@ ncclResult_t ncclEpCombine(
                 handle->ll.continue_fn = combine_fn;
             }
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
-        // [FULLMESH] Phase 2 commit 1 stub: no kernel launched, no data moved.
-        // The real combine kernel (dest-initiated push of expert FFN output back
-        // to the src rank using the (src_rank, src_token_id) header embedded in
-        // the dispatch payload, plus ncclBarrier for completion sync) lands in
-        // commit 5. Here we just confirm routing is live.
-        static bool logged_combine = false;
-        if (!logged_combine && handle->group->rank == 0) {
-            fprintf(stderr,
-                    "[FULLMESH] ncclEpCombine stub: send_only=%u num_inputs=%u "
-                    "num_outputs=%u num_local_tensors=%u (no-op, commit-1 skeleton)\n",
-                    send_only, num_inputs, num_outputs, num_local_tensors);
-            fflush(stderr);
-            logged_combine = true;
-        }
-        (void)inputs; (void)outputs; (void)local_tensors; (void)config; (void)stream;
+        // [FULLMESH] Phase 2 commit 4: real combine path.
+        //   (a) cudaMemsetAsync on combine_local_va so contributions that the
+        //       current handle's num_topk leaves past are zero (the reduce
+        //       kernel always sums 0..num_topk entries, so unused slots must
+        //       read back as zero, not last-iter garbage).
+        //   (b) ncclBarrier: every rank finishes its memset before any peer
+        //       starts pushing into it.
+        //   (c) launch_combine_push_kernel: dest rank reads its own meta +
+        //       counter_row, then pushes ffn_output[src*max+slot] to
+        //       peer_combine_vas_dev[src_rank][src_token_id][k_in_topk].
+        //   (d) ncclBarrier: all pushes from every peer complete before we
+        //       read our own combine_local_va.
+        //   (e) launch_combine_reduce_kernel: src-local weighted sum across
+        //       the k dimension using topk_weights -> combined_output.
+        ncclEpGroup_t group = handle->group;
+        assert(group->fullmesh_buffers.initialized && "FULLMESH buffers not init'd");
+
+        // Inputs: expert (FFN) output tokens + topk_weights.
+        ncclNDTensor_t expert_out  = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOKENS);
+        ncclNDTensor_t topk_w_in   = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+        ncclNDTensor_t combined_x  = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
+        assert(expert_out != nullptr && "FULLMESH combine missing input TOKENS");
+        assert(topk_w_in  != nullptr && "FULLMESH combine missing input TOPK_WEIGHTS");
+        assert(combined_x != nullptr && "FULLMESH combine missing output TOKENS");
+        assert(expert_out->ndim == 2 && tensor_is_contiguous(expert_out));
+        assert(topk_w_in->ndim  == 2 && tensor_is_contiguous(topk_w_in));
+        assert(combined_x->ndim == 2 && tensor_is_contiguous(combined_x));
+        assert(expert_out->datatype == ncclBfloat16 && "FULLMESH combine only supports bf16 payload");
+        assert(combined_x->datatype == ncclBfloat16);
+        assert(topk_w_in->datatype  == ncclFloat32);
+        assert(combined_x->sizes[0] == handle->num_tokens);
+        assert(topk_w_in->sizes[0]  == handle->num_tokens);
+        assert(topk_w_in->sizes[1]  == handle->num_topk);
+        assert(num_local_tensors == 0 && "FULLMESH combine does not accept local_tensors");
+
+        auto& fb = group->fullmesh_buffers;
+        const int nRanks       = group->nRanks;
+        const int myRank       = group->rank;
+        const int max_tokens   = static_cast<int>(group->config.max_tokens_per_rank);
+        const int hidden_bytes = static_cast<int>(group->config.token_size_bytes);
+        const int max_topk     = static_cast<int>(fb.max_topk_for_combine);
+        assert(handle->num_topk > 0 && handle->num_topk <= max_topk &&
+               "FULLMESH combine: handle num_topk exceeds max_topk_for_combine");
+
+        // (a) Zero the full combine buffer so stale data from past iterations
+        // or slots past num_topk don't leak into the weighted sum.
+        CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(fb.combine_local_va),
+                                   0, fb.bytes_per_combine_buf, stream));
+
+        // (b) Pre-push barrier.
+        NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+
+        // (c) Dest-initiated push kernel.
+        nccl_ep::fullmesh::launch_combine_push_kernel(
+            expert_out->data,                                        // ffn output
+            reinterpret_cast<const void*>(fb.recv_local_va),         // for meta
+            reinterpret_cast<const int32_t*>(fb.counter_local_va),   // counter_row
+            fb.peer_combine_vas_dev,
+            nRanks, myRank, max_tokens, max_topk,
+            hidden_bytes,
+            static_cast<int>(fb.bytes_per_entry),
+            static_cast<int>(fb.meta_bytes),
+            stream);
+
+        // (d) Post-push barrier: peers finished writing into my combine_local_va.
+        NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+
+        // (e) Src-local weighted reduce across k -> combined_output.
+        nccl_ep::fullmesh::launch_combine_reduce_kernel(
+            reinterpret_cast<const void*>(fb.combine_local_va),
+            static_cast<const float*>(topk_w_in->data),
+            combined_x->data,
+            handle->num_tokens, handle->num_topk, max_topk,
+            hidden_bytes,
+            stream);
+
+        (void)config; (void)send_only;
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
         // ===== HT mode =====
         // Combine: gather expert outputs back to original token positions
