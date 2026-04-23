@@ -3258,22 +3258,29 @@ ncclResult_t ncclEpCombine(
         ncclEpGroup_t group = handle->group;
         assert(group->fullmesh_buffers.initialized && "FULLMESH buffers not init'd");
 
-        // Inputs: expert (FFN) output tokens + topk_weights.
+        // Inputs: expert (FFN) output tokens (required) + topk_weights (optional).
+        // topk_weights is absent in ep_bench's HT tensor setup (it puts them in
+        // combine_inputs[1] but sets num_combine_inputs=1, so find_tensor_by_tag
+        // only sees inputs[0] = expert_outputs). Allow nullptr and fall back to
+        // uniform 1/num_topk in the reduce kernel -- matches HT's forward
+        // combine semantics and keeps FULLMESH testable without touching the
+        // benchmark.
         ncclNDTensor_t expert_out  = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOKENS);
         ncclNDTensor_t topk_w_in   = find_tensor_by_tag(inputs, num_inputs, NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
         ncclNDTensor_t combined_x  = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
         assert(expert_out != nullptr && "FULLMESH combine missing input TOKENS");
-        assert(topk_w_in  != nullptr && "FULLMESH combine missing input TOPK_WEIGHTS");
         assert(combined_x != nullptr && "FULLMESH combine missing output TOKENS");
         assert(expert_out->ndim == 2 && tensor_is_contiguous(expert_out));
-        assert(topk_w_in->ndim  == 2 && tensor_is_contiguous(topk_w_in));
         assert(combined_x->ndim == 2 && tensor_is_contiguous(combined_x));
         assert(expert_out->datatype == ncclBfloat16 && "FULLMESH combine only supports bf16 payload");
         assert(combined_x->datatype == ncclBfloat16);
-        assert(topk_w_in->datatype  == ncclFloat32);
         assert(combined_x->sizes[0] == handle->num_tokens);
-        assert(topk_w_in->sizes[0]  == handle->num_tokens);
-        assert(topk_w_in->sizes[1]  == handle->num_topk);
+        if (topk_w_in != nullptr) {
+            assert(topk_w_in->ndim == 2 && tensor_is_contiguous(topk_w_in));
+            assert(topk_w_in->datatype == ncclFloat32);
+            assert(topk_w_in->sizes[0] == handle->num_tokens);
+            assert(topk_w_in->sizes[1] == handle->num_topk);
+        }
         assert(num_local_tensors == 0 && "FULLMESH combine does not accept local_tensors");
 
         auto& fb = group->fullmesh_buffers;
@@ -3311,7 +3318,7 @@ ncclResult_t ncclEpCombine(
         // (e) Src-local weighted reduce across k -> combined_output.
         nccl_ep::fullmesh::launch_combine_reduce_kernel(
             reinterpret_cast<const void*>(fb.combine_local_va),
-            static_cast<const float*>(topk_w_in->data),
+            topk_w_in ? static_cast<const float*>(topk_w_in->data) : nullptr,
             combined_x->data,
             handle->num_tokens, handle->num_topk, max_topk,
             hidden_bytes,

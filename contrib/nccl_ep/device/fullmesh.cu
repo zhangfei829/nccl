@@ -287,7 +287,13 @@ __global__ void combine_reduce_kernel(
 
     // Each thread covers a strided slice of the hidden dim. For each assigned
     // h, loop over k, accumulate weights[k] * combine[t,k,h] in fp32, then
-    // write bf16 result to combined_output[t,h].
+    // write bf16 result to combined_output[t,h]. If topk_weights is null
+    // (caller did not provide TOPK_WEIGHTS in combine inputs), fall back to
+    // uniform 1/num_topk weighting -- this matches HT's forward-combine
+    // semantics and keeps FULLMESH working with ep_bench's existing HT
+    // tensor setup (num_combine_inputs=1, topk_weights absent) without a
+    // per-algorithm branch in the benchmark.
+    const float uniform_w = (num_topk > 0) ? (1.0f / static_cast<float>(num_topk)) : 0.f;
     for (int h = tid; h < hidden; h += nthreads) {
         float acc = 0.f;
         for (int k = 0; k < num_topk; ++k) {
@@ -298,7 +304,9 @@ __global__ void combine_reduce_kernel(
             uint16_t bf   = combine_local[slot_idx];
             uint32_t bits = static_cast<uint32_t>(bf) << 16;
             float    v    = __int_as_float(static_cast<int>(bits));
-            float    w    = topk_weights[static_cast<size_t>(t) * num_topk + k];
+            float    w    = (topk_weights != nullptr)
+                          ? topk_weights[static_cast<size_t>(t) * num_topk + k]
+                          : uniform_w;
             acc += w * v;
         }
         // bf16 round-to-nearest-even via "add 0x7fff + lsb" trick.

@@ -162,6 +162,7 @@ void launch_combine_push_kernel(
 //   For each k in 0..num_topk-1:
 //     load combine_local_va[t * max_topk + k] (hidden bf16)
 //     accumulate weighted by topk_weights[t * num_topk + k] in fp32
+//     (fallback: uniform 1/num_topk if topk_weights == nullptr)
 //   Store acc -> combined_output[t] in bf16.
 //
 // Assumes the user cudaMemsetAsync'd combine_local_va to zero before combine
@@ -169,7 +170,7 @@ void launch_combine_push_kernel(
 // nothing to the sum. That memset is the caller's job.
 void launch_combine_reduce_kernel(
     const void*       combine_local_va,       // src-local [num_tokens][max_topk][hidden]
-    const float*      topk_weights,           // [num_tokens, num_topk]
+    const float*      topk_weights,           // [num_tokens, num_topk] or nullptr => uniform
     void*             combined_output,        // [num_tokens, hidden] bf16 dst
     int               num_tokens,
     int               num_topk,
