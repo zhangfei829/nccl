@@ -32,7 +32,11 @@ namespace {
 // future tuning) early-exit. Tokens whose topk_idx==-1 (masked / dropped)
 // also early-exit without consuming a slot, which matches HT's is-routed
 // semantics in hybrid_ep.cuh.
-__global__ void dispatch_kernel(
+// Name pattern: "fullmesh_<op>_kernel[_<phase>]" so CUPTI name-substring
+// filters in ep_bench.cu (ktimer.get_avg_us("dispatch_kernel") and "combine
+// _kernel") still match, and grep in sweep logs can pick FULLMESH kernels
+// out by the fullmesh_ prefix.
+__global__ void fullmesh_dispatch_kernel(
     const uint4*     __restrict__ x,                 // [num_tokens, hidden_u4]
     const int64_t*   __restrict__ topk_idx,          // [num_tokens, top_k]
     void* const*     __restrict__ peer_recv_vas,    // [nRanks]
@@ -164,7 +168,7 @@ void launch_dispatch_kernel(
 
     dim3 grid(num_tokens);
     dim3 block(threads_per_block);
-    dispatch_kernel<<<grid, block, 0, stream>>>(
+    fullmesh_dispatch_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint4*>(x_void),
         topk_idx,
         peer_recv_vas_dev,
@@ -211,7 +215,7 @@ namespace {
 // Dest-initiated combine push. One block per (src, slot); warp cooperatively
 // streams the hidden payload of the FFN output to the src rank's combine_recv
 // _buf at [src_token_id, k_in_topk]. See fullmesh.cuh for full contract.
-__global__ void combine_push_kernel(
+__global__ void fullmesh_combine_kernel_push(
     const uint4*    __restrict__ ffn_output,            // [nRanks*max_tokens, hidden_u4]
     const uint8_t*  __restrict__ recv_local_va,         // this rank's dispatch recv_buf
     const int32_t*  __restrict__ counter_local_va,      // this rank's counter_row[nRanks]
@@ -270,7 +274,7 @@ __global__ void combine_push_kernel(
 
 // Src-side weighted sum across the k dimension.
 // Grid (num_tokens,), block cooperative streams hidden_u4 entries.
-__global__ void combine_reduce_kernel(
+__global__ void fullmesh_combine_kernel_reduce(
     const uint16_t* __restrict__ combine_local,    // [num_tokens*max_topk*hidden] bf16
     const float*    __restrict__ topk_weights,     // [num_tokens, num_topk]
     uint16_t*       __restrict__ combined_output,  // [num_tokens, hidden] bf16
@@ -344,7 +348,7 @@ void launch_combine_push_kernel(
 
     dim3 grid(nRanks, max_tokens_per_rank);
     dim3 block(32);
-    combine_push_kernel<<<grid, block, 0, stream>>>(
+    fullmesh_combine_kernel_push<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint4*>(ffn_output_void),
         reinterpret_cast<const uint8_t*>(recv_local_va),
         counter_local_va,
@@ -372,7 +376,7 @@ void launch_combine_reduce_kernel(
     // the common-case tail of the loop simple.
     dim3 grid(num_tokens);
     dim3 block(256);
-    combine_reduce_kernel<<<grid, block, 0, stream>>>(
+    fullmesh_combine_kernel_reduce<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(combine_local_va_void),
         topk_weights,
         reinterpret_cast<uint16_t*>(combined_output_void),

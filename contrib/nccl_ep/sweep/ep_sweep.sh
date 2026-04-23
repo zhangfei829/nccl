@@ -17,6 +17,8 @@
 #     MODES            Which (algorithm,dtype) combos to run.
 #                      Valid tokens in MODES:
 #                        ll / ht_bf16 / ht_fp8          -- production dispatch
+#                        fullmesh_bf16                  -- Phase 2 FULLMESH
+#                                                         (NV72 MNNVL direct
 #                        slot_scan / slot_atomic /
 #                        slot_cumsum                    -- Phase 2 Stage 1
 #                                                         slot-alloc microbench;
@@ -141,6 +143,13 @@ should_skip() {
             # HT: MAX_SUPPORTED_TOKENS_PER_RANK is compiled at 8192.
             if (( tokens > 8192 )); then return 0; fi
             ;;
+        fullmesh_bf16)
+            # FULLMESH recv_buf = nRanks * max_tokens * (meta+hidden)
+            # FULLMESH combine_buf = max_tokens * max_topk(32) * hidden
+            # At EP32 tokens=8192 hidden=7168, total per rank ~= 8 GB fabric.
+            # HBM3e 96GB fits comfortably; cap at 8192 for symmetry with HT.
+            if (( tokens > 8192 )); then return 0; fi
+            ;;
     esac
     return 1
 }
@@ -160,6 +169,14 @@ mode_to_algo_args() {
         ht_fp8)
             ALGO="ht"; WARMUP="$WARMUP_HT"; ITERS="$ITERS_HT"
             EXTRA_ARGS="--use-fp8"; DTYPE_TAG="fp8"
+            ;;
+        fullmesh_bf16)
+            # Phase 2 FULLMESH: NV72 MNNVL direct peer-store. Reuses HT warmup /
+            # iters counts so the sweep's per-cell cost is comparable; DTYPE_TAG
+            # stays bf16 so the CSV's (mode, dispatch_dtype_tag) key is unique
+            # per algorithm+dtype combination.
+            ALGO="fullmesh"; WARMUP="$WARMUP_HT"; ITERS="$ITERS_HT"
+            EXTRA_ARGS=""; DTYPE_TAG="bf16"
             ;;
         slot_scan|slot_atomic|slot_cumsum)
             # Phase 2 Stage 1 slot-alloc microbench. --algorithm is still

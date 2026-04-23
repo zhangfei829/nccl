@@ -14,7 +14,10 @@
 # Env overrides:
 #     EP_SIZES       default "4 8 16 32 64"
 #     TOKENS         default "16 32 64 128 256 4096 8192"
-#     MODES          default "ll ht_bf16 ht_fp8"
+#     MODES          default "ll ht_bf16 ht_fp8"; use
+#                    "fullmesh_bf16" to run the Phase 2 FULLMESH backend,
+#                    or pair it with HT for side-by-side comparison:
+#                    MODES="ht_bf16 fullmesh_bf16" bash run_all_from_jumphost.sh
 #     PARTITION      default gb300
 #     TIME_LIMIT     default 02:00:00
 #     OUT_ROOT       default $HOME/fizhang/nccl-sweep-<ts>
