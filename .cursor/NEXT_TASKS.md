@@ -58,7 +58,85 @@ output 的 peer mapping，要 push 必须经 fabric。
 **三个 alt 的 ROI 都不突出**。决定：Commit B 先搁置，等 Phase 3 确实卡
 在 memcpy2D 上且有时间做 API 扩展时再动。
 
-## 当前在做：Commit P3-diag — FULLMESH 内部 per-stage profile event
+## P3-diag 实测 breakdown (EP=8 iter 2-7 均值, profile mode)
+
+**EP=8 t=128**: total=283us
+  dispatch: memset=4.9 barrier1=33.6 kernel=32.4 barrier2=31.5 memcpy2d=24.3 → 127us
+  combine:  memset=9.8 barrier1=25.4 push=28.0 barrier2=33.9 reduce=59.6 → 157us
+
+**EP=8 t=8192**: total=4036us
+  dispatch: memset=4.9 barrier1=41.0 kernel=**1401.6** barrier2=62.2 memcpy2d=**522.7** → 2032us
+  combine:  memset=**135.0** barrier1=25.1 push=**1169.8** barrier2=37.4 reduce=**636.5** → 2004us
+
+### 关键修正（之前的推算都低估了 HBM3e 带宽）
+
+- Combine memset effective rate **~7 TB/s**（0.94 GB / 135us）,
+  不是之前估的 1500 GB/s。Commit A 原 memset 时间 ≈ 540us（不是
+  1880us），Commit A 节省 ≈ 405us 对上实测 344us。
+- Dispatch kernel 做 938 MB 的 push @ **670 GB/s**，已 85% fabric peak
+  (peak ~800 GB/s)。TMA / kernel micro-opt 能压出的余量 <15%。
+- Combine push kernel 938 MB @ **802 GB/s**，已 100% fabric peak。
+  零优化空间。
+- Combine reduce kernel 1055 MB @ **1656 GB/s**，HBM3e peak ~5 TB/s
+  时 33% 饱和。有 ~2x 优化空间（唯一的 kernel 余量）。
+- 4× ncclBarrier 在 stream 上共 **166us @ t=8192**，只占 4%。
+  Commit C (device-barrier) ROI 极低，撤回优先级。
+
+### Phase 3 后续 commit 的真实 ROI（按实测重排）
+
+1. **Commit B (消除 memcpy2d)**: EP8 t=8192 节省 523us，EP32 推算 ~2000us。
+   但 Commit B 需要 tensor API 扩展或 data-pointer-alias trick
+   （见下节）。改动规模 100-200 行。
+2. **Commit E (优化 reduce kernel)**: 当前 33% HBM 饱和，改 block size
+   + vectorized load 可能压到 60% → 节省 ~300us @ t=8192。中小改动。
+3. ~~Commit C (device barrier)~~: 撤回。只 166us @ t=8192 stream time,
+   收益 <100us。
+4. ~~Commit D (TMA)~~: 撤回。kernel 已 85-100% fabric 饱和。
+
+### Commit B 的架构选项与决策
+
+Output tensor 目前是 cudaMalloc 分配，非 fabric-mapped。要让 dispatch
+kernel 直接写 output（省掉 memcpy2d）：
+
+- **B-alt-3 (内部 data-pointer alias + recv_buf 变 payload-only)**:
+  recv_buf 从 [nRanks][max_tokens][meta+hidden] 变为两块独立 fabric
+  alloc:
+    meta_buf [nRanks][max_tokens][16B]  ~4 MB
+    recv_payload_buf [nRanks][max_tokens][hidden_bytes]  dense
+  在 ncclEpDispatch FULLMESH 分支里，把 output tensor->data 替换为
+  `fb.recv_payload_buf + myRank_block_offset`，user 通过 ncclEpTensorGetData
+  拿到的是 fabric-mapped 指针（user 释放时用 ncclEpTensorDestroy 会走
+  free_fn，但 owns_data=false 跳过 free；原 cudaMalloc 那块留到 group
+  destroy 时 release）。
+  改动约 150 行，不扩展 public API。
+- **B-alt-4 (扩展 ncclEpTensorCreate flags)**: 加 NCCL_EP_TENSOR_FLAG_
+  FABRIC_ACCESSIBLE，true 时用 cuMemCreate(FABRIC)。ep_bench setup 传
+  flag。public API 变更，~200 行。
+
+推荐 B-alt-3（不动 public API，用户代码无感）。
+
+### 硬限制
+
+EP=8 t=8192 下 FM kernel-only D+C = 3209us 比 HT kernel-only D+C = 2164us
+**慢 1045us**。即便 Commit B 消掉 memcpy2d 523us，FM 4084 - 523 = 3561us
+仍 > HT 2764us。原因：FM combine 拆成 push + reduce 两个 kernel，比 HT
+的融合 combine 多过一次 HBM。EP8 small scale 下 FM 追不上 HT 是架构决定。
+
+但 EP16/32 下 FM kernel-only 已经赢 HT（phase2-done tag 记录），Commit B
+做了差距会进一步放大。
+
+### 下一步决策点
+
+给用户选：
+- A. 继续 Commit B (B-alt-3)，EP16/32 total_us 继续压，但 EP8 small 场景
+     仍追不上 HT。
+- B. Phase 3 到此为止，Commit A 已把 hot path 最 obvious 的浪费
+     （memset 全量）砍掉；FULLMESH 作为 "EP ≥ 16 + t ≥ 4096 领先 HT" 的
+     production 路径就绪，其余留给未来 API 扩展。
+- C. 先做 Commit E（优化 reduce kernel），~300us 收益，改动小；之后再看
+     是否做 Commit B。
+
+## 以下为历史记录：Commit P3-diag 实施说明
 
 **目的**：不再基于推算评估 memset / barrier / memcpy / kernel 的 absolute
 时间，用 cudaEvent 在 FULLMESH dispatch + combine 的每个 stream op 之间
