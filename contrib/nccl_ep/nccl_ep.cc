@@ -2819,12 +2819,37 @@ ncclResult_t ncclEpDispatch(
         const int hidden_bytes     = static_cast<int>(group->config.token_size_bytes);
         const int num_local_exps   = group->num_local_experts;
 
+        // Phase 3 diagnostic: per-stage cudaEvent profiling. env
+        // NCCL_EP_FULLMESH_PROFILE=1 enables 5-stage timing so we can read
+        // memset / barrier / kernel / barrier / memcpy2d absolute us instead
+        // of reverse-engineering it from `dispatch_avg_us - kernel_us`. Each
+        // profile call does a cudaStreamSynchronize + 5 cudaEventElapsedTime,
+        // which INFLATES dispatch_avg_us by ~0.1 ms; only use for one-off
+        // breakdown runs, then unset the env to get normal timing back.
+        static const bool fm_prof = [](){
+            const char* v = std::getenv("NCCL_EP_FULLMESH_PROFILE");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+        cudaEvent_t ev_d0 = nullptr, ev_d1 = nullptr, ev_d2 = nullptr,
+                    ev_d3 = nullptr, ev_d4 = nullptr, ev_d5 = nullptr;
+        if (fm_prof) {
+            CUDA_CHECK(cudaEventCreate(&ev_d0));
+            CUDA_CHECK(cudaEventCreate(&ev_d1));
+            CUDA_CHECK(cudaEventCreate(&ev_d2));
+            CUDA_CHECK(cudaEventCreate(&ev_d3));
+            CUDA_CHECK(cudaEventCreate(&ev_d4));
+            CUDA_CHECK(cudaEventCreate(&ev_d5));
+            CUDA_CHECK(cudaEventRecord(ev_d0, stream));
+        }
+
         // (a) Reset this rank's counter row on the group stream.
         CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(fb.counter_local_va),
                                    0, fb.bytes_per_counter_row, stream));
+        if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d1, stream));
 
         // (b) Cross-rank barrier so no peer atomicAdds our counter before reset finishes.
         NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+        if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d2, stream));
 
         // (c) Fused atomicAdd-slot + payload push kernel.
         nccl_ep::fullmesh::launch_dispatch_kernel(
@@ -2842,9 +2867,11 @@ ncclResult_t ncclEpDispatch(
             static_cast<int>(fb.bytes_per_entry),
             static_cast<int>(fb.meta_bytes),
             stream);
+        if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d3, stream));
 
         // (d) Cross-rank barrier so every peer has finished writing into my recv_buf.
         NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+        if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d4, stream));
 
         // (e) Strip per-entry meta and project payload to the dense output tensor.
         nccl_ep::fullmesh::launch_compact_to_output(
@@ -2856,6 +2883,30 @@ ncclResult_t ncclEpDispatch(
             static_cast<int>(fb.bytes_per_entry),
             static_cast<int>(fb.meta_bytes),
             stream);
+        if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d5, stream));
+
+        if (fm_prof) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            float memset_ms = 0, bar1_ms = 0, kernel_ms = 0, bar2_ms = 0, cpy_ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&memset_ms, ev_d0, ev_d1));
+            CUDA_CHECK(cudaEventElapsedTime(&bar1_ms,   ev_d1, ev_d2));
+            CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev_d2, ev_d3));
+            CUDA_CHECK(cudaEventElapsedTime(&bar2_ms,   ev_d3, ev_d4));
+            CUDA_CHECK(cudaEventElapsedTime(&cpy_ms,    ev_d4, ev_d5));
+            if (myRank == 0) {
+                fprintf(stderr,
+                        "[FM-PROFILE] dispatch EP=%d t=%d  "
+                        "memset=%.1f barrier1=%.1f kernel=%.1f barrier2=%.1f memcpy2d=%.1f  "
+                        "total_stream=%.1f us\n",
+                        nRanks, handle->num_tokens,
+                        memset_ms * 1000.f, bar1_ms * 1000.f,
+                        kernel_ms * 1000.f, bar2_ms * 1000.f, cpy_ms * 1000.f,
+                        (memset_ms + bar1_ms + kernel_ms + bar2_ms + cpy_ms) * 1000.f);
+                fflush(stderr);
+            }
+            cudaEventDestroy(ev_d0); cudaEventDestroy(ev_d1); cudaEventDestroy(ev_d2);
+            cudaEventDestroy(ev_d3); cudaEventDestroy(ev_d4); cudaEventDestroy(ev_d5);
+        }
 
         (void)config; (void)send_only;
     } else { // HT
@@ -3315,6 +3366,27 @@ ncclResult_t ncclEpCombine(
         // Shape: combine_local_va layout is [max_tokens][max_topk][hidden_bytes].
         // Row pitch = max_topk * hidden_bytes. We want to zero the first
         // num_topk * hidden_bytes of every row, for max_tokens_per_rank rows.
+
+        // Phase 3 diagnostic: per-stage profile events. Uses the same env flag
+        // as dispatch (NCCL_EP_FULLMESH_PROFILE). 5 stages: memset / barrier1
+        // / push / barrier2 / reduce. Adds a cudaStreamSynchronize per call
+        // when enabled so combine_avg_us inflates; use only for breakdown.
+        static const bool fm_prof_c = [](){
+            const char* v = std::getenv("NCCL_EP_FULLMESH_PROFILE");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+        cudaEvent_t ev_c0 = nullptr, ev_c1 = nullptr, ev_c2 = nullptr,
+                    ev_c3 = nullptr, ev_c4 = nullptr, ev_c5 = nullptr;
+        if (fm_prof_c) {
+            CUDA_CHECK(cudaEventCreate(&ev_c0));
+            CUDA_CHECK(cudaEventCreate(&ev_c1));
+            CUDA_CHECK(cudaEventCreate(&ev_c2));
+            CUDA_CHECK(cudaEventCreate(&ev_c3));
+            CUDA_CHECK(cudaEventCreate(&ev_c4));
+            CUDA_CHECK(cudaEventCreate(&ev_c5));
+            CUDA_CHECK(cudaEventRecord(ev_c0, stream));
+        }
+
         {
             const size_t row_pitch_bytes = fb.max_topk_for_combine
                                          * static_cast<size_t>(hidden_bytes);
@@ -3328,9 +3400,11 @@ ncclResult_t ncclEpCombine(
                 static_cast<size_t>(max_tokens),
                 stream));
         }
+        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c1, stream));
 
         // (b) Pre-push barrier.
         NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c2, stream));
 
         // (c) Dest-initiated push kernel.
         nccl_ep::fullmesh::launch_combine_push_kernel(
@@ -3343,9 +3417,11 @@ ncclResult_t ncclEpCombine(
             static_cast<int>(fb.bytes_per_entry),
             static_cast<int>(fb.meta_bytes),
             stream);
+        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
 
         // (d) Post-push barrier: peers finished writing into my combine_local_va.
         NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c4, stream));
 
         // (e) Src-local weighted reduce across k -> combined_output.
         nccl_ep::fullmesh::launch_combine_reduce_kernel(
@@ -3355,6 +3431,30 @@ ncclResult_t ncclEpCombine(
             handle->num_tokens, handle->num_topk, max_topk,
             hidden_bytes,
             stream);
+        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c5, stream));
+
+        if (fm_prof_c) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            float memset_ms = 0, bar1_ms = 0, push_ms = 0, bar2_ms = 0, reduce_ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&memset_ms, ev_c0, ev_c1));
+            CUDA_CHECK(cudaEventElapsedTime(&bar1_ms,   ev_c1, ev_c2));
+            CUDA_CHECK(cudaEventElapsedTime(&push_ms,   ev_c2, ev_c3));
+            CUDA_CHECK(cudaEventElapsedTime(&bar2_ms,   ev_c3, ev_c4));
+            CUDA_CHECK(cudaEventElapsedTime(&reduce_ms, ev_c4, ev_c5));
+            if (myRank == 0) {
+                fprintf(stderr,
+                        "[FM-PROFILE] combine  EP=%d t=%d  "
+                        "memset=%.1f barrier1=%.1f push=%.1f barrier2=%.1f reduce=%.1f  "
+                        "total_stream=%.1f us\n",
+                        nRanks, handle->num_tokens,
+                        memset_ms * 1000.f, bar1_ms * 1000.f,
+                        push_ms * 1000.f, bar2_ms * 1000.f, reduce_ms * 1000.f,
+                        (memset_ms + bar1_ms + push_ms + bar2_ms + reduce_ms) * 1000.f);
+                fflush(stderr);
+            }
+            cudaEventDestroy(ev_c0); cudaEventDestroy(ev_c1); cudaEventDestroy(ev_c2);
+            cudaEventDestroy(ev_c3); cudaEventDestroy(ev_c4); cudaEventDestroy(ev_c5);
+        }
 
         (void)config; (void)send_only;
     } else if (handle->group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT) {
