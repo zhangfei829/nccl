@@ -3292,10 +3292,42 @@ ncclResult_t ncclEpCombine(
         assert(handle->num_topk > 0 && handle->num_topk <= max_topk &&
                "FULLMESH combine: handle num_topk exceeds max_topk_for_combine");
 
-        // (a) Zero the full combine buffer so stale data from past iterations
-        // or slots past num_topk don't leak into the weighted sum.
-        CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(fb.combine_local_va),
-                                   0, fb.bytes_per_combine_buf, stream));
+        // (a) Zero only the ACTIVE num_topk columns of combine_buf so stale
+        // data from past iterations doesn't leak into the weighted sum.
+        //
+        // Why 2D instead of flat memset of the full buffer: combine_local_va
+        // is sized to max_topk_for_combine (=32) columns per token as a
+        // group-level upper bound, but the current handle's num_topk is
+        // normally <= 8. push_kernel only writes columns [0, num_topk),
+        // reduce_kernel only reads columns [0, num_topk) (loops 0..num_topk-1).
+        // Columns [num_topk, max_topk) are completely untouched by the kernels,
+        // so zeroing them every call is 100% waste.
+        //
+        // Why memset at all (can't just delete it): dispatch_kernel early-exits
+        // on topk_idx[t][k] == -1, so masked (t, k) pairs never reach the
+        // push_kernel, and the corresponding combine_buf[t][k] is not written
+        // by anyone this iteration. Without memset, reduce_kernel reads stale
+        // residue from last iteration. generateTopkIndicesHT never emits -1
+        // (HT mode is the dense case), but LL's generateRandomTopkIndicesLL
+        // and real production topk_idx can, so Phase 3 keeps the memset and
+        // only shrinks its width.
+        //
+        // Shape: combine_local_va layout is [max_tokens][max_topk][hidden_bytes].
+        // Row pitch = max_topk * hidden_bytes. We want to zero the first
+        // num_topk * hidden_bytes of every row, for max_tokens_per_rank rows.
+        {
+            const size_t row_pitch_bytes = fb.max_topk_for_combine
+                                         * static_cast<size_t>(hidden_bytes);
+            const size_t active_width_bytes = static_cast<size_t>(handle->num_topk)
+                                            * static_cast<size_t>(hidden_bytes);
+            CUDA_CHECK(cudaMemset2DAsync(
+                reinterpret_cast<void*>(fb.combine_local_va),
+                row_pitch_bytes,
+                0,
+                active_width_bytes,
+                static_cast<size_t>(max_tokens),
+                stream));
+        }
 
         // (b) Pre-push barrier.
         NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));

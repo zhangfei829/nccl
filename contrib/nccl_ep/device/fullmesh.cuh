@@ -165,9 +165,20 @@ void launch_combine_push_kernel(
 //     (fallback: uniform 1/num_topk if topk_weights == nullptr)
 //   Store acc -> combined_output[t] in bf16.
 //
-// Assumes the user cudaMemsetAsync'd combine_local_va to zero before combine
-// push so slots for k beyond the actual routed count are 0 and contribute
-// nothing to the sum. That memset is the caller's job.
+// Caller contract on combine_local_va zeroing (Phase 3 Commit A):
+//   Slots (t, k) for k in [0, num_topk) MUST be zero before push_kernel runs,
+//   because some (t, k) pairs have topk_idx == -1 (masked) and are never
+//   written by any peer's push -- reduce_kernel will still read them when
+//   iterating k = 0..num_topk-1, so stale residue from a past iteration
+//   would corrupt the weighted sum.
+//   Slots (t, k) for k in [num_topk, max_topk_for_combine) are never
+//   written (push checks k_in_topk < max_topk_for_combine via the meta
+//   field, but push_kernel ONLY runs for k < num_topk in practice because
+//   dispatch_kernel's warp_id bound is top_k == num_topk) and never read
+//   (reduce_kernel stops at k == num_topk), so they can hold arbitrary
+//   garbage and the caller should NOT waste bandwidth zeroing them.
+//   ncclEpCombine in nccl_ep.cc uses cudaMemset2DAsync to zero exactly
+//   the first num_topk columns of every row.
 void launch_combine_reduce_kernel(
     const void*       combine_local_va,       // src-local [num_tokens][max_topk][hidden]
     const float*      topk_weights,           // [num_tokens, num_topk] or nullptr => uniform
