@@ -1365,18 +1365,27 @@ HighThroughputBytes calculateHighThroughputBytes(
     int local_node = myRank / num_ranks_per_node;
     unsigned int num_experts_per_rank = num_experts / static_cast<unsigned int>(nRanks);
 
-    // Send side: count unique (token, node) pairs from this rank's topk_idx
-    // A token routed to multiple experts on the same node is counted only once, even though
-    // NCCL EP sends it to each target rank individually via NVLink P2P (not once per node).
-    // TODO: switch to per-rank counting for both nvl_send and nvl_recv.
+    // Send side (HT semantics): HT dispatches each token to each unique target
+    // RANK in its top-k set, merging multiple experts on the same rank into a
+    // single per-rank payload push (expert_ids and weights are carried as
+    // metadata, not copies of the token body). So total_send_tokens counts
+    // unique (my_token, target_rank) pairs. rdma_send_tokens is the subset
+    // whose target_rank is on a different physical node than this rank.
+    //
+    // This replaces an older formula that dedup'd by unique target NODE, which
+    // under MNNVL full-coverage (num_nodes == 1) collapsed total_send_tokens to
+    // num_tokens regardless of top_k and made HT's send bandwidth read top_k
+    // times lower than the actual wire throughput. The rank-level dedup here
+    // matches what the HT dispatch kernel actually writes over NVLink / fabric.
     for (unsigned int t = 0; t < num_tokens; t++) {
-        std::set<int> nodes_for_token;
+        std::set<int> ranks_for_token;
         for (unsigned int k = 0; k < top_k; k++) {
             int64_t expert_id = topk_idx_host[t * top_k + k];
             if (expert_id < 0) continue;
-            int target_node = static_cast<int>(expert_id / num_experts_per_node);
-            if (nodes_for_token.insert(target_node).second) {
+            int target_rank = static_cast<int>(expert_id / num_experts_per_rank);
+            if (ranks_for_token.insert(target_rank).second) {
                 bytes.total_send_tokens++;
+                int target_node = target_rank / num_ranks_per_node;
                 if (target_node != local_node)
                     bytes.rdma_send_tokens++;
             }
@@ -1384,9 +1393,10 @@ HighThroughputBytes calculateHighThroughputBytes(
     }
 
     // Recv side: replay every source rank's randperm routing to count tokens
-    // received by myRank. This is deterministic because each rank uses the
-    // same seed (src_rank + 42) and same shuffle algorithm.
-    // Each (src_rank, token) pair is counted once regardless of how many experts on myRank it targets.
+    // received by myRank. HT also per-rank-dedups inbound (per (src_rank,
+    // src_token) pair once, regardless of how many of myRank's experts the
+    // src token targeted), so the break-on-first-match below is semantically
+    // consistent with the send side.
     std::vector<int64_t> src_perm(num_experts);
     for (int src_rank = 0; src_rank < nRanks; src_rank++) {
         int src_node = src_rank / num_ranks_per_node;
@@ -1402,6 +1412,83 @@ HighThroughputBytes calculateHighThroughputBytes(
                     bytes.total_recv_tokens++;
                     if (is_rdma) bytes.rdma_recv_tokens++;
                     break;
+                }
+            }
+        }
+    }
+
+    const size_t bf16_bytes_per_token = hidden * 2;
+    const double fp8_factor = (1.0 + 4.0 / 128.0) / 2.0;
+    const size_t bytes_per_token = use_fp8 ?
+        static_cast<size_t>(bf16_bytes_per_token * fp8_factor) : bf16_bytes_per_token;
+
+    bytes.total_send_bytes = bytes.total_send_tokens * bytes_per_token;
+    bytes.rdma_send_bytes  = bytes.rdma_send_tokens  * bytes_per_token;
+    bytes.total_recv_bytes = bytes.total_recv_tokens   * bytes_per_token;
+    bytes.rdma_recv_bytes  = bytes.rdma_recv_tokens   * bytes_per_token;
+
+    return bytes;
+}
+
+// Compute per-rank wire bytes for FULLMESH.
+// FULLMESH differs from HT in that every (my_token, expert) pair in the top-k
+// is pushed independently (the dispatch kernel writes one recv slot per k),
+// with NO per-rank deduplication. A token whose top-k routes to two experts
+// on the same dest rank results in two separate slot pushes, not one shared
+// payload. Symmetrically on the recv side, each (src_rank, src_token, expert
+// _on_my_rank) triple causes one slot landing on myRank's recv buffer, and
+// multiple matches per src_token are all counted.
+//
+// Consequence under MNNVL (num_nodes==1): rdma_* are always zero; nvl_* is
+// total_*. At typical top_k=8, num_experts=256, nRanks=32 this yields a
+// send count of roughly num_tokens*top_k = 8*num_tokens per rank, i.e. 8x
+// HT's per-rank-dedup'd send count. This is the correct apples-to-apples
+// number vs HT because FM's kernel actually does push that many slots
+// over the fabric.
+HighThroughputBytes calculateFullmeshBytes(
+    const int64_t* topk_idx_host,
+    unsigned int num_tokens,
+    unsigned int top_k,
+    unsigned int num_experts,
+    unsigned int hidden,
+    int myRank,
+    int nRanks,
+    bool use_fp8,
+    int num_ranks_per_node
+) {
+    HighThroughputBytes bytes = {0, 0, 0, 0, 0, 0, 0, 0, use_fp8};
+
+    int local_node = myRank / num_ranks_per_node;
+    unsigned int num_experts_per_rank = num_experts / static_cast<unsigned int>(nRanks);
+
+    // Send side: one per-expert slot per (my_token, expert) pair, no dedup.
+    for (unsigned int t = 0; t < num_tokens; t++) {
+        for (unsigned int k = 0; k < top_k; k++) {
+            int64_t expert_id = topk_idx_host[t * top_k + k];
+            if (expert_id < 0) continue;
+            int target_rank = static_cast<int>(expert_id / num_experts_per_rank);
+            bytes.total_send_tokens++;
+            int target_node = target_rank / num_ranks_per_node;
+            if (target_node != local_node) bytes.rdma_send_tokens++;
+        }
+    }
+
+    // Recv side: replay every source rank, no break on first match -- one
+    // slot counted per matched expert on myRank.
+    std::vector<int64_t> src_perm(num_experts);
+    for (int src_rank = 0; src_rank < nRanks; src_rank++) {
+        int src_node = src_rank / num_ranks_per_node;
+        bool is_rdma = (src_node != local_node);
+
+        std::mt19937 src_gen(src_rank + 42);
+        std::iota(src_perm.begin(), src_perm.end(), 0);
+        for (unsigned int t = 0; t < num_tokens; t++) {
+            std::shuffle(src_perm.begin(), src_perm.end(), src_gen);
+            for (unsigned int k = 0; k < top_k; k++) {
+                int target_rank = static_cast<int>(src_perm[k] / num_experts_per_rank);
+                if (target_rank == myRank) {
+                    bytes.total_recv_tokens++;
+                    if (is_rdma) bytes.rdma_recv_tokens++;
                 }
             }
         }
@@ -2218,11 +2305,19 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Calculate byte metrics based on algorithm mode and FP8 setting
+    // Calculate byte metrics based on algorithm mode and FP8 setting.
+    // HT and FULLMESH use different dedup rules for the wire byte count
+    // (see calculateHighThroughputBytes / calculateFullmeshBytes comments);
+    // both results land in the same HighThroughputBytes struct so downstream
+    // reduction + print code is shared.
     LowLatencyBytes ll_bytes = {};
     HighThroughputBytes ht_bytes = {};
     if (algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         ll_bytes = calculateLowLatencyBytes(topk_idx_host, num_tokens, top_k, hidden, use_fp8);
+    } else if (algorithm == NCCL_EP_ALGO_FULLMESH) {
+        ht_bytes = calculateFullmeshBytes(
+            topk_idx_host, num_tokens, top_k, num_experts, hidden, myRank, nRanks, use_fp8,
+            ncclTeamLsa(comm).nRanks);
     } else {
         ht_bytes = calculateHighThroughputBytes(
             topk_idx_host, num_tokens, top_k, num_experts, hidden, myRank, nRanks, use_fp8,
