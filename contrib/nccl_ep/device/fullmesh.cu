@@ -8,6 +8,7 @@
 #include "fullmesh.cuh"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdio>
 
@@ -39,6 +40,7 @@ namespace {
 __global__ void fullmesh_dispatch_kernel(
     const uint4*     __restrict__ x,                 // [num_tokens, hidden_u4]
     const int64_t*   __restrict__ topk_idx,          // [num_tokens, top_k]
+    const float*     __restrict__ topk_weights,      // [num_tokens, top_k] or nullptr
     void* const*     __restrict__ peer_recv_vas,    // [nRanks]
     void* const*     __restrict__ peer_counter_vas, // [nRanks]
     int num_tokens,
@@ -90,16 +92,23 @@ __global__ void fullmesh_dispatch_kernel(
     // Lane-0 writes the 16-byte meta header as a single uint4 store (aligned):
     //   uint32[0]: src_rank    (this rank, push author)
     //   uint32[1]: src_token_id (= t in this block's grid index)
-    //   uint32[2]: k_in_topk   (= warp_id; commit 4 combine uses this to
-    //                           route the FFN output back to the src's
-    //                           combine_recv_buf[src_token_id][k_in_topk])
-    //   uint32[3]: reserved    (0; future use)
+    //   uint32[2]: k_in_topk   (= warp_id; combine push_kernel routes the FFN
+    //                           output back to the src's combine_recv_buf
+    //                           at [src_token_id, k_in_topk])
+    //   uint32[3]: weight_fp32 (commit 5 fused combine reads this. Either
+    //                           topk_weights[t,k] when caller provided one,
+    //                           or 1/top_k uniform fallback. Bit-cast through
+    //                           __float_as_int so the meta uint4 store stays
+    //                           one 16B transaction.)
     if (lane == 0) {
+        float w = (topk_weights != nullptr)
+                ? topk_weights[static_cast<size_t>(t) * top_k + k]
+                : ((top_k > 0) ? (1.0f / static_cast<float>(top_k)) : 0.f);
         uint4 meta_vec;
         meta_vec.x = static_cast<uint32_t>(myRank);
         meta_vec.y = static_cast<uint32_t>(t);
         meta_vec.z = static_cast<uint32_t>(k);
-        meta_vec.w = 0;
+        meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
         *reinterpret_cast<uint4*>(entry) = meta_vec;
     }
 
@@ -115,6 +124,7 @@ __global__ void fullmesh_dispatch_kernel(
 void launch_dispatch_kernel(
     const void*    x_void,
     const int64_t* topk_idx,
+    const float*   topk_weights,
     void* const*   peer_recv_vas_dev,
     void* const*   peer_counter_vas_dev,
     int  num_tokens,
@@ -171,6 +181,7 @@ void launch_dispatch_kernel(
     fullmesh_dispatch_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint4*>(x_void),
         topk_idx,
+        topk_weights,
         peer_recv_vas_dev,
         peer_counter_vas_dev,
         num_tokens, top_k, num_local_experts,
@@ -381,6 +392,134 @@ void launch_combine_reduce_kernel(
         topk_weights,
         reinterpret_cast<uint16_t*>(combined_output_void),
         num_tokens, num_topk, max_topk_for_combine, hidden);
+}
+
+// ============================================================================
+// Combine FUSED (Phase 3 commit B-fused): single-kernel push+reduce
+// ----------------------------------------------------------------------------
+// One block per (src, slot) at the dest. Reads the FFN output for that slot
+// and the meta (which carries weight_fp32 written by dispatch), then
+// atomic_add's weight * ffn into the src rank's combine_buf at column 0.
+// After all peers finish, src rank reads column 0 directly as the combined
+// weighted sum -- no separate reduce kernel.
+
+namespace {
+
+__global__ void fullmesh_combine_kernel_fused(
+    const __nv_bfloat162* __restrict__ ffn_output_pair, // [nRanks*max_tokens, hidden_pair]
+    const uint8_t*        __restrict__ recv_local_va,   // dispatch recv buf (for meta)
+    const int32_t*        __restrict__ counter_local_va,// counter_row[nRanks]
+    void* const*          __restrict__ peer_combine_vas_dev,  // [nRanks]
+    int nRanks,
+    int myRank,
+    int max_tokens_per_rank,
+    int max_topk_for_combine,
+    int hidden_pair,                                    // hidden_bf16 / 2
+    int bytes_per_entry,
+    int meta_bytes)
+{
+    int src  = blockIdx.x;
+    int slot = blockIdx.y;
+    if (src >= nRanks || slot >= max_tokens_per_rank) return;
+
+    // Skip slots a peer never filled this iter (dispatch counter is the
+    // ground truth). Saves one block's worth of load+atomic for empty slots.
+    int filled = counter_local_va[src];
+    if (slot >= filled) return;
+
+    int tid      = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    // Read 16B meta in a single transaction. dispatch_kernel's lane-0 stored:
+    //   x: src_rank, y: src_token_id, z: k_in_topk, w: weight_fp32 bits
+    const uint8_t* entry = recv_local_va +
+        (static_cast<size_t>(src) * max_tokens_per_rank + slot) *
+        static_cast<size_t>(bytes_per_entry);
+    uint4 meta_vec = *reinterpret_cast<const uint4*>(entry);
+    int   src_rank     = static_cast<int>(meta_vec.x);
+    int   src_token_id = static_cast<int>(meta_vec.y);
+    // meta_vec.z = k_in_topk: not used in fused path; we sum directly into
+    // col 0 instead of a per-k slot, so the dest rank doesn't care which k
+    // this slot was for.
+    float weight       = __int_as_float(static_cast<int>(meta_vec.w));
+
+    if (src_rank != src) return;
+    if (src_token_id < 0 || src_token_id >= max_tokens_per_rank) return;
+
+    // Source: dest-local FFN output for this (src, slot) entry. The compaction
+    // pass after dispatch projected the recv_buf into a dense
+    // [nRanks * max_tokens, hidden] tensor, so the row index is exactly
+    // src * max + slot.
+    size_t i = static_cast<size_t>(src) * max_tokens_per_rank + slot;
+    const __nv_bfloat162* src_payload = ffn_output_pair + i * hidden_pair;
+
+    // Target: peer src_rank's combine_buf at [src_token_id, 0, 0..hidden).
+    // Layout = [num_tokens][max_topk_for_combine][hidden_bf16]. A row in
+    // bf162-pair units is max_topk_for_combine * hidden_pair pairs. We
+    // accumulate into column 0 so all (src, slot) blocks targeting the same
+    // src_token_id end up atomic-add'd into the same row[0:hidden] region.
+    __nv_bfloat162* dst_base =
+        reinterpret_cast<__nv_bfloat162*>(peer_combine_vas_dev[src_rank]);
+    size_t row_pair_stride =
+        static_cast<size_t>(max_topk_for_combine) * static_cast<size_t>(hidden_pair);
+    __nv_bfloat162* dst = dst_base + static_cast<size_t>(src_token_id) * row_pair_stride;
+    // col 0 starts at offset 0 inside the row; no further offset.
+
+    // Pre-bake the weight into a bf162 pair so the inner loop is just
+    // mul + atomicAdd, no float->bf16 conversions per element.
+    __nv_bfloat162 wpair = __floats2bfloat162_rn(weight, weight);
+
+    // Strided loop: 256 threads over hidden_pair=2240 (for hidden=7168) does
+    // ~9 iterations/thread. Grid covers all (src, slot, src_token_id), so
+    // multiple blocks may race on the same dst pair from different (src, slot)
+    // tuples mapped to the same src_token_id; atomic_add on bf162 in fabric
+    // memory serialises those writes correctly on sm_90+ (GB300 sm_103).
+    for (int p = tid; p < hidden_pair; p += nthreads) {
+        __nv_bfloat162 v        = src_payload[p];
+        __nv_bfloat162 weighted = __hmul2(v, wpair);
+        atomicAdd(dst + p, weighted);
+    }
+}
+
+}  // anonymous namespace
+
+void launch_combine_fused_kernel(
+    const void*  ffn_output_void,
+    const void*  recv_local_va,
+    const int32_t* counter_local_va,
+    void* const* peer_combine_vas_dev,
+    int nRanks,
+    int myRank,
+    int max_tokens_per_rank,
+    int max_topk_for_combine,
+    int hidden_bytes,
+    int bytes_per_entry,
+    int meta_bytes,
+    cudaStream_t stream)
+{
+    if (nRanks <= 0 || max_tokens_per_rank <= 0) return;
+    // bf162 atomic_add requires hidden_bytes % 4 == 0. hidden_bytes % 16 == 0
+    // already implied by dispatch's uint4 invariant, so this is belt-and-
+    // braces.
+    if ((hidden_bytes & 3) != 0) {
+        fprintf(stderr,
+                "[FULLMESH] launch_combine_fused_kernel: hidden_bytes=%d not "
+                "4B aligned (bf162 atomic_add requires 4B). Aborting.\n",
+                hidden_bytes);
+        return;
+    }
+    int hidden_bf16 = hidden_bytes >> 1;
+    int hidden_pair = hidden_bf16 >> 1;
+
+    dim3 grid(nRanks, max_tokens_per_rank);
+    dim3 block(256);
+    fullmesh_combine_kernel_fused<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat162*>(ffn_output_void),
+        reinterpret_cast<const uint8_t*>(recv_local_va),
+        counter_local_va,
+        peer_combine_vas_dev,
+        nRanks, myRank, max_tokens_per_rank, max_topk_for_combine,
+        hidden_pair, bytes_per_entry, meta_bytes);
 }
 
 }  // namespace fullmesh

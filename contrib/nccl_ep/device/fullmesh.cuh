@@ -12,7 +12,13 @@
 //                                                    output back to the
 //                                                    src's combine_recv_buf
 //                                                    at [src_token_id][k])
-//     bytes 12..meta_bytes-1     : reserved padding (currently 0)
+//     bytes 12..15               : float32 weight   (commit 5 fused combine
+//                                                    reads this to scale the
+//                                                    FFN output before the
+//                                                    cross-rank atomic_add.
+//                                                    Written by dispatch
+//                                                    from topk_weights or
+//                                                    1/num_topk fallback.)
 //     bytes meta_bytes..end      : hidden payload (dtype opaque)
 //   counter_row[dest][src]       : int32 atomic counter, src atomicAdd(1) to
 //                                  carve its next slot inside its per-src
@@ -71,9 +77,18 @@ namespace fullmesh {
 //   - This rank's counter_row was cudaMemset(0) on the same stream earlier
 //     this iteration and a cross-rank barrier has confirmed all peers did
 //     the same before any peer can atomicAdd this rank's row.
+//
+// topk_weights (commit 5): if non-null, read at lane 0 of each (token, k)
+//   warp and serialized into the meta.w fp32 slot at the dest. Lets the
+//   fused combine kernel weight the FFN output by w[k] before the cross-
+//   rank atomic_add without having to expose topk_weights as fabric memory
+//   on every combine call. nullptr falls back to a uniform 1/top_k written
+//   into meta.w; this matches HT's forward-combine semantics when callers
+//   don't pass weights.
 void launch_dispatch_kernel(
     const void*       x,                      // [num_tokens, hidden_bytes] device src
     const int64_t*    topk_idx,               // [num_tokens, top_k] int64
+    const float*      topk_weights,           // [num_tokens, top_k] fp32 or nullptr
     void* const*      peer_recv_vas_dev,      // device [nRanks] void*
     void* const*      peer_counter_vas_dev,   // device [nRanks] void*
     int               num_tokens,
@@ -187,6 +202,54 @@ void launch_combine_reduce_kernel(
     int               num_topk,
     int               max_topk_for_combine,
     int               hidden_bytes,
+    cudaStream_t      stream);
+
+// ============================================================================
+// Combine FUSED (Phase 3 commit B-fused): single-kernel dest -> src atomic_add
+// ----------------------------------------------------------------------------
+// Replaces push_kernel + reduce_kernel with one kernel that reads the dest's
+// FFN output + meta, computes weight * ffn at the dest, and atomic_add's the
+// weighted contribution directly into the src rank's combine_buf at column 0
+// (i.e. [src_token_id, 0, hidden] under the same [num_tokens][max_topk][hidden]
+// layout, treating column 0 as the running accumulator). The src rank then
+// cudaMemcpy2DAsync's column 0 out to the user's combined_output.
+//
+// Why fused beats push+reduce on NV72:
+//   - HBM passes drop from 2 to 1: data lands directly in the accumulator,
+//     no separate staging-then-reduce read.
+//   - 1 kernel instead of 2: removes the kernel-launch + stream-serialization
+//     overhead between push and reduce.
+//   - memset shrinks from num_topk columns to 1 column (column 0 only),
+//     since fused doesn't need the per-k slots anymore. ~num_topk x smaller.
+//
+// Why we still need the column 0 zero-init:
+//   atomicAdd is +=, not =. Reduce starts at whatever residue last iter left
+//   in the accumulator. Without memset(col0), the result is corrupted.
+//
+// Preconditions:
+//   - hidden_bytes % 16 == 0 AND hidden_bytes % 4 == 0
+//     (uint4 loads for the source side, __nv_bfloat162 atomic_add for the
+//     dest side; the latter wants 4-byte aligned pairs.)
+//   - dispatch wrote weight into meta.w via the topk_weights param of
+//     launch_dispatch_kernel; otherwise meta.w is 0 and the fused kernel
+//     produces zero output.
+//   - bf16 atomic_add on fabric memory requires sm_90+. GB300 is sm_103, OK.
+//   - peer_combine_vas_dev[src_rank] points at the src rank's combine_buf
+//     fabric region (same as push_kernel's target).
+//   - The caller has cudaMemset2DAsync'd column 0 of combine_local_va to 0
+//     and crossed a barrier so all peers see fresh zeros before atomic_add.
+void launch_combine_fused_kernel(
+    const void*       ffn_output,             // [nRanks*max_tokens, hidden] dense bf16
+    const void*       recv_local_va,          // this rank's dispatch recv_buf (meta + payload)
+    const int32_t*    counter_local_va,       // this rank's counter_row[nRanks]
+    void* const*      peer_combine_vas_dev,   // device [nRanks] void*, src->combine VAs
+    int               nRanks,
+    int               myRank,
+    int               max_tokens_per_rank,
+    int               max_topk_for_combine,   // row stride in src.combine_buf
+    int               hidden_bytes,
+    int               bytes_per_entry,
+    int               meta_bytes,
     cudaStream_t      stream);
 
 }  // namespace fullmesh

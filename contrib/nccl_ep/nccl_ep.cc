@@ -2800,9 +2800,17 @@ ncclResult_t ncclEpDispatch(
         assert(num_local_tensors == 0 && "FULLMESH dispatch does not accept local_tensors");
         assert(group->fullmesh_buffers.initialized && "FULLMESH buffers not init'd");
 
-        ncclNDTensor_t x       = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOKENS);
-        ncclNDTensor_t topk    = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOPK_IDX);
-        ncclNDTensor_t recv_x  = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
+        ncclNDTensor_t x         = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOKENS);
+        ncclNDTensor_t topk      = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOPK_IDX);
+        // commit B-fused: dispatch consumes topk_weights too so it can serialize
+        // weight into the meta.w slot of the recv_buf entry, letting the fused
+        // combine kernel weight the FFN output at the dest with a 4B meta load
+        // instead of cross-rank fabric exposure of topk_weights every iter.
+        // Optional: nullptr falls back to uniform 1/top_k inside the kernel,
+        // matching HT's default forward-combine semantics when the bench
+        // doesn't provide weights.
+        ncclNDTensor_t topk_w_in = find_tensor_by_tag(inputs,  num_inputs,  NCCL_EP_TENSOR_TAG_TOPK_WEIGHTS);
+        ncclNDTensor_t recv_x    = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
         assert(x      != nullptr && "FULLMESH dispatch missing input TOKENS tensor");
         assert(topk   != nullptr && "FULLMESH dispatch missing input TOPK_IDX tensor");
         assert(recv_x != nullptr && "FULLMESH dispatch missing output TOKENS tensor");
@@ -2811,6 +2819,12 @@ ncclResult_t ncclEpDispatch(
         assert(recv_x->ndim == 2 && tensor_is_contiguous(recv_x));
         assert(x->sizes[0] == handle->num_tokens);
         assert(x->sizes[0] <= group->config.max_tokens_per_rank);
+        if (topk_w_in != nullptr) {
+            assert(topk_w_in->ndim == 2 && tensor_is_contiguous(topk_w_in));
+            assert(topk_w_in->datatype == ncclFloat32);
+            assert(topk_w_in->sizes[0] == handle->num_tokens);
+            assert(topk_w_in->sizes[1] == handle->num_topk);
+        }
 
         auto& fb = group->fullmesh_buffers;
         const int nRanks           = group->nRanks;
@@ -2855,6 +2869,7 @@ ncclResult_t ncclEpDispatch(
         nccl_ep::fullmesh::launch_dispatch_kernel(
             x->data,
             static_cast<const int64_t*>(topk->data),
+            topk_w_in ? static_cast<const float*>(topk_w_in->data) : nullptr,
             fb.peer_recv_vas_dev,
             fb.peer_counter_vas_dev,
             handle->num_tokens,
@@ -3387,9 +3402,98 @@ ncclResult_t ncclEpCombine(
             CUDA_CHECK(cudaEventRecord(ev_c0, stream));
         }
 
-        {
-            const size_t row_pitch_bytes = fb.max_topk_for_combine
-                                         * static_cast<size_t>(hidden_bytes);
+        // [FULLMESH] Phase 3 commit B-fused: pick combine path based on env var.
+        // Default "fused": 1 kernel + 1 HBM pass via dest -> src bf162 atomic_add
+        //   into the src rank's combine_buf column 0, then src memcpy's col 0
+        //   out to combined_output. Required for FM combine to match HT BW.
+        // "push_reduce": legacy 2-kernel + 2-HBM-pass path kept for A/B
+        //   correctness comparison and as a fallback if a sm version turns out
+        //   to lack bf162 atomic_add on fabric memory.
+        static const bool fm_combine_fused = [](){
+            const char* v = std::getenv("NCCL_EP_FULLMESH_COMBINE_PATH");
+            if (v == nullptr) return true;     // default fused
+            return !(v[0] == 'p' || v[0] == 'P');  // "push_reduce" / "PUSH..." -> false
+        }();
+
+        const size_t row_pitch_bytes = fb.max_topk_for_combine
+                                     * static_cast<size_t>(hidden_bytes);
+
+        if (fm_combine_fused) {
+            // (a) Zero only column 0 of combine_buf (1 column wide vs. num_topk
+            //     columns in push_reduce). atomic_add accumulates into col 0
+            //     across all (src, slot) blocks targeting the same src_token_id;
+            //     stale residue from last iter would corrupt the running sum.
+            CUDA_CHECK(cudaMemset2DAsync(
+                reinterpret_cast<void*>(fb.combine_local_va),
+                row_pitch_bytes,
+                0,
+                static_cast<size_t>(hidden_bytes),    // width = 1 column
+                static_cast<size_t>(max_tokens),
+                stream));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c1, stream));
+
+            // (b) Pre-push barrier: every rank's col-0 zero is visible before
+            //     any peer issues an atomic_add into it.
+            NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c2, stream));
+
+            // (c) Single fused kernel: dest reads ffn + meta(weight), atomic
+            //     adds weight*ffn into peer src.combine_buf[src_token_id, 0].
+            nccl_ep::fullmesh::launch_combine_fused_kernel(
+                expert_out->data,                                        // ffn output
+                reinterpret_cast<const void*>(fb.recv_local_va),         // for meta
+                reinterpret_cast<const int32_t*>(fb.counter_local_va),   // counter_row
+                fb.peer_combine_vas_dev,
+                nRanks, myRank, max_tokens, max_topk,
+                hidden_bytes,
+                static_cast<int>(fb.bytes_per_entry),
+                static_cast<int>(fb.meta_bytes),
+                stream);
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
+
+            // (d) Post-push barrier: peers finished atomic-adding into our col 0.
+            NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c4, stream));
+
+            // (e) Project col 0 out to user's combined_output. Effectively a
+            //     dst_pitch=hidden_bytes contiguous write, src is the strided
+            //     col-0 region of combine_buf. ~5us for 7168 hidden * 8192
+            //     tokens on GB300 HBM3e; cheap relative to the kernel.
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                combined_x->data,
+                static_cast<size_t>(hidden_bytes),    // dst pitch (dense)
+                reinterpret_cast<const void*>(fb.combine_local_va),
+                row_pitch_bytes,                       // src pitch (max_topk * hidden)
+                static_cast<size_t>(hidden_bytes),    // width
+                static_cast<size_t>(handle->num_tokens),
+                cudaMemcpyDeviceToDevice,
+                stream));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c5, stream));
+
+            if (fm_prof_c) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                float memset_ms = 0, bar1_ms = 0, kernel_ms = 0, bar2_ms = 0, cpy_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&memset_ms, ev_c0, ev_c1));
+                CUDA_CHECK(cudaEventElapsedTime(&bar1_ms,   ev_c1, ev_c2));
+                CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev_c2, ev_c3));
+                CUDA_CHECK(cudaEventElapsedTime(&bar2_ms,   ev_c3, ev_c4));
+                CUDA_CHECK(cudaEventElapsedTime(&cpy_ms,    ev_c4, ev_c5));
+                if (myRank == 0) {
+                    fprintf(stderr,
+                            "[FM-PROFILE] combine_fused EP=%d t=%d  "
+                            "memset_col0=%.1f barrier1=%.1f fused_kernel=%.1f barrier2=%.1f memcpy2d=%.1f  "
+                            "total_stream=%.1f us\n",
+                            nRanks, handle->num_tokens,
+                            memset_ms * 1000.f, bar1_ms * 1000.f,
+                            kernel_ms * 1000.f, bar2_ms * 1000.f, cpy_ms * 1000.f,
+                            (memset_ms + bar1_ms + kernel_ms + bar2_ms + cpy_ms) * 1000.f);
+                    fflush(stderr);
+                }
+                cudaEventDestroy(ev_c0); cudaEventDestroy(ev_c1); cudaEventDestroy(ev_c2);
+                cudaEventDestroy(ev_c3); cudaEventDestroy(ev_c4); cudaEventDestroy(ev_c5);
+            }
+        } else {
+            // ----- Legacy push+reduce path (NCCL_EP_FULLMESH_COMBINE_PATH=push_reduce) -----
             const size_t active_width_bytes = static_cast<size_t>(handle->num_topk)
                                             * static_cast<size_t>(hidden_bytes);
             CUDA_CHECK(cudaMemset2DAsync(
@@ -3399,61 +3503,57 @@ ncclResult_t ncclEpCombine(
                 active_width_bytes,
                 static_cast<size_t>(max_tokens),
                 stream));
-        }
-        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c1, stream));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c1, stream));
 
-        // (b) Pre-push barrier.
-        NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
-        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c2, stream));
+            NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c2, stream));
 
-        // (c) Dest-initiated push kernel.
-        nccl_ep::fullmesh::launch_combine_push_kernel(
-            expert_out->data,                                        // ffn output
-            reinterpret_cast<const void*>(fb.recv_local_va),         // for meta
-            reinterpret_cast<const int32_t*>(fb.counter_local_va),   // counter_row
-            fb.peer_combine_vas_dev,
-            nRanks, myRank, max_tokens, max_topk,
-            hidden_bytes,
-            static_cast<int>(fb.bytes_per_entry),
-            static_cast<int>(fb.meta_bytes),
-            stream);
-        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
+            nccl_ep::fullmesh::launch_combine_push_kernel(
+                expert_out->data,
+                reinterpret_cast<const void*>(fb.recv_local_va),
+                reinterpret_cast<const int32_t*>(fb.counter_local_va),
+                fb.peer_combine_vas_dev,
+                nRanks, myRank, max_tokens, max_topk,
+                hidden_bytes,
+                static_cast<int>(fb.bytes_per_entry),
+                static_cast<int>(fb.meta_bytes),
+                stream);
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
 
-        // (d) Post-push barrier: peers finished writing into my combine_local_va.
-        NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
-        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c4, stream));
+            NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c4, stream));
 
-        // (e) Src-local weighted reduce across k -> combined_output.
-        nccl_ep::fullmesh::launch_combine_reduce_kernel(
-            reinterpret_cast<const void*>(fb.combine_local_va),
-            topk_w_in ? static_cast<const float*>(topk_w_in->data) : nullptr,
-            combined_x->data,
-            handle->num_tokens, handle->num_topk, max_topk,
-            hidden_bytes,
-            stream);
-        if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c5, stream));
+            nccl_ep::fullmesh::launch_combine_reduce_kernel(
+                reinterpret_cast<const void*>(fb.combine_local_va),
+                topk_w_in ? static_cast<const float*>(topk_w_in->data) : nullptr,
+                combined_x->data,
+                handle->num_tokens, handle->num_topk, max_topk,
+                hidden_bytes,
+                stream);
+            if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c5, stream));
 
-        if (fm_prof_c) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            float memset_ms = 0, bar1_ms = 0, push_ms = 0, bar2_ms = 0, reduce_ms = 0;
-            CUDA_CHECK(cudaEventElapsedTime(&memset_ms, ev_c0, ev_c1));
-            CUDA_CHECK(cudaEventElapsedTime(&bar1_ms,   ev_c1, ev_c2));
-            CUDA_CHECK(cudaEventElapsedTime(&push_ms,   ev_c2, ev_c3));
-            CUDA_CHECK(cudaEventElapsedTime(&bar2_ms,   ev_c3, ev_c4));
-            CUDA_CHECK(cudaEventElapsedTime(&reduce_ms, ev_c4, ev_c5));
-            if (myRank == 0) {
-                fprintf(stderr,
-                        "[FM-PROFILE] combine  EP=%d t=%d  "
-                        "memset=%.1f barrier1=%.1f push=%.1f barrier2=%.1f reduce=%.1f  "
-                        "total_stream=%.1f us\n",
-                        nRanks, handle->num_tokens,
-                        memset_ms * 1000.f, bar1_ms * 1000.f,
-                        push_ms * 1000.f, bar2_ms * 1000.f, reduce_ms * 1000.f,
-                        (memset_ms + bar1_ms + push_ms + bar2_ms + reduce_ms) * 1000.f);
-                fflush(stderr);
+            if (fm_prof_c) {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                float memset_ms = 0, bar1_ms = 0, push_ms = 0, bar2_ms = 0, reduce_ms = 0;
+                CUDA_CHECK(cudaEventElapsedTime(&memset_ms, ev_c0, ev_c1));
+                CUDA_CHECK(cudaEventElapsedTime(&bar1_ms,   ev_c1, ev_c2));
+                CUDA_CHECK(cudaEventElapsedTime(&push_ms,   ev_c2, ev_c3));
+                CUDA_CHECK(cudaEventElapsedTime(&bar2_ms,   ev_c3, ev_c4));
+                CUDA_CHECK(cudaEventElapsedTime(&reduce_ms, ev_c4, ev_c5));
+                if (myRank == 0) {
+                    fprintf(stderr,
+                            "[FM-PROFILE] combine_push_reduce EP=%d t=%d  "
+                            "memset=%.1f barrier1=%.1f push=%.1f barrier2=%.1f reduce=%.1f  "
+                            "total_stream=%.1f us\n",
+                            nRanks, handle->num_tokens,
+                            memset_ms * 1000.f, bar1_ms * 1000.f,
+                            push_ms * 1000.f, bar2_ms * 1000.f, reduce_ms * 1000.f,
+                            (memset_ms + bar1_ms + push_ms + bar2_ms + reduce_ms) * 1000.f);
+                    fflush(stderr);
+                }
+                cudaEventDestroy(ev_c0); cudaEventDestroy(ev_c1); cudaEventDestroy(ev_c2);
+                cudaEventDestroy(ev_c3); cudaEventDestroy(ev_c4); cudaEventDestroy(ev_c5);
             }
-            cudaEventDestroy(ev_c0); cudaEventDestroy(ev_c1); cudaEventDestroy(ev_c2);
-            cudaEventDestroy(ev_c3); cudaEventDestroy(ev_c4); cudaEventDestroy(ev_c5);
         }
 
         (void)config; (void)send_only;
