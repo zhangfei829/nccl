@@ -66,6 +66,13 @@ namespace fullmesh {
 
 // Launch the fused atomicAdd-slot + cooperative payload-push kernel.
 //
+// SM budget (num_sms): caps grid.x at min(num_tokens, num_sms). When grid <
+//   num_tokens the kernel runs a grid-stride loop so each block handles
+//   multiple tokens. This keeps HT vs FM benchmarks apples-to-apples:
+//   HT hardcodes grid=HYBRIDEP_MAX_NUM_SMS_PER_RANK=16, so FM should match
+//   16 by default. Pass 0 to mean "no cap" but expect unfair benchmark
+//   numbers vs HT.
+//
 // Preconditions enforced at the caller (nccl_ep.cc) level:
 //   - hidden_bytes % 16 == 0 (required for uint4 store loop)
 //   - top_k <= 32 (warps-per-block cap)
@@ -100,6 +107,7 @@ void launch_dispatch_kernel(
     int               hidden_bytes,
     int               bytes_per_entry,
     int               meta_bytes,
+    int               num_sms,                // SM cap; 0 = no cap (= num_tokens)
     cudaStream_t      stream);
 
 // Project this rank's recv_buf payload column into a dense user output tensor
@@ -165,6 +173,7 @@ void launch_combine_push_kernel(
     int               hidden_bytes,
     int               bytes_per_entry,
     int               meta_bytes,
+    int               num_sms,                // SM cap (1D flatten of 2D grid)
     cudaStream_t      stream);
 
 // Kernel: src-side weighted sum across k.
@@ -202,6 +211,7 @@ void launch_combine_reduce_kernel(
     int               num_topk,
     int               max_topk_for_combine,
     int               hidden_bytes,
+    int               num_sms,                // SM cap; 0 = no cap (= num_tokens)
     cudaStream_t      stream);
 
 // ============================================================================
@@ -250,6 +260,7 @@ void launch_combine_fused_kernel(
     int               hidden_bytes,
     int               bytes_per_entry,
     int               meta_bytes,
+    int               num_sms,                // SM cap (1D flatten of 2D grid)
     cudaStream_t      stream);
 
 }  // namespace fullmesh

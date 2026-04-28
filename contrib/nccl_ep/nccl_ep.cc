@@ -242,6 +242,14 @@ struct ncclEpGroup {
     int hidden;               // Hidden size (token_size_bytes / ncclTypeSize(ncclBfloat16))
     unsigned int device_sm_count; // Number of SMs on the device
     unsigned int num_sms_ht; // Number of SMs to use for HT kernels
+    // Number of SMs to use for FULLMESH kernels (dispatch / combine push /
+    // combine reduce / combine fused). Default 16 to match
+    // HYBRIDEP_MAX_NUM_SMS_PER_RANK so HT vs FM benchmark is apples-to-apples
+    // (HT hardcodes grid=16 blocks; FM previously launched grid=num_tokens
+    // which on GB300 saturates ~132 SMs and gave FM an unfair 8x SM budget
+    // advantage in ep_bench numbers). Override via env var
+    // NCCL_EP_FULLMESH_NUM_SMS for SM-scaling sweeps.
+    unsigned int fullmesh_num_sms;
 
     // Custom allocator function pointers
     ncclEpAllocFn_t alloc_fn;
@@ -425,6 +433,7 @@ struct ncclEpGroup {
         hidden(0),
         device_sm_count(0),
         num_sms_ht(0),
+        fullmesh_num_sms(0),
         alloc_fn(nullptr),
         free_fn(nullptr),
         gpus_per_node(0),
@@ -1843,6 +1852,38 @@ ncclResult_t ncclEpCreateGroup(
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, ep_group->cuda_device_id));
     ep_group->device_sm_count = device_prop.multiProcessorCount;
 
+    // FULLMESH SM cap: parse NCCL_EP_FULLMESH_NUM_SMS once. Default 16 to
+    // match HYBRIDEP_MAX_NUM_SMS_PER_RANK so the HT vs FM comparison runs at
+    // equal SM budget. Caller can set 0 to mean "no cap" (debug only -- breaks
+    // apples-to-apples). Caller can override per-sweep to scan 16/32/64.
+    {
+        const char* v = std::getenv("NCCL_EP_FULLMESH_NUM_SMS");
+        unsigned int env_sms = 16;  // default match HT
+        if (v != nullptr && v[0] != '\0') {
+            int parsed = std::atoi(v);
+            if (parsed > 0) {
+                env_sms = static_cast<unsigned int>(parsed);
+            } else if (parsed == 0) {
+                env_sms = ep_group->device_sm_count;  // explicit "use all SMs"
+            }
+        }
+        // Don't ask for more SMs than the device has.
+        if (env_sms > ep_group->device_sm_count) env_sms = ep_group->device_sm_count;
+        ep_group->fullmesh_num_sms = env_sms;
+
+        if (ep_group->rank == 0 &&
+            ep_group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+            fprintf(stderr,
+                    "[NV72-ADAPT] FULLMESH SM cap: num_sms=%u (device_sm_count=%u, "
+                    "HT hardcodes %d, env NCCL_EP_FULLMESH_NUM_SMS=%s)\n",
+                    ep_group->fullmesh_num_sms,
+                    ep_group->device_sm_count,
+                    16,    // HYBRIDEP_MAX_NUM_SMS_PER_RANK
+                    v ? v : "<unset, default 16>");
+            fflush(stderr);
+        }
+    }
+
     CUDA_CHECK(ep_group->alloc_fn(&ep_group->ep_workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(ep_group->ep_workspace, 0, NUM_WORKSPACE_BYTES, stream));
 
@@ -2881,6 +2922,7 @@ ncclResult_t ncclEpDispatch(
             hidden_bytes,
             static_cast<int>(fb.bytes_per_entry),
             static_cast<int>(fb.meta_bytes),
+            static_cast<int>(group->fullmesh_num_sms),
             stream);
         if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d3, stream));
 
@@ -3453,6 +3495,7 @@ ncclResult_t ncclEpCombine(
                 hidden_bytes,
                 static_cast<int>(fb.bytes_per_entry),
                 static_cast<int>(fb.meta_bytes),
+                static_cast<int>(group->fullmesh_num_sms),
                 stream);
             if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
 
@@ -3522,6 +3565,7 @@ ncclResult_t ncclEpCombine(
                 hidden_bytes,
                 static_cast<int>(fb.bytes_per_entry),
                 static_cast<int>(fb.meta_bytes),
+                static_cast<int>(group->fullmesh_num_sms),
                 stream);
             if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
 
@@ -3534,6 +3578,7 @@ ncclResult_t ncclEpCombine(
                 combined_x->data,
                 handle->num_tokens, handle->num_topk, max_topk,
                 hidden_bytes,
+                static_cast<int>(group->fullmesh_num_sms),
                 stream);
             if (fm_prof_c) CUDA_CHECK(cudaEventRecord(ev_c5, stream));
 

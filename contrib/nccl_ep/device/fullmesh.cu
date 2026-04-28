@@ -53,69 +53,71 @@ __global__ void fullmesh_dispatch_kernel(
     int bytes_per_entry,
     int meta_bytes)
 {
-    int t = blockIdx.x;
-    if (t >= num_tokens) return;
-
+    // Grid-stride loop over tokens. Caller may launch grid < num_tokens (SM
+    // cap) so each block handles multiple tokens. With grid == num_tokens
+    // each block does exactly 1 iteration (legacy behaviour preserved).
     int warp_id = static_cast<int>(threadIdx.x >> 5);
     int lane    = static_cast<int>(threadIdx.x & 31);
     if (warp_id >= top_k) return;
-
     int k = warp_id;
-    int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
-    if (eid < 0) return;
 
-    int dest = static_cast<int>(eid / num_local_experts);
-    // Defensive bound: a malformed topk_idx that indexes past num_experts
-    // would otherwise corrupt peer memory at a neighbour rank.
-    if (dest < 0 || dest >= nRanks) return;
+    for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
+        int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
+        if (eid < 0) continue;
 
-    int32_t* dest_counter = reinterpret_cast<int32_t*>(peer_counter_vas[dest]);
+        int dest = static_cast<int>(eid / num_local_experts);
+        // Defensive bound: a malformed topk_idx that indexes past num_experts
+        // would otherwise corrupt peer memory at a neighbour rank.
+        if (dest < 0 || dest >= nRanks) continue;
 
-    int slot = 0;
-    if (lane == 0) {
-        slot = atomicAdd(&dest_counter[myRank], 1);
-    }
-    slot = __shfl_sync(0xFFFFFFFFu, slot, 0);
+        int32_t* dest_counter = reinterpret_cast<int32_t*>(peer_counter_vas[dest]);
 
-    // Overflow guard: if more than max_tokens_per_rank entries from this src
-    // arrive at this dest, the slot index would run past the per-src block
-    // and corrupt the neighbouring src's slots. Static sizing makes this
-    // impossible when num_tokens <= max_tokens_per_rank (ep_bench config
-    // enforces this), but keep the guard so a future caller error is visible
-    // as missing data instead of silent corruption.
-    if (slot >= max_tokens_per_rank) return;
+        int slot = 0;
+        if (lane == 0) {
+            slot = atomicAdd(&dest_counter[myRank], 1);
+        }
+        slot = __shfl_sync(0xFFFFFFFFu, slot, 0);
 
-    uint8_t* dest_recv = reinterpret_cast<uint8_t*>(peer_recv_vas[dest]);
-    size_t   entry_idx = static_cast<size_t>(myRank) * max_tokens_per_rank + slot;
-    uint8_t* entry     = dest_recv + entry_idx * static_cast<size_t>(bytes_per_entry);
+        // Overflow guard: if more than max_tokens_per_rank entries from this src
+        // arrive at this dest, the slot index would run past the per-src block
+        // and corrupt the neighbouring src's slots. Static sizing makes this
+        // impossible when num_tokens <= max_tokens_per_rank (ep_bench config
+        // enforces this), but keep the guard so a future caller error is visible
+        // as missing data instead of silent corruption.
+        if (slot >= max_tokens_per_rank) continue;
 
-    // Lane-0 writes the 16-byte meta header as a single uint4 store (aligned):
-    //   uint32[0]: src_rank    (this rank, push author)
-    //   uint32[1]: src_token_id (= t in this block's grid index)
-    //   uint32[2]: k_in_topk   (= warp_id; combine push_kernel routes the FFN
-    //                           output back to the src's combine_recv_buf
-    //                           at [src_token_id, k_in_topk])
-    //   uint32[3]: weight_fp32 (commit 5 fused combine reads this. Either
-    //                           topk_weights[t,k] when caller provided one,
-    //                           or 1/top_k uniform fallback. Bit-cast through
-    //                           __float_as_int so the meta uint4 store stays
-    //                           one 16B transaction.)
-    if (lane == 0) {
-        float w = (topk_weights != nullptr)
-                ? topk_weights[static_cast<size_t>(t) * top_k + k]
-                : ((top_k > 0) ? (1.0f / static_cast<float>(top_k)) : 0.f);
-        uint4 meta_vec;
-        meta_vec.x = static_cast<uint32_t>(myRank);
-        meta_vec.y = static_cast<uint32_t>(t);
-        meta_vec.z = static_cast<uint32_t>(k);
-        meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
-        *reinterpret_cast<uint4*>(entry) = meta_vec;
-    }
+        uint8_t* dest_recv = reinterpret_cast<uint8_t*>(peer_recv_vas[dest]);
+        size_t   entry_idx = static_cast<size_t>(myRank) * max_tokens_per_rank + slot;
+        uint8_t* entry     = dest_recv + entry_idx * static_cast<size_t>(bytes_per_entry);
 
-    uint4*       dst_payload = reinterpret_cast<uint4*>(entry + meta_bytes);
-    const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
-    for (int i = lane; i < hidden_u4; i += 32) {
-        dst_payload[i] = src_payload[i];
+        // Lane-0 writes the 16-byte meta header as a single uint4 store (aligned):
+        //   uint32[0]: src_rank    (this rank, push author)
+        //   uint32[1]: src_token_id (= t in this iteration)
+        //   uint32[2]: k_in_topk   (= warp_id; combine push_kernel routes the FFN
+        //                           output back to the src's combine_recv_buf
+        //                           at [src_token_id, k_in_topk])
+        //   uint32[3]: weight_fp32 (commit 5 fused combine reads this. Either
+        //                           topk_weights[t,k] when caller provided one,
+        //                           or 1/top_k uniform fallback. Bit-cast through
+        //                           __float_as_int so the meta uint4 store stays
+        //                           one 16B transaction.)
+        if (lane == 0) {
+            float w = (topk_weights != nullptr)
+                    ? topk_weights[static_cast<size_t>(t) * top_k + k]
+                    : ((top_k > 0) ? (1.0f / static_cast<float>(top_k)) : 0.f);
+            uint4 meta_vec;
+            meta_vec.x = static_cast<uint32_t>(myRank);
+            meta_vec.y = static_cast<uint32_t>(t);
+            meta_vec.z = static_cast<uint32_t>(k);
+            meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
+            *reinterpret_cast<uint4*>(entry) = meta_vec;
+        }
+
+        uint4*       dst_payload = reinterpret_cast<uint4*>(entry + meta_bytes);
+        const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
+        for (int i = lane; i < hidden_u4; i += 32) {
+            dst_payload[i] = src_payload[i];
+        }
     }
 }
 
@@ -136,6 +138,7 @@ void launch_dispatch_kernel(
     int  hidden_bytes,
     int  bytes_per_entry,
     int  meta_bytes,
+    int  num_sms,
     cudaStream_t stream)
 {
     if (num_tokens <= 0) return;
@@ -176,7 +179,11 @@ void launch_dispatch_kernel(
     int warps_per_block = (top_k > 0) ? top_k : 1;
     int threads_per_block = 32 * warps_per_block;
 
-    dim3 grid(num_tokens);
+    // Grid is min(num_tokens, num_sms) to cap SM use; kernel runs a grid-
+    // stride loop over tokens. num_sms == 0 means "no cap" -> match num_tokens.
+    int grid_x = (num_sms <= 0 || num_sms >= num_tokens) ? num_tokens : num_sms;
+
+    dim3 grid(grid_x);
     dim3 block(threads_per_block);
     fullmesh_dispatch_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint4*>(x_void),
@@ -239,52 +246,57 @@ __global__ void fullmesh_combine_kernel_push(
     int bytes_per_entry,
     int meta_bytes)
 {
-    int src  = blockIdx.x;
-    int slot = blockIdx.y;
-    if (src >= nRanks || slot >= max_tokens_per_rank) return;
+    // Grid-stride loop over flattened (src, slot) space. Caller may launch
+    // grid < nRanks * max_tokens_per_rank (SM cap) so each block handles
+    // multiple (src, slot) entries.
+    int total = nRanks * max_tokens_per_rank;
+    int lane  = static_cast<int>(threadIdx.x & 31);
 
-    // Only (src, slot) pairs that a peer actually filled during dispatch are
-    // valid. counter_local_va[src] is the total count src pushed into us.
-    int filled = counter_local_va[src];
-    if (slot >= filled) return;
+    for (int idx = blockIdx.x; idx < total; idx += gridDim.x) {
+        int src  = idx / max_tokens_per_rank;
+        int slot = idx - src * max_tokens_per_rank;
 
-    int lane = static_cast<int>(threadIdx.x & 31);
+        // Only (src, slot) pairs that a peer actually filled during dispatch
+        // are valid. counter_local_va[src] is the total count src pushed into us.
+        int filled = counter_local_va[src];
+        if (slot >= filled) continue;
 
-    // Read meta off this rank's own dispatch recv buf.
-    const uint8_t* entry = recv_local_va +
-                           (static_cast<size_t>(src) * max_tokens_per_rank + slot)
-                           * static_cast<size_t>(bytes_per_entry);
-    uint4 meta_vec = *reinterpret_cast<const uint4*>(entry);
-    int src_rank     = static_cast<int>(meta_vec.x);
-    int src_token_id = static_cast<int>(meta_vec.y);
-    int k_in_topk    = static_cast<int>(meta_vec.z);
+        // Read meta off this rank's own dispatch recv buf.
+        const uint8_t* entry = recv_local_va +
+                               (static_cast<size_t>(src) * max_tokens_per_rank + slot)
+                               * static_cast<size_t>(bytes_per_entry);
+        uint4 meta_vec = *reinterpret_cast<const uint4*>(entry);
+        int src_rank     = static_cast<int>(meta_vec.x);
+        int src_token_id = static_cast<int>(meta_vec.y);
+        int k_in_topk    = static_cast<int>(meta_vec.z);
 
-    // Defensive: malformed meta (src_rank mismatch) would route the push to
-    // the wrong rank. In practice dispatch writes src_rank == src always, but
-    // if a future change breaks that invariant the combine would silently
-    // corrupt unrelated tokens.
-    if (src_rank != src) return;
-    if (k_in_topk < 0 || k_in_topk >= max_topk_for_combine) return;
-    if (src_token_id < 0 || src_token_id >= max_tokens_per_rank) return;
+        // Defensive: malformed meta (src_rank mismatch) would route the push
+        // to the wrong rank. In practice dispatch writes src_rank == src, but
+        // if a future change breaks that invariant the combine would silently
+        // corrupt unrelated tokens.
+        if (src_rank != src) continue;
+        if (k_in_topk < 0 || k_in_topk >= max_topk_for_combine) continue;
+        if (src_token_id < 0 || src_token_id >= max_tokens_per_rank) continue;
 
-    // Peer target: src_rank's combine_recv_buf at [src_token_id][k_in_topk].
-    uint8_t* peer_combine = reinterpret_cast<uint8_t*>(peer_combine_vas_dev[src_rank]);
-    size_t   combine_slot = static_cast<size_t>(src_token_id) * max_topk_for_combine
-                          + static_cast<size_t>(k_in_topk);
-    uint4*   dst_payload  = reinterpret_cast<uint4*>(
-                              peer_combine + combine_slot * static_cast<size_t>(hidden_u4) * 16);
+        // Peer target: src_rank's combine_recv_buf at [src_token_id, k_in_topk].
+        uint8_t* peer_combine = reinterpret_cast<uint8_t*>(peer_combine_vas_dev[src_rank]);
+        size_t   combine_slot = static_cast<size_t>(src_token_id) * max_topk_for_combine
+                              + static_cast<size_t>(k_in_topk);
+        uint4*   dst_payload  = reinterpret_cast<uint4*>(
+                                  peer_combine + combine_slot * static_cast<size_t>(hidden_u4) * 16);
 
-    // Source: this rank's FFN output at the dense row (src * max + slot).
-    size_t i = static_cast<size_t>(src) * max_tokens_per_rank + slot;
-    const uint4* src_payload = ffn_output + i * hidden_u4;
+        // Source: this rank's FFN output at the dense row (src * max + slot).
+        size_t i = static_cast<size_t>(src) * max_tokens_per_rank + slot;
+        const uint4* src_payload = ffn_output + i * hidden_u4;
 
-    for (int j = lane; j < hidden_u4; j += 32) {
-        dst_payload[j] = src_payload[j];
+        for (int j = lane; j < hidden_u4; j += 32) {
+            dst_payload[j] = src_payload[j];
+        }
     }
 }
 
 // Src-side weighted sum across the k dimension.
-// Grid (num_tokens,), block cooperative streams hidden_u4 entries.
+// Grid <= num_tokens (SM cap), kernel runs grid-stride loop over tokens.
 __global__ void fullmesh_combine_kernel_reduce(
     const uint16_t* __restrict__ combine_local,    // [num_tokens*max_topk*hidden] bf16
     const float*    __restrict__ topk_weights,     // [num_tokens, num_topk]
@@ -294,42 +306,42 @@ __global__ void fullmesh_combine_kernel_reduce(
     int max_topk_for_combine,
     int hidden)
 {
-    int t = blockIdx.x;
-    if (t >= num_tokens) return;
-
     int tid       = threadIdx.x;
     int nthreads  = blockDim.x;
 
-    // Each thread covers a strided slice of the hidden dim. For each assigned
-    // h, loop over k, accumulate weights[k] * combine[t,k,h] in fp32, then
-    // write bf16 result to combined_output[t,h]. If topk_weights is null
-    // (caller did not provide TOPK_WEIGHTS in combine inputs), fall back to
-    // uniform 1/num_topk weighting -- this matches HT's forward-combine
-    // semantics and keeps FULLMESH working with ep_bench's existing HT
-    // tensor setup (num_combine_inputs=1, topk_weights absent) without a
-    // per-algorithm branch in the benchmark.
     const float uniform_w = (num_topk > 0) ? (1.0f / static_cast<float>(num_topk)) : 0.f;
-    for (int h = tid; h < hidden; h += nthreads) {
-        float acc = 0.f;
-        for (int k = 0; k < num_topk; ++k) {
-            size_t slot_idx = ((static_cast<size_t>(t) * max_topk_for_combine) + k)
-                            * hidden + h;
-            // bf16 -> float via bit shift into upper 16 of fp32. This is the
-            // standard bf16 load pattern used elsewhere in the project.
-            uint16_t bf   = combine_local[slot_idx];
-            uint32_t bits = static_cast<uint32_t>(bf) << 16;
-            float    v    = __int_as_float(static_cast<int>(bits));
-            float    w    = (topk_weights != nullptr)
-                          ? topk_weights[static_cast<size_t>(t) * num_topk + k]
-                          : uniform_w;
-            acc += w * v;
+
+    for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
+        // Each thread covers a strided slice of the hidden dim. For each
+        // assigned h, loop over k, accumulate weights[k] * combine[t,k,h] in
+        // fp32, then write bf16 result to combined_output[t,h]. If
+        // topk_weights is null (caller did not provide TOPK_WEIGHTS in combine
+        // inputs), fall back to uniform 1/num_topk weighting -- this matches
+        // HT's forward-combine semantics and keeps FULLMESH working with
+        // ep_bench's existing HT tensor setup (num_combine_inputs=1,
+        // topk_weights absent) without a per-algorithm branch in the benchmark.
+        for (int h = tid; h < hidden; h += nthreads) {
+            float acc = 0.f;
+            for (int k = 0; k < num_topk; ++k) {
+                size_t slot_idx = ((static_cast<size_t>(t) * max_topk_for_combine) + k)
+                                * hidden + h;
+                // bf16 -> float via bit shift into upper 16 of fp32. Standard
+                // bf16 load pattern used elsewhere in the project.
+                uint16_t bf   = combine_local[slot_idx];
+                uint32_t bits = static_cast<uint32_t>(bf) << 16;
+                float    v    = __int_as_float(static_cast<int>(bits));
+                float    w    = (topk_weights != nullptr)
+                              ? topk_weights[static_cast<size_t>(t) * num_topk + k]
+                              : uniform_w;
+                acc += w * v;
+            }
+            // bf16 round-to-nearest-even via "add 0x7fff + lsb" trick.
+            uint32_t acc_bits = static_cast<uint32_t>(__float_as_int(acc));
+            uint32_t lsb      = (acc_bits >> 16) & 1u;
+            uint32_t bias     = 0x7fffu + lsb;
+            uint16_t out      = static_cast<uint16_t>((acc_bits + bias) >> 16);
+            combined_output[static_cast<size_t>(t) * hidden + h] = out;
         }
-        // bf16 round-to-nearest-even via "add 0x7fff + lsb" trick.
-        uint32_t acc_bits = static_cast<uint32_t>(__float_as_int(acc));
-        uint32_t lsb      = (acc_bits >> 16) & 1u;
-        uint32_t bias     = 0x7fffu + lsb;
-        uint16_t out      = static_cast<uint16_t>((acc_bits + bias) >> 16);
-        combined_output[static_cast<size_t>(t) * hidden + h] = out;
     }
 }
 
@@ -347,6 +359,7 @@ void launch_combine_push_kernel(
     int hidden_bytes,
     int bytes_per_entry,
     int meta_bytes,
+    int num_sms,
     cudaStream_t stream)
 {
     if ((hidden_bytes & 15) != 0) {
@@ -357,7 +370,14 @@ void launch_combine_push_kernel(
     }
     int hidden_u4 = hidden_bytes >> 4;
 
-    dim3 grid(nRanks, max_tokens_per_rank);
+    // 1D grid over flattened (src, slot) space, capped at num_sms. Kernel
+    // does grid-stride loop. Default (num_sms == 0) uses full
+    // nRanks * max_tokens_per_rank grid (legacy behaviour).
+    int total = nRanks * max_tokens_per_rank;
+    int grid_x = (num_sms <= 0 || num_sms >= total) ? total : num_sms;
+    if (grid_x <= 0) return;
+
+    dim3 grid(grid_x);
     dim3 block(32);
     fullmesh_combine_kernel_push<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint4*>(ffn_output_void),
@@ -376,6 +396,7 @@ void launch_combine_reduce_kernel(
     int num_topk,
     int max_topk_for_combine,
     int hidden_bytes,
+    int num_sms,
     cudaStream_t stream)
 {
     if (num_tokens <= 0) return;
@@ -385,7 +406,8 @@ void launch_combine_reduce_kernel(
 
     // 256 threads covers 7168-hidden in 28-element stripes. Power of two keeps
     // the common-case tail of the loop simple.
-    dim3 grid(num_tokens);
+    int grid_x = (num_sms <= 0 || num_sms >= num_tokens) ? num_tokens : num_sms;
+    dim3 grid(grid_x);
     dim3 block(256);
     fullmesh_combine_kernel_reduce<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(combine_local_va_void),
@@ -418,66 +440,71 @@ __global__ void fullmesh_combine_kernel_fused(
     int bytes_per_entry,
     int meta_bytes)
 {
-    int src  = blockIdx.x;
-    int slot = blockIdx.y;
-    if (src >= nRanks || slot >= max_tokens_per_rank) return;
-
-    // Skip slots a peer never filled this iter (dispatch counter is the
-    // ground truth). Saves one block's worth of load+atomic for empty slots.
-    int filled = counter_local_va[src];
-    if (slot >= filled) return;
-
+    // Grid-stride loop over flattened (src, slot) space.
+    int total    = nRanks * max_tokens_per_rank;
     int tid      = threadIdx.x;
     int nthreads = blockDim.x;
 
-    // Read 16B meta in a single transaction. dispatch_kernel's lane-0 stored:
-    //   x: src_rank, y: src_token_id, z: k_in_topk, w: weight_fp32 bits
-    const uint8_t* entry = recv_local_va +
-        (static_cast<size_t>(src) * max_tokens_per_rank + slot) *
-        static_cast<size_t>(bytes_per_entry);
-    uint4 meta_vec = *reinterpret_cast<const uint4*>(entry);
-    int   src_rank     = static_cast<int>(meta_vec.x);
-    int   src_token_id = static_cast<int>(meta_vec.y);
-    // meta_vec.z = k_in_topk: not used in fused path; we sum directly into
-    // col 0 instead of a per-k slot, so the dest rank doesn't care which k
-    // this slot was for.
-    float weight       = __int_as_float(static_cast<int>(meta_vec.w));
+    for (int idx = blockIdx.x; idx < total; idx += gridDim.x) {
+        int src  = idx / max_tokens_per_rank;
+        int slot = idx - src * max_tokens_per_rank;
 
-    if (src_rank != src) return;
-    if (src_token_id < 0 || src_token_id >= max_tokens_per_rank) return;
+        // Skip slots a peer never filled this iter (dispatch counter is the
+        // ground truth). Saves one iteration's worth of load+atomic for empty
+        // slots.
+        int filled = counter_local_va[src];
+        if (slot >= filled) continue;
 
-    // Source: dest-local FFN output for this (src, slot) entry. The compaction
-    // pass after dispatch projected the recv_buf into a dense
-    // [nRanks * max_tokens, hidden] tensor, so the row index is exactly
-    // src * max + slot.
-    size_t i = static_cast<size_t>(src) * max_tokens_per_rank + slot;
-    const __nv_bfloat162* src_payload = ffn_output_pair + i * hidden_pair;
+        // Read 16B meta in a single transaction. dispatch_kernel's lane-0 stored:
+        //   x: src_rank, y: src_token_id, z: k_in_topk, w: weight_fp32 bits
+        const uint8_t* entry = recv_local_va +
+            (static_cast<size_t>(src) * max_tokens_per_rank + slot) *
+            static_cast<size_t>(bytes_per_entry);
+        uint4 meta_vec = *reinterpret_cast<const uint4*>(entry);
+        int   src_rank     = static_cast<int>(meta_vec.x);
+        int   src_token_id = static_cast<int>(meta_vec.y);
+        // meta_vec.z = k_in_topk: not used in fused path; we sum directly into
+        // col 0 instead of a per-k slot.
+        float weight       = __int_as_float(static_cast<int>(meta_vec.w));
 
-    // Target: peer src_rank's combine_buf at [src_token_id, 0, 0..hidden).
-    // Layout = [num_tokens][max_topk_for_combine][hidden_bf16]. A row in
-    // bf162-pair units is max_topk_for_combine * hidden_pair pairs. We
-    // accumulate into column 0 so all (src, slot) blocks targeting the same
-    // src_token_id end up atomic-add'd into the same row[0:hidden] region.
-    __nv_bfloat162* dst_base =
-        reinterpret_cast<__nv_bfloat162*>(peer_combine_vas_dev[src_rank]);
-    size_t row_pair_stride =
-        static_cast<size_t>(max_topk_for_combine) * static_cast<size_t>(hidden_pair);
-    __nv_bfloat162* dst = dst_base + static_cast<size_t>(src_token_id) * row_pair_stride;
-    // col 0 starts at offset 0 inside the row; no further offset.
+        if (src_rank != src) continue;
+        if (src_token_id < 0 || src_token_id >= max_tokens_per_rank) continue;
 
-    // Pre-bake the weight into a bf162 pair so the inner loop is just
-    // mul + atomicAdd, no float->bf16 conversions per element.
-    __nv_bfloat162 wpair = __floats2bfloat162_rn(weight, weight);
+        // Source: dest-local FFN output for this (src, slot) entry. The
+        // compaction pass after dispatch projected the recv_buf into a dense
+        // [nRanks * max_tokens, hidden] tensor, so the row index is exactly
+        // src * max + slot.
+        size_t i = static_cast<size_t>(src) * max_tokens_per_rank + slot;
+        const __nv_bfloat162* src_payload = ffn_output_pair + i * hidden_pair;
 
-    // Strided loop: 256 threads over hidden_pair=2240 (for hidden=7168) does
-    // ~9 iterations/thread. Grid covers all (src, slot, src_token_id), so
-    // multiple blocks may race on the same dst pair from different (src, slot)
-    // tuples mapped to the same src_token_id; atomic_add on bf162 in fabric
-    // memory serialises those writes correctly on sm_90+ (GB300 sm_103).
-    for (int p = tid; p < hidden_pair; p += nthreads) {
-        __nv_bfloat162 v        = src_payload[p];
-        __nv_bfloat162 weighted = __hmul2(v, wpair);
-        atomicAdd(dst + p, weighted);
+        // Target: peer src_rank's combine_buf at [src_token_id, 0, 0..hidden).
+        // Layout = [num_tokens][max_topk_for_combine][hidden_bf16]. A row in
+        // bf162-pair units is max_topk_for_combine * hidden_pair pairs. We
+        // accumulate into column 0 so all (src, slot) blocks targeting the
+        // same src_token_id end up atomic-add'd into the same row[0:hidden]
+        // region.
+        __nv_bfloat162* dst_base =
+            reinterpret_cast<__nv_bfloat162*>(peer_combine_vas_dev[src_rank]);
+        size_t row_pair_stride =
+            static_cast<size_t>(max_topk_for_combine) * static_cast<size_t>(hidden_pair);
+        __nv_bfloat162* dst = dst_base + static_cast<size_t>(src_token_id) * row_pair_stride;
+        // col 0 starts at offset 0 inside the row; no further offset.
+
+        // Pre-bake the weight into a bf162 pair so the inner loop is just
+        // mul + atomicAdd, no float->bf16 conversions per element.
+        __nv_bfloat162 wpair = __floats2bfloat162_rn(weight, weight);
+
+        // Strided loop: 256 threads over hidden_pair=2240 (for hidden=7168)
+        // does ~9 iterations/thread. Grid covers all (src, slot, src_token_id),
+        // so multiple iterations may race on the same dst pair from different
+        // (src, slot) tuples mapped to the same src_token_id; atomic_add on
+        // bf162 in fabric memory serialises those writes correctly on sm_90+
+        // (GB300 sm_103).
+        for (int p = tid; p < hidden_pair; p += nthreads) {
+            __nv_bfloat162 v        = src_payload[p];
+            __nv_bfloat162 weighted = __hmul2(v, wpair);
+            atomicAdd(dst + p, weighted);
+        }
     }
 }
 
@@ -495,6 +522,7 @@ void launch_combine_fused_kernel(
     int hidden_bytes,
     int bytes_per_entry,
     int meta_bytes,
+    int num_sms,
     cudaStream_t stream)
 {
     if (nRanks <= 0 || max_tokens_per_rank <= 0) return;
@@ -511,7 +539,11 @@ void launch_combine_fused_kernel(
     int hidden_bf16 = hidden_bytes >> 1;
     int hidden_pair = hidden_bf16 >> 1;
 
-    dim3 grid(nRanks, max_tokens_per_rank);
+    int total = nRanks * max_tokens_per_rank;
+    int grid_x = (num_sms <= 0 || num_sms >= total) ? total : num_sms;
+    if (grid_x <= 0) return;
+
+    dim3 grid(grid_x);
     dim3 block(256);
     fullmesh_combine_kernel_fused<<<grid, block, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat162*>(ffn_output_void),
