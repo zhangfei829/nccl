@@ -3403,16 +3403,21 @@ ncclResult_t ncclEpCombine(
         }
 
         // [FULLMESH] Phase 3 commit B-fused: pick combine path based on env var.
-        // Default "fused": 1 kernel + 1 HBM pass via dest -> src bf162 atomic_add
-        //   into the src rank's combine_buf column 0, then src memcpy's col 0
-        //   out to combined_output. Required for FM combine to match HT BW.
-        // "push_reduce": legacy 2-kernel + 2-HBM-pass path kept for A/B
-        //   correctness comparison and as a fallback if a sm version turns out
-        //   to lack bf162 atomic_add on fabric memory.
+        // Default "push_reduce" (the legacy 2-kernel path) because empirical
+        // sweep on GB300 showed that "fused" is a regression at every EP size
+        // we tried (EP4/8/16/32 t=8192). On EP8 fused combine_kernel_us is
+        // 2284us vs push_reduce's 1795us -- the bf162 atomic_add at fabric
+        // memory serialises HBM-controller writes when num_topk src ranks
+        // simultaneously atomic_add into the same col-0 region of one src
+        // rank's combine_buf, which kills the throughput advantage that the
+        // single HBM-pass design was supposed to deliver.
+        // Set NCCL_EP_FULLMESH_COMBINE_PATH=fused to force the new path
+        // (still useful for A/B and for future hardware where the fabric
+        // atomic contention story changes).
         static const bool fm_combine_fused = [](){
             const char* v = std::getenv("NCCL_EP_FULLMESH_COMBINE_PATH");
-            if (v == nullptr) return true;     // default fused
-            return !(v[0] == 'p' || v[0] == 'P');  // "push_reduce" / "PUSH..." -> false
+            if (v == nullptr) return false;    // default push_reduce
+            return v[0] == 'f' || v[0] == 'F'; // "fused" / "FUSED" -> true
         }();
 
         const size_t row_pitch_bytes = fb.max_topk_for_combine
