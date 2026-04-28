@@ -1,0 +1,46 @@
+---
+description: 给用户构建/运行命令前，必须先从仓库里已验证脚本中拷环境变量与调用方式，禁止凭记忆裸写
+alwaysApply: true
+---
+
+# 产出 build/run 命令前必须先核对已工作脚本
+
+这条规则是这次"上次能编这次又挂 mpi.h"的直接产物。原话：
+> 为什么上次没问题，你不能一次性把事情做好吗，写入规则
+
+## 根因
+
+我先前给的命令 `make -C contrib/nccl_ep MPI=1 BUILDDIR=... NVCC_GENCODE=... -j16` 漏了 `MPI_HOME`，导致 `nvcc` 用不到 `mpi.h`，编译挂在第 1 个 `.o`。
+
+漏的原因：我**凭印象裸写命令**，没去看仓库里 `contrib/nccl_ep/sweep/run_all_from_jumphost.sh` —— 那个脚本上次成功过，里面已经有完整环境变量集：
+
+```bash
+export MPI_HOME="$(dirname $(dirname $(readlink -f $(which mpirun))))"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
+make -C contrib/nccl_ep MPI=1 BUILDDIR="${NCCL_HOME}" \
+                       NVCC_GENCODE="${NVCC_GENCODE}" MPI_HOME="${MPI_HOME}"
+```
+
+只要先 grep 一下 `MPI_HOME` 在仓库的引用，就一定不会漏。
+
+## 硬性流程（产出 build / run 命令前**必做**）
+
+1. **先 grep 已工作脚本**：在仓库里 `rg "make -C ${target}"` / `rg "${binary_name}"` / `rg "MPI_HOME|NCCL_HOME|CUDA_HOME"`，找出**正在产线用的调用方式**。
+2. **以脚本为准**：脚本里 `export` 了哪些变量、给 `make` 传了哪些 KV、给 `srun/mpirun` 传了哪些 flag，**全部抄过来**。不要做"我觉得这个不必要"的删减——除非已读 `Makefile` 确认默认值。
+3. **能直接调脚本就调脚本**：如果 `run_all_from_jumphost.sh` / `ep_sweep.sh` 这种已工作 wrapper 已经覆盖目标场景，**优先直接调它**，不要为了"瘦一点"自己手撸 `make`+`srun`。
+4. **手撸命令必须等价于脚本**：如果场景脚本没覆盖、必须手撸，先把脚本的 env block 完整复制到命令前缀，再改你要变的部分（如换 `TOKENS` / `MODES`）。
+5. **聚合时把环境推导也聚进来**：`MPI_HOME=$(...)`、`NCCL_HOME=...` 这些放在 `&&` 链最前面，跟着 `ls $MPI_HOME/include/mpi.h` 这种 1 行 sanity check，让缺变量的情况立刻暴露而不是等编译挂。
+
+## 反模式（这次踩的）
+
+- ❌ 凭记忆裸写 `make -C ... MPI=1 BUILDDIR=... NVCC_GENCODE=... -j16`，漏 `MPI_HOME`。
+- ❌ "上次成功过 → 这次也行" —— 上次成功是因为调了 `run_all_from_jumphost.sh`（脚本帮你导了），不是命令本身完整。两次场景不同，记忆不能直接迁移。
+- ❌ 给用户命令前没跑过 `Grep "MPI_HOME"` / `Grep "make -C contrib/nccl_ep"`。
+
+## 自检清单（每次给 build/run 命令必过）
+
+- [ ] grep 过 `Makefile` 的 `?=` / 必需变量？
+- [ ] grep 过 `sweep/*.sh` / `*.sh` 看已知调用方式？
+- [ ] 已工作脚本里 `export` 的变量我命令里**全部包含**？
+- [ ] 命令前缀有 1-2 行 sanity check（`ls $MPI_HOME/include/mpi.h` / `which mpirun`），让缺变量立刻报错？
+- [ ] 能直接调脚本的，是否优先调脚本而不是手撸？
