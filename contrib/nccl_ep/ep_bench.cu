@@ -2496,14 +2496,30 @@ int main(int argc, char* argv[]) {
     int actual_warmup = num_warmup;
     int actual_iters = num_iters;
 
+    // Warmup runs OUTSIDE the KernelTimer window so CUPTI only records
+    // launches from the measured iters. This prevents (warmup+iters)/iters
+    // inflation of dispatch_kernel_us / combine_kernel_us when get_total_per
+    // _iter() divides total_ns by num_iters: if warmup launches are in
+    // total_ns the result is inflated by ~1.67x at the default 20/30 ratio,
+    // which made HT dispatch BW read 358 GB/s vs the true 600 GB/s baseline.
+    for (int i = 0; i < actual_warmup; i++) {
+        dispatch_fn();
+        CUDACHECK(cudaStreamSynchronize(stream));
+        combine_fn();
+        CUDACHECK(cudaStreamSynchronize(stream));
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
+
     // CUPTI wraps the benchmark loop — records kernel GPU timestamps in hardware
     // alongside the cudaEvent timing, with zero interference.
     KernelTimer ktimer;
     ktimer.start();
 
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    // Pass warmup=0 because we did warmup above outside the timer; the
+    // cudaEvent loop inside runPairedBenchmark only times the iters.
     PairedBenchResult paired_result = runPairedBenchmark(
-        dispatch_fn, combine_fn, actual_warmup, actual_iters,
+        dispatch_fn, combine_fn, /*num_warmup=*/0, actual_iters,
         dispatch_data_bytes, combine_data_bytes, stream);
 
     ktimer.stop();
