@@ -116,6 +116,13 @@ namespace fullmesh {
 //   don't pass weights.
 enum class DispatchPath { kCoop = 0, kTma = 1 };
 
+// C3: how many tokens each block processes concurrently in the TMA path.
+// Each token slot occupies 32 * top_k threads, so kNum * 32 * top_k must stay
+// <= 1024 (block thread cap). For top_k=8 and kNum=2 we use 512 threads.
+// Exposed in the header so the host-side prof print can convert cycles back
+// to ns-per-token correctly (only token-slot 0 accumulates the counter).
+constexpr int kFmDispatchTokensPerBlock = 2;
+
 void launch_dispatch_kernel(
     const void*       x,                      // [num_tokens, hidden_bytes] device src
     const int64_t*    topk_idx,               // [num_tokens, top_k] int64

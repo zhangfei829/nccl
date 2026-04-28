@@ -139,21 +139,32 @@ __global__ void fullmesh_dispatch_kernel_coop(
     }
 }
 
-// Phase 4 commit C2: warp-specialised TMA dispatch kernel.
+// Phase 4 commit C3: multi-token-per-block + warp-specialised TMA dispatch.
 // ----------------------------------------------------------------------------
-// C1 found that with 1-warp/block + lane-0 serial issue, the per-k TMA-issue
-// loop (atomicAdd + meta store + tma_store_1d setup ~= 2 us each) ate 78% of
-// the per-token cycles (15.87 / 20.43 us at NUM_SMS=16, EP=8 t=8192). TMA
-// hardware itself was fast (tail wait only 0.16 us). C2 spreads the per-k
-// loop across one warp per k:
-//   Block = 32 * top_k threads (warp_id == k).
-//   - All threads cooperate on the gmem -> smem load.
-//   - __syncthreads + tma_store_fence so smem is visible to all warps' TMA.
-//   - Each warp's lane 0 issues its own atomicAdd + meta store + tma_store_1d
-//     concurrently with the other warps.
-//   - Each warp's lane 0 calls tma_store_wait<0> for its own commit_group.
-//   - __syncthreads so smem can be reused on the next iter.
-// Expected payload us/tok 15.87 -> ~2 (8x parallel issue).
+// C2 brought us to 5.59 us/tok / 292 GB/s at NUM_SMS=16, EP=8 t=8192. Still
+// 2x off HT (602 GB/s). Stage breakdown showed load/payload/tail are running
+// SERIALLY within a block (load -> payload -> tail back-to-back), and only
+// 8 warps are active per SM at a time -- well below the 32-64 warps an SM can
+// schedule in parallel.
+//
+// C3 packs N tokens into the same block. With NUM_TOKENS_PER_BLOCK=2 we get
+// 16 warps per block (= 2 * top_k for top_k=8), letting the SM scheduler
+// hide atomicAdd-peer-counter NVLink latency by switching warps. Every per-
+// token slice (load / atomic / meta / TMA issue / wait) runs the same way as
+// in C2; the only change is each block now interleaves N tokens. block size
+// 2 x 256 = 512 threads is below the 1024/block cap. smem 2 x hidden_bytes is
+// well below the per-SM smem budget (228 KB on GB300) so block residency
+// remains unconstrained.
+//
+// Expected at NUM_SMS=16 EP=8 t=8192:
+//   total us/tok 5.59 -> ~3 (latency hidden across 2 tokens worth of warps)
+//   dispatch BW 292 -> ~520 GB/s (closing on HT 602)
+//
+// If C3 lands but still misses HT, C4 bumps NUM_TOKENS_PER_BLOCK to 4 (1024
+// threads/block); above that we need real producer/consumer + multi-stage
+// ring buffer with mbarrier (C5) since we run out of block size budget.
+// (kFmDispatchTokensPerBlock declared in fullmesh.cuh so host print can use it)
+
 __global__ void fullmesh_dispatch_kernel_tma(
     const uint4*     __restrict__ x,                 // [num_tokens, hidden_u4]
     const int64_t*   __restrict__ topk_idx,          // [num_tokens, top_k]
@@ -172,35 +183,45 @@ __global__ void fullmesh_dispatch_kernel_tma(
     int meta_bytes,
     unsigned long long* prof_dispatch)
 {
+    // Layout per block:
+    //   threads 0..255   = token slot 0  (warps 0..7 = k=0..7)
+    //   threads 256..511 = token slot 1  (warps 8..15 = k=0..7 for token slot 1)
     extern __shared__ uint4 smem_payload[];
+    const int kNum = kFmDispatchTokensPerBlock;
+    const int threads_per_token = 32 * top_k;          // = 256 for top_k=8
+    const int tid_in_block      = threadIdx.x;
+    const int token_in_block    = tid_in_block / threads_per_token;     // 0..kNum-1
+    const int tid_in_token      = tid_in_block - token_in_block * threads_per_token;
+    const int warp_in_token     = tid_in_token >> 5;                    // 0..top_k-1
+    const int lane              = tid_in_token & 31;                    // 0..31
 
-    int tid_in_block = threadIdx.x;
-    int warp_id      = tid_in_block >> 5;        // 0..top_k-1
-    int lane         = tid_in_block & 31;        // 0..31
+    // smem subrange this token slot owns: [token_in_block * hidden_u4, +hidden_u4).
+    uint4* smem_for_slot = smem_payload + token_in_block * hidden_u4;
 
-    for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
+    // Grid-stride: each block processes kNum tokens per iteration.
+    for (int t_base = blockIdx.x * kNum; t_base < num_tokens; t_base += gridDim.x * kNum) {
+        int t = t_base + token_in_block;
+        bool active_token = (t < num_tokens);
+
         unsigned long long ck0 = clock_if_prof(prof_dispatch, tid_in_block);
 
-        // (1) Cooperative load gmem -> smem. ALL block threads (32 * top_k)
-        //     stride hidden_u4 uint4 elements; far more parallelism than the
-        //     32-lane single-warp version gave, which should also shrink the
-        //     load cycles substantially when hidden_u4 is small.
-        const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
-        for (int i = tid_in_block; i < hidden_u4; i += blockDim.x) {
-            smem_payload[i] = src_payload[i];
+        // (1) Cooperative load gmem -> smem. Each token's 256 threads load
+        //     its own hidden_u4 elements stride-256 into its own smem slot.
+        if (active_token) {
+            const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
+            for (int i = tid_in_token; i < hidden_u4; i += threads_per_token) {
+                smem_for_slot[i] = src_payload[i];
+            }
         }
         __syncthreads();
-        // Make smem stores visible to TMA proxy for every warp's tma_store_1d.
         tma_store_fence();
 
         unsigned long long ck1 = clock_if_prof(prof_dispatch, tid_in_block);
 
-        // (2) Per-warp issue: warp k = warp_id processes (token, k) pair.
-        //     Each warp's lane 0 does the slot allocation + meta store + TMA
-        //     issue concurrently with the others, removing the lane-0 serial
-        //     bottleneck identified in C1.
-        if (warp_id < top_k && lane == 0) {
-            int k = warp_id;
+        // (2) Per-warp issue: each warp_in_token == k handles (t, k) pair.
+        //     With kNum=2 there are 2 * top_k = 16 warps issuing concurrently.
+        if (active_token && warp_in_token < top_k && lane == 0) {
+            int k = warp_in_token;
             int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
             if (eid >= 0) {
                 int dest = static_cast<int>(eid / num_local_experts);
@@ -222,9 +243,7 @@ __global__ void fullmesh_dispatch_kernel_tma(
                         meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
                         *reinterpret_cast<uint4*>(entry) = meta_vec;
 
-                        // Each warp's commit_group is per-thread state, so
-                        // tma_store_1d here belongs to this warp's lane 0 only.
-                        tma_store_1d(smem_payload, entry + meta_bytes, hidden_bytes);
+                        tma_store_1d(smem_for_slot, entry + meta_bytes, hidden_bytes);
                     }
                 }
             }
@@ -233,19 +252,16 @@ __global__ void fullmesh_dispatch_kernel_tma(
 
         unsigned long long ck2 = clock_if_prof(prof_dispatch, tid_in_block);
 
-        // (3) Each warp's lane 0 waits its own pending commit_group. wait<0>
-        //     on a thread that issued nothing returns immediately, so warps
-        //     beyond top_k are no-op.
-        if (warp_id < top_k && lane == 0) {
+        // (3) Each issuing warp's lane 0 waits on its own commit_group.
+        if (active_token && warp_in_token < top_k && lane == 0) {
             tma_store_wait<0>();
         }
         __syncthreads();
 
         unsigned long long ck3 = clock_if_prof(prof_dispatch, tid_in_block);
 
-        // Profile counters: only thread 0 of block 0 atomicAdd's the deltas
-        // (tid_in_block==0 implies warp_id==0 lane==0, the canonical reporter).
         if (tid_in_block == 0) {
+            // Per "token-slot" delta -- block 0 thread 0 is the slot-0 reporter.
             prof_add(prof_dispatch, 0, ck1 - ck0);   // load + fence
             prof_add(prof_dispatch, 1, 0ULL);        // (no separate prelude)
             prof_add(prof_dispatch, 2, ck2 - ck1);   // parallel atomic + meta + TMA issue
@@ -321,12 +337,27 @@ void launch_dispatch_kernel(
             hidden_u4, bytes_per_entry, meta_bytes,
             prof_dispatch);
     } else {
-        // C2 TMA: 32 * top_k threads (one warp per k for parallel TMA issue),
-        // smem = hidden_bytes for the per-block staging buffer that all top_k
-        // warps share-read via cp.async.bulk.
-        int threads_per_block = 32 * (top_k > 0 ? top_k : 1);
-        int smem_bytes = hidden_bytes;
-        dim3 grid(grid_x);
+        // C3 TMA: kFmDispatchTokensPerBlock tokens per block, each token gets
+        // 32 * top_k threads (one warp per k for parallel TMA issue). Block
+        // size = kNum * 32 * top_k. smem = kNum * hidden_bytes for the kNum
+        // staging buffers the kNum tokens need.
+        int threads_per_token = 32 * (top_k > 0 ? top_k : 1);
+        int threads_per_block = kFmDispatchTokensPerBlock * threads_per_token;
+        if (threads_per_block > 1024) {
+            fprintf(stderr,
+                    "[FULLMESH] launch_dispatch_kernel: threads_per_block=%d exceeds "
+                    "1024-thread/block cap (kNum=%d top_k=%d). Aborting.\n",
+                    threads_per_block, kFmDispatchTokensPerBlock, top_k);
+            return;
+        }
+        int smem_bytes = kFmDispatchTokensPerBlock * hidden_bytes;
+        // Grid is now in units of kNum tokens; ceil-div num_tokens by kNum and
+        // cap at num_sms. With NUM_SMS=16 grid_x=16 and each block strides over
+        // multiple kNum-token chunks via the kernel's grid-stride loop.
+        int chunks = (num_tokens + kFmDispatchTokensPerBlock - 1) / kFmDispatchTokensPerBlock;
+        int grid_chunks = (num_sms <= 0 || num_sms >= chunks) ? chunks : num_sms;
+        if (grid_chunks <= 0) return;
+        dim3 grid(grid_chunks);
         dim3 block(threads_per_block);
         fullmesh_dispatch_kernel_tma<<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const uint4*>(x_void),
