@@ -139,32 +139,43 @@ __global__ void fullmesh_dispatch_kernel_coop(
     }
 }
 
-// Phase 4 commit C3: multi-token-per-block + warp-specialised TMA dispatch.
+// Phase 4 commit D1: multi-stage ring buffer with mbarrier producer/consumer.
 // ----------------------------------------------------------------------------
-// C2 brought us to 5.59 us/tok / 292 GB/s at NUM_SMS=16, EP=8 t=8192. Still
-// 2x off HT (602 GB/s). Stage breakdown showed load/payload/tail are running
-// SERIALLY within a block (load -> payload -> tail back-to-back), and only
-// 8 warps are active per SM at a time -- well below the 32-64 warps an SM can
-// schedule in parallel.
+// C3 baseline (kFm=2, warp-specialised + multi-token) measured 5.59 us/tok at
+// NUM_SMS=16 EP=8 t=8192 = 499 GB/s (HT 599 GB/s, -17%). Stages run serially
+// within a block:
+//   load    cooperative gmem->smem    2.14 us/tok
+//   payload lane-0 atomicAdd + meta + tma_store    2.59 us/tok
+//   tail    tma_store_wait<0>    0.86 us/tok
 //
-// C3 packs N tokens into the same block. With NUM_TOKENS_PER_BLOCK=2 we get
-// 16 warps per block (= 2 * top_k for top_k=8), letting the SM scheduler
-// hide atomicAdd-peer-counter NVLink latency by switching warps. Every per-
-// token slice (load / atomic / meta / TMA issue / wait) runs the same way as
-// in C2; the only change is each block now interleaves N tokens. block size
-// 2 x 256 = 512 threads is below the 1024/block cap. smem 2 x hidden_bytes is
-// well below the per-SM smem budget (228 KB on GB300) so block residency
-// remains unconstrained.
+// D1 splits the block into:
+//   1 producer warp (warp 0):  TMA load gmem -> smem ring buffer
+//   top_k consumer warps:      per-k atomicAdd + meta + TMA store
+// Two-stage ring: while consumers process token[t] from smem[t&1], producer
+// already TMA-loads token[t+1] into smem[(t+1)&1]. Consumer wall and producer
+// wall run in parallel, total per-token wall = max(load, payload+tail).
+//
+// Synchronization via shared-memory mbarriers (HT-style):
+//   produced_mbar[2] : signaled by producer when stage payload is in smem
+//                      (TMA's complete_tx variant means hardware signals on
+//                       cp.async.bulk completion -- no SM cycle spent waiting).
+//   consumed_mbar[2] : signaled by consumers when stage smem is no longer
+//                      needed (each of top_k consumer warps' lane 0 arrives,
+//                      arrive_count = top_k).
+//
+// Block layout: warp 0 = producer, warps 1..top_k = consumers.
+// Block size = 32 * (1 + top_k) threads (= 288 for top_k=8).
+// Smem layout:
+//   [0,             hidden_bytes)         stage 0 payload
+//   [hidden_bytes,  2 * hidden_bytes)     stage 1 payload
+//   [2 * hidden_bytes, +16)               produced_mbar[2]
+//   [+16, +32)                            consumed_mbar[2]
+// Total ~14 KB for hidden_bytes=7168.
 //
 // Expected at NUM_SMS=16 EP=8 t=8192:
-//   total us/tok 5.59 -> ~3 (latency hidden across 2 tokens worth of warps)
-//   dispatch BW 292 -> ~520 GB/s (closing on HT 602)
-//
-// If C3 lands but still misses HT, C4 bumps NUM_TOKENS_PER_BLOCK to 4 (1024
-// threads/block); above that we need real producer/consumer + multi-stage
-// ring buffer with mbarrier (C5) since we run out of block size budget.
-// (kFmDispatchTokensPerBlock declared in fullmesh.cuh so host print can use it)
-
+//   per-token wall = max(load, payload+tail) = max(2.14, 3.45) = 3.45 us/tok
+//   dispatch_kernel_us 1881 -> ~1170 us
+//   dispatch BW 499 -> ~803 GB/s, beating HT 599 by ~34%
 __global__ void fullmesh_dispatch_kernel_tma(
     const uint4*     __restrict__ x,                 // [num_tokens, hidden_u4]
     const int64_t*   __restrict__ topk_idx,          // [num_tokens, top_k]
@@ -183,45 +194,76 @@ __global__ void fullmesh_dispatch_kernel_tma(
     int meta_bytes,
     unsigned long long* prof_dispatch)
 {
-    // Layout per block:
-    //   threads 0..255   = token slot 0  (warps 0..7 = k=0..7)
-    //   threads 256..511 = token slot 1  (warps 8..15 = k=0..7 for token slot 1)
-    extern __shared__ uint4 smem_payload[];
-    const int kNum = kFmDispatchTokensPerBlock;
-    const int threads_per_token = 32 * top_k;          // = 256 for top_k=8
-    const int tid_in_block      = threadIdx.x;
-    const int token_in_block    = tid_in_block / threads_per_token;     // 0..kNum-1
-    const int tid_in_token      = tid_in_block - token_in_block * threads_per_token;
-    const int warp_in_token     = tid_in_token >> 5;                    // 0..top_k-1
-    const int lane              = tid_in_token & 31;                    // 0..31
+    constexpr int kStages = 2;
 
-    // smem subrange this token slot owns: [token_in_block * hidden_u4, +hidden_u4).
-    uint4* smem_for_slot = smem_payload + token_in_block * hidden_u4;
+    extern __shared__ uint8_t smem_raw[];
+    uint4* smem_payload[kStages];
+    smem_payload[0] = reinterpret_cast<uint4*>(smem_raw);
+    smem_payload[1] = reinterpret_cast<uint4*>(smem_raw + hidden_bytes);
+    uint64_t* mbar_base = reinterpret_cast<uint64_t*>(smem_raw + kStages * hidden_bytes);
+    uint64_t* produced_mbar = mbar_base;            // [kStages]
+    uint64_t* consumed_mbar = mbar_base + kStages;  // [kStages]
 
-    // Grid-stride: each block processes kNum tokens per iteration.
-    for (int t_base = blockIdx.x * kNum; t_base < num_tokens; t_base += gridDim.x * kNum) {
-        int t = t_base + token_in_block;
-        bool active_token = (t < num_tokens);
+    const int tid_in_block = threadIdx.x;
+    const int warp_id      = tid_in_block >> 5;
+    const int lane         = tid_in_block & 31;
+    const bool is_producer = (warp_id == 0);
+    const int  consumer_k  = warp_id - 1;
+    const bool is_consumer = (warp_id >= 1 && warp_id <= top_k);
 
-        unsigned long long ck0 = clock_if_prof(prof_dispatch, tid_in_block);
-
-        // (1) Cooperative load gmem -> smem. Each token's 256 threads load
-        //     its own hidden_u4 elements stride-256 into its own smem slot.
-        if (active_token) {
-            const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
-            for (int i = tid_in_token; i < hidden_u4; i += threads_per_token) {
-                smem_for_slot[i] = src_payload[i];
-            }
+    // --- (a) Init mbarriers once per block (producer warp lane 0). ---
+    if (is_producer && lane == 0) {
+        for (int s = 0; s < kStages; s++) {
+            mbarrier_init(&produced_mbar[s], 1);          // 1 producer arrival per stage
+            mbarrier_init(&consumed_mbar[s], top_k);      // top_k consumer arrivals per stage
         }
-        __syncthreads();
-        tma_store_fence();
+        fence_barrier_init();
+    }
+    __syncthreads();
 
-        unsigned long long ck1 = clock_if_prof(prof_dispatch, tid_in_block);
+    // Per-thread phase counters; bit s tracks the parity for stage s.
+    uint32_t producer_phase = 0;
+    uint32_t consumer_phase = 0;
 
-        // (2) Per-warp issue: each warp_in_token == k handles (t, k) pair.
-        //     With kNum=2 there are 2 * top_k = 16 warps issuing concurrently.
-        if (active_token && warp_in_token < top_k && lane == 0) {
-            int k = warp_in_token;
+    // Per-block-0-only profile timestamps. Producer wall == warp 0 lane 0;
+    // consumer wall == warp 1 lane 0.
+    unsigned long long p_start = 0, p_end = 0;
+    unsigned long long c0 = 0, c1 = 0, c2 = 0;
+
+    // --- (b) Pipeline: 1 token / iter, producer/consumer overlap across stages ---
+    for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
+        const int stage = t & (kStages - 1);
+
+        // ===== Producer side (warp 0 lane 0 only) =====
+        if (is_producer && lane == 0) {
+            p_start = clock_if_prof(prof_dispatch, 0);
+
+            // Wait for previous use of this stage to drain (skip first kStages tokens).
+            if (t >= kStages) {
+                mbarrier_wait<true>(&consumed_mbar[stage], producer_phase, stage);
+            }
+
+            // Issue async TMA load gmem -> smem[stage]; mbarrier.expect_tx tells
+            // the barrier how many bytes the TMA will deliver, and the hardware
+            // arrives on the barrier when cp.async.bulk completes.
+            mbarrier_arrive_and_expect_tx(&produced_mbar[stage], hidden_bytes);
+            const uint4* src = x + static_cast<size_t>(t) * hidden_u4;
+            tma_load_1d(smem_payload[stage], src, &produced_mbar[stage], hidden_bytes);
+
+            p_end = clock_if_prof(prof_dispatch, 0);
+        }
+
+        // ===== Consumer side (warps 1..top_k, each lane 0 issues its k) =====
+        if (is_consumer && lane == 0) {
+            c0 = clock_if_prof(prof_dispatch, /*lane*/(consumer_k == 0) ? 0 : 1);
+
+            // Wait token[t] payload to be in smem[stage].
+            mbarrier_wait<true>(&produced_mbar[stage], consumer_phase, stage);
+
+            c1 = clock_if_prof(prof_dispatch, /*lane*/(consumer_k == 0) ? 0 : 1);
+
+            // Per-(t, k) work.
+            const int k = consumer_k;
             int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
             if (eid >= 0) {
                 int dest = static_cast<int>(eid / num_local_experts);
@@ -243,31 +285,39 @@ __global__ void fullmesh_dispatch_kernel_tma(
                         meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
                         *reinterpret_cast<uint4*>(entry) = meta_vec;
 
-                        tma_store_1d(smem_for_slot, entry + meta_bytes, hidden_bytes);
+                        tma_store_1d(smem_payload[stage], entry + meta_bytes, hidden_bytes);
+                        tma_store_wait<0>();   // wait this warp's commit_group
                     }
                 }
             }
+
+            c2 = clock_if_prof(prof_dispatch, /*lane*/(consumer_k == 0) ? 0 : 1);
+
+            // Signal stage smem reusable for producer.
+            mbarrier_arrive(&consumed_mbar[stage]);
         }
-        __syncthreads();
 
-        unsigned long long ck2 = clock_if_prof(prof_dispatch, tid_in_block);
-
-        // (3) Each issuing warp's lane 0 waits on its own commit_group.
-        if (active_token && warp_in_token < top_k && lane == 0) {
-            tma_store_wait<0>();
+        // ===== Per-iter prof commit (block 0, canonical reporters). =====
+        // Done outside the producer/consumer divergent paths so atomicAdd
+        // happens uniformly per iter (no reordering hazards).
+        if (blockIdx.x == 0 && tid_in_block == 0 && prof_dispatch != nullptr) {
+            // [0] producer wait + arrive_expect + tma_load_1d issue (~ small)
+            prof_add(prof_dispatch, 0, p_end - p_start);
         }
-        __syncthreads();
-
-        unsigned long long ck3 = clock_if_prof(prof_dispatch, tid_in_block);
-
-        if (tid_in_block == 0) {
-            // Per "token-slot" delta -- block 0 thread 0 is the slot-0 reporter.
-            prof_add(prof_dispatch, 0, ck1 - ck0);   // load + fence
-            prof_add(prof_dispatch, 1, 0ULL);        // (no separate prelude)
-            prof_add(prof_dispatch, 2, ck2 - ck1);   // parallel atomic + meta + TMA issue
-            prof_add(prof_dispatch, 3, ck3 - ck2);   // tma_store_wait
+        if (blockIdx.x == 0 && tid_in_block == 32 && prof_dispatch != nullptr) {
+            // [1] consumer wait produced_mbar (= 0 if pipeline is hiding load)
+            // [2] consumer body (atomic + meta + tma_store + tma_wait)
+            // [3] always 0 (slot reserved for symmetry with C3 print format)
+            prof_add(prof_dispatch, 1, c1 - c0);
+            prof_add(prof_dispatch, 2, c2 - c1);
+            prof_add(prof_dispatch, 3, 0ULL);
         }
     }
+
+    // --- (c) Drain: producer is done, but consumers may still be processing
+    // the last kStages tokens. The kernel's natural exit waits for all warps,
+    // so consumers will finish their tma_store_wait<0> + mbarrier_arrive
+    // before kernel returns. No additional drain barrier needed. ---
 }
 
 }  // anonymous namespace
@@ -337,27 +387,23 @@ void launch_dispatch_kernel(
             hidden_u4, bytes_per_entry, meta_bytes,
             prof_dispatch);
     } else {
-        // C3 TMA: kFmDispatchTokensPerBlock tokens per block, each token gets
-        // 32 * top_k threads (one warp per k for parallel TMA issue). Block
-        // size = kNum * 32 * top_k. smem = kNum * hidden_bytes for the kNum
-        // staging buffers the kNum tokens need.
-        int threads_per_token = 32 * (top_k > 0 ? top_k : 1);
-        int threads_per_block = kFmDispatchTokensPerBlock * threads_per_token;
+        // D1 TMA multi-stage: 1 producer warp + top_k consumer warps.
+        // Block = 32 * (1 + top_k) threads, 1 token per iter via grid stride,
+        // load and payload overlap across two smem stages with mbarrier sync.
+        constexpr int kStages = 2;
+        int threads_per_block = 32 * (1 + (top_k > 0 ? top_k : 1));
         if (threads_per_block > 1024) {
             fprintf(stderr,
                     "[FULLMESH] launch_dispatch_kernel: threads_per_block=%d exceeds "
-                    "1024-thread/block cap (kNum=%d top_k=%d). Aborting.\n",
-                    threads_per_block, kFmDispatchTokensPerBlock, top_k);
+                    "1024-thread/block cap (top_k=%d). Aborting.\n",
+                    threads_per_block, top_k);
             return;
         }
-        int smem_bytes = kFmDispatchTokensPerBlock * hidden_bytes;
-        // Grid is now in units of kNum tokens; ceil-div num_tokens by kNum and
-        // cap at num_sms. With NUM_SMS=16 grid_x=16 and each block strides over
-        // multiple kNum-token chunks via the kernel's grid-stride loop.
-        int chunks = (num_tokens + kFmDispatchTokensPerBlock - 1) / kFmDispatchTokensPerBlock;
-        int grid_chunks = (num_sms <= 0 || num_sms >= chunks) ? chunks : num_sms;
-        if (grid_chunks <= 0) return;
-        dim3 grid(grid_chunks);
+        // smem = kStages payload buffers + 2 * kStages 8B mbarriers.
+        int smem_bytes = kStages * hidden_bytes + 2 * kStages * 8;
+        int grid_x = (num_sms <= 0 || num_sms >= num_tokens) ? num_tokens : num_sms;
+        if (grid_x <= 0) return;
+        dim3 grid(grid_x);
         dim3 block(threads_per_block);
         fullmesh_dispatch_kernel_tma<<<grid, block, smem_bytes, stream>>>(
             reinterpret_cast<const uint4*>(x_void),

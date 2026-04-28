@@ -2998,29 +2998,16 @@ ncclResult_t ncclEpDispatch(
             int clk_khz = 0;
             cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, group->cuda_device_id);
             double cycles_per_ns = (clk_khz > 0) ? clk_khz / 1e6 : 1.41;
-            // tokens_per_block0 = how many tokens block 0 thread 0 saw, which
-            // is also how many cycles atomicAdd's worth of work the prof
-            // counters accumulated. Different per dispatch path:
-            //   coop: 1 token per block-iter -> tokens_per_block0 = ceil(num_tokens / grid)
-            //   tma : kFm tokens per block-iter, slot 0 sees 1 per iter ->
-            //         tokens_per_block0 = ceil(chunks / grid), chunks = ceil(num_tokens / kFm)
-            int tokens_per_block0;
-            int grid_x;
-            if (group->fullmesh_dispatch_path == nccl_ep::fullmesh::DispatchPath::kCoop) {
-                grid_x = (group->fullmesh_num_sms == 0 ||
+            // D1 uses 1 token / block-iter for both coop and tma paths (D1
+            // multi-stage handles overlap via mbarrier producer/consumer, not
+            // by packing kFm tokens into one block). The kFm constant in the
+            // header is kept for the (deprecated) C3 path which we removed
+            // when D1 replaced fullmesh_dispatch_kernel_tma.
+            int grid_x = (group->fullmesh_num_sms == 0 ||
                           static_cast<int>(group->fullmesh_num_sms) >= handle->num_tokens)
                          ? handle->num_tokens
                          : static_cast<int>(group->fullmesh_num_sms);
-                tokens_per_block0 = (handle->num_tokens + grid_x - 1) / grid_x;
-            } else {
-                const int kFm = nccl_ep::fullmesh::kFmDispatchTokensPerBlock;
-                int chunks = (handle->num_tokens + kFm - 1) / kFm;
-                grid_x = (group->fullmesh_num_sms == 0 ||
-                          static_cast<int>(group->fullmesh_num_sms) >= chunks)
-                         ? chunks
-                         : static_cast<int>(group->fullmesh_num_sms);
-                tokens_per_block0 = (chunks + grid_x - 1) / grid_x;
-            }
+            int tokens_per_block0 = (handle->num_tokens + grid_x - 1) / grid_x;
             const char* path_name =
                 (group->fullmesh_dispatch_path == nccl_ep::fullmesh::DispatchPath::kCoop)
                     ? "coop" : "tma";
