@@ -2991,16 +2991,13 @@ ncclResult_t ncclEpDispatch(
             CUDA_CHECK(cudaMemcpyAsync(prof_host, group->fullmesh_prof_dispatch_dev,
                                        sizeof(prof_host), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            // Convert cycles -> ns. clock64 is per-SM cycle counter at the
-            // device's GPU clock rate. cudaDeviceProp.clockRate is in kHz.
-            double cycles_per_ns = static_cast<double>(group->device_sm_count > 0
-                                       ? 1.41        // GB300 SM ~1.41 GHz approx
-                                       : 1.0);
-            // Pull actual clockRate (kHz) once per print to avoid hardcode drift.
-            cudaDeviceProp dp{};
-            cudaGetDeviceProperties(&dp, group->cuda_device_id);
-            // dp.clockRate (kHz) -> cycles/ns = clockRate / 1e6
-            cycles_per_ns = dp.clockRate / 1e6;
+            // Convert cycles -> ns. clock64 is the per-SM cycle counter at
+            // the device's GPU clock rate. CUDA 13 removed cudaDeviceProp::
+            // clockRate so use cudaDeviceGetAttribute(cudaDevAttrClockRate)
+            // which returns peak clock in kHz; cycles_per_ns = kHz / 1e6.
+            int clk_khz = 0;
+            cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, group->cuda_device_id);
+            double cycles_per_ns = (clk_khz > 0) ? clk_khz / 1e6 : 1.41;
             // Counters were atomicAdd'd by block 0 lane 0 once per token in
             // this single iter call. block 0 sees num_tokens / grid_x tokens
             // (grid-stride loop). Per-token us = cycles / (cycles_per_ns *
