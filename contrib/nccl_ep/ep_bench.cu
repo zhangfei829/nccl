@@ -2541,8 +2541,16 @@ int main(int argc, char* argv[]) {
     }
 
     // ==================== CUPTI Kernel-Only Timing (reduce before print) ====================
-    // Debug: show all captured kernels on rank 0 (uncomment to inspect names)
-    // ktimer.dump(myRank);
+    // Debug: show all captured kernels on rank 0 when NCCL_EP_KTIMER_DUMP=1.
+    // Useful when the kernel-time numbers look wrong (e.g. dispatch_kernel_us
+    // = 0 with non-zero wall time means CUPTI substring matching missed the
+    // kernel name -- dump shows the actual demangled names CUPTI saw).
+    {
+        const char* v = std::getenv("NCCL_EP_KTIMER_DUMP");
+        if (v != nullptr && v[0] != '0' && v[0] != '\0' && myRank == 0) {
+            ktimer.dump(myRank);
+        }
+    }
 
     // Use per-iter total (sum across all kernel launches in the iter, divided
     // by iter count) so multi-kernel back-ends like FULLMESH (combine = push +
