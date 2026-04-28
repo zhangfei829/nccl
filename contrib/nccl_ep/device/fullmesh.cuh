@@ -116,15 +116,25 @@ namespace fullmesh {
 //   don't pass weights.
 enum class DispatchPath { kCoop = 0, kTma = 1 };
 
-// C4 (was C3 with kFm=2): how many tokens each block processes concurrently
-// in the TMA path. Each token slot occupies 32 * top_k threads, so kFm * 32
-// * top_k must stay <= 1024 (block thread cap). For top_k=8 and kFm=4 we hit
-// the 1024-thread cap exactly; kFm=2 leaves the SM scheduler under-saturated
-// per C3 data (tail wait dominated, dispatch BW 499 vs HT 602). Bump to 4 to
-// double the concurrent warps per block and finish closing the gap to HT.
+// C3 setting: how many tokens each block processes concurrently in the TMA
+// path. Each token slot occupies 32 * top_k threads, so kFm * 32 * top_k must
+// stay <= 1024 (block thread cap).
+//
+// kFm=4 (= 1024 threads/block, 28 KB smem/block) was tried in C4 and reproduced
+// a silent kernel issue on GB300 sm_103: CUPTI captured zero dispatch kernel
+// records while combine kernels recorded fine, dispatch wall time of 624 us
+// implied an impossible 2.9 TB/s effective wire rate (NVLink peak is 1.8 TB/s
+// per link). Rolled back to kFm=2 (512 threads, 14 KB smem) which is the C3
+// setting that produces verifiable dispatch BW = 499 GB/s at NUM_SMS=16.
+//
+// To exceed HT (602 GB/s) at equal SM budget we need a real multi-stage ring
+// buffer + mbarrier producer/consumer pipeline (Phase 4 commit C5), not more
+// kFm. Block size scaling alone cannot get past the in-block serial load ->
+// issue -> wait sequence; only stage overlap can.
+//
 // Exposed in the header so the host-side prof print can convert cycles back
 // to ns-per-token correctly (only token-slot 0 accumulates the counter).
-constexpr int kFmDispatchTokensPerBlock = 4;
+constexpr int kFmDispatchTokensPerBlock = 2;
 
 void launch_dispatch_kernel(
     const void*       x,                      // [num_tokens, hidden_bytes] device src
