@@ -246,3 +246,10 @@ ls -l "$AGG_CSV" 2>/dev/null || echo "    (no HT/LL CSV produced)"
 echo "  Combined slot CSV    : $AGG_SLOT_CSV"
 ls -l "$AGG_SLOT_CSV" 2>/dev/null || echo "    (no slot CSV produced)"
 echo "==========================================================="
+
+# HT vs FULLMESH bandwidth comparison summary (only when both modes are
+# present in the aggregated CSV; ep_summary.py is no-op + warning if not).
+SUMMARY_PY="$NCCL_REPO/contrib/nccl_ep/sweep/ep_summary.py"
+if [[ -f "$AGG_CSV" && -x "$(command -v python3)" && -f "$SUMMARY_PY" ]]; then
+    python3 "$SUMMARY_PY" "$AGG_CSV" || true
+fi
