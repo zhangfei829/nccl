@@ -34,7 +34,13 @@ def main(argv: list[str]) -> int:
         return 1
     csv_path = argv[1]
 
-    # Map (mode, ep_size, tokens) -> {dispatch_bw_gbs, combine_bw_gbs}
+    # Map (mode, ep_size, tokens) -> {bw_field: value}
+    METRICS = [
+        ("dispatch_send_bw_gbs", "Dispatch SEND BW (GB/s, kernel time, per-iter)"),
+        ("dispatch_recv_bw_gbs", "Dispatch RECV BW (GB/s, kernel time, per-iter)"),
+        ("combine_send_bw_gbs",  "Combine  SEND BW (GB/s, kernel time, per-iter)"),
+        ("combine_recv_bw_gbs",  "Combine  RECV BW (GB/s, kernel time, per-iter)"),
+    ]
     rows: dict[tuple[str, int, int], dict[str, float | None]] = {}
     ep_sizes_seen: set[int] = set()
     tokens_seen: set[int] = set()
@@ -53,8 +59,7 @@ def main(argv: list[str]) -> int:
             ep_sizes_seen.add(ep)
             tokens_seen.add(tk)
             rows[(mode, ep, tk)] = {
-                "dispatch_bw_gbs": _to_float(row.get("dispatch_bw_gbs", "")),
-                "combine_bw_gbs": _to_float(row.get("combine_bw_gbs", "")),
+                key: _to_float(row.get(key, "")) for (key, _label) in METRICS
             }
 
     ht_modes = [m for m in sorted(modes_seen) if m.startswith("ht_")]
@@ -108,9 +113,13 @@ def main(argv: list[str]) -> int:
     print(f"  FM mode       : {fm_mode}")
     print(f"  EP sizes seen : {ep_sizes}")
     print(f"  tokens seen   : {tokens}")
+    print(f"  Note          : send bytes != recv bytes per rank in general.")
+    print(f"                  HT dedups payloads by target rank; FULLMESH does")
+    print(f"                  not (one slot push per (token, expert) pair).")
+    print(f"                  Both BW columns are per-iter wire bytes / kernel us.")
     print("=" * 80)
-    render("dispatch_bw_gbs", "Dispatch BW (GB/s, kernel time, per-iter)")
-    render("combine_bw_gbs",  "Combine  BW (GB/s, kernel time, per-iter)")
+    for key, label in METRICS:
+        render(key, label)
     print()
     return 0
 
