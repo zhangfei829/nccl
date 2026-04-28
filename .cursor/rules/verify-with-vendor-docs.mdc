@@ -1,0 +1,75 @@
+---
+description: PTX/HW 指令语义、CUDA Driver/Runtime API 行为、NCCL/cuTensor 等专有 API 的可行性判断, 必须以 NVIDIA 官方文档为最终证据, 不能停在 "我们的代码实测能跑"
+alwaysApply: true
+---
+
+# PTX / Driver API / 第三方 SDK 必须查官方文档作最终证据
+
+这条规则是 2026-04-28 当天的直接产物. 原话:
+> 你不相信你, 写入规则, 去查 NV PTX 指令
+
+## 根因
+
+判断 "TMA cp.async.bulk 能不能从 peer fabric memory load" 时, 我给了三条证据:
+1. HT 代码用 cp.async.bulk(space_shared, space_global, peer_fabric_ptr, ...) 写在那里
+2. peer_fabric_ptr 来自 cuMemImportFromShareableHandle(.., CU_MEM_HANDLE_TYPE_FABRIC)
+3. 实测 combine BW 549 GB/s 不为零
+
+这三条**只能证明 "在我们的环境某次运行下能跑"**, 不能证明:
+- PTX ISA 是否**正式支持** peer fabric address 作为 cp.async.bulk 的 .global 操作数
+- 是否在某些硬件 / driver 版本下会出 silent bug
+- 是否所有 hidden bytes 范围 / mbarrier 配置都能 work
+- 不同 SM compute capability 是否兼容
+
+"实测能跑" 是必要条件, 不是充分条件. 这次答 user 我用实测兜底, 用户合理质疑 "你确定吗还是猜测的".
+
+## 硬性要求 (判断 PTX / Driver API / SDK 行为时必做)
+
+1. **PTX 指令语义**: 必须查
+   <https://docs.nvidia.com/cuda/parallel-thread-execution/> (PTX ISA Reference)
+   找到指令 section, 引用具体 syntax + 操作数 constraint. 例如:
+   - `cp.async.bulk` -> 9.7.x section, 看 `.dst_cm`, `.src_cm`, address space restrictions
+   - `mbarrier.*` -> 8.18 section, 看 phase / count semantics
+   - `wgmma.*` -> 9.7.20, 看 fragment layout
+
+2. **CUDA Driver / Runtime API**: 必须查
+   <https://docs.nvidia.com/cuda/cuda-driver-api/> 或
+   <https://docs.nvidia.com/cuda/cuda-runtime-api/>
+   找具体函数 signature + return code + threadsafety + ordering. 例如:
+   - `cuMemImportFromShareableHandle` 看 fabric handle 的 access rights
+   - `cuMemSetAccess` 看 readwrite vs readonly 对 atomics 的影响
+   - `cudaMemcpyAsync` 看 stream-ordered semantics
+
+3. **NCCL / cuTensor / cuDNN / SHARP 等 SDK**: 必须查对应 SDK 的官方 dev guide / API ref. 不依赖代码 grep.
+
+4. **当文档与代码冲突时**: 报告冲突, 让用户判断哪个为准, **不自动选一个**.
+
+5. **当文档没明确说时**: 必须显式说 "PTX ISA 9.x 没有明确说 X 是否支持 Y, 我只看到 the closest related text is ...". 不允许 "应该可以" / "估计 OK".
+
+## 升级原 no-unfounded-speculation 规则
+
+`no-unfounded-speculation.mdc` 已经写了 "禁止猜测". 这条规则补充说: **代码 grep 和实测数据虽然不是猜测, 但也不是 PTX/API 语义的最终证据**. 三个层次:
+
+```
+代码 grep (具体代码这样写)
+    < 实测数据 (这样写跑出来这个数字)
+        < 官方文档 (PTX ISA / Driver API 规定 X 支持 Y, 行为是 Z)
+```
+
+最终证据必须来自最上层的层级.
+
+## 反模式 (这次踩的)
+
+- 用 "HT 实测能跑" 作 cp.async.bulk peer fabric 支持的最终证据
+- 没去查 PTX ISA cp.async.bulk section 的 source/destination address space 限制
+- 用户质疑 "你确定吗" 时仍然没主动去查文档, 而是再去 grep 代码
+
+## 自检清单 (每次涉及 PTX / Driver API / SDK 必过)
+
+- [ ] 我有官方文档的 URL 引用吗?
+- [ ] 文档引用对应到具体 section / 函数 signature / paragraph?
+- [ ] 文档说的 X 在我们的代码场景下成立吗 (硬件 cap, driver 版本, address space)?
+- [ ] 当文档没明确说时, 我有没有写明 "文档没说"?
+- [ ] 当代码与文档冲突时, 我有没有把冲突明确报告给用户?
+
+如果任一答 No, 不准下结论. 必须先查文档或显式承认 "我没查到, 这是基于代码 + 实测的间接推断".
