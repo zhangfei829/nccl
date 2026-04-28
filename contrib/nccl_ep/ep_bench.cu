@@ -118,6 +118,12 @@ public:
 
     // Average GPU execution time (microseconds) across all kernels whose
     // mangled name contains substr.  Returns 0 if no matching kernel found.
+    //
+    // CAUTION: this is per-LAUNCH average. If multiple distinct kernels match
+    // (e.g. fullmesh_combine_kernel_push + fullmesh_combine_kernel_reduce both
+    // match "combine_kernel"), the result divides total ns by total launches
+    // and thus reads HALF the per-iteration time. For per-iter cost use
+    // get_total_per_iter() below instead.
     double get_avg_us(const char* substr) const {
         uint64_t total_ns = 0; int count = 0;
         for (const auto& kv : g_kernel_stats) {
@@ -127,6 +133,29 @@ public:
             }
         }
         return count ? static_cast<double>(total_ns) / count / 1000.0 : 0.0;
+    }
+
+    // Per-iteration total kernel time (microseconds): sums total_ns of every
+    // launch matching substr and divides by num_iters. This is what BW
+    // computations should use because the wire bytes are sent over an entire
+    // iteration's worth of kernel launches, not over one launch.
+    //
+    // Example: HT combine launches `combine_kernel` once per iter, so
+    // get_total_per_iter("combine_kernel", iters) == get_avg_us("combine
+    // _kernel"). FULLMESH combine launches `fullmesh_combine_kernel_push`
+    // and `fullmesh_combine_kernel_reduce` each once per iter, so
+    // get_total_per_iter("combine_kernel", iters) == push_us + reduce_us
+    // (the correct per-iter cost), while get_avg_us is (push + reduce)/2
+    // and underestimates by 2x.
+    double get_total_per_iter(const char* substr, int num_iters) const {
+        if (num_iters <= 0) return 0.0;
+        uint64_t total_ns = 0;
+        for (const auto& kv : g_kernel_stats) {
+            if (kv.first.find(substr) != std::string::npos) {
+                total_ns += kv.second.total_ns;
+            }
+        }
+        return static_cast<double>(total_ns) / num_iters / 1000.0;
     }
 
     // Print all captured kernel names and their stats to stdout (debug helper).
@@ -2499,8 +2528,15 @@ int main(int argc, char* argv[]) {
     // Debug: show all captured kernels on rank 0 (uncomment to inspect names)
     // ktimer.dump(myRank);
 
-    double dispatch_kernel_us = ktimer.get_avg_us("dispatch_kernel");
-    double combine_kernel_us  = ktimer.get_avg_us("combine_kernel");
+    // Use per-iter total (sum across all kernel launches in the iter, divided
+    // by iter count) so multi-kernel back-ends like FULLMESH (combine = push +
+    // reduce, two launches per iter) report the real per-iteration kernel time
+    // instead of the per-launch average. HT has one kernel per iter for both
+    // dispatch and combine so the new API returns the same value as get_avg_us
+    // for HT, only FULLMESH numbers change (correctly: ~2x larger -> BW ~2x
+    // lower for combine).
+    double dispatch_kernel_us = ktimer.get_total_per_iter("dispatch_kernel", actual_iters);
+    double combine_kernel_us  = ktimer.get_total_per_iter("combine_kernel",  actual_iters);
     double global_dk_us = 0.0, global_ck_us = 0.0;
     MPI_Reduce(&dispatch_kernel_us, &global_dk_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&combine_kernel_us,  &global_ck_us, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
