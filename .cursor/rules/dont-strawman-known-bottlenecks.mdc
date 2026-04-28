@@ -1,0 +1,78 @@
+---
+description: 不要先实现一个已知会成为瓶颈的"简化版"再去验证它就是瓶颈; 已知瓶颈应该直接跳过
+alwaysApply: true
+---
+
+# 已知瓶颈不要再写一遍验证
+
+这条规则是 2026-04-28 当天的直接产物。原话:
+> 为什么你要按C1实现，不是让参考HT的TMA实现?
+
+## 根因
+
+我做 Phase 4 commit C1 时, 把 dispatch_kernel 改成 "1 warp/block + lane-0
+串行 issue 8 个 TMA store". 跑完 NUM_SMS=16 单点 sweep 拿到打点数据:
+
+```
+load    cooperative gmem->smem 7168 bytes:  4.4 us
+issue   lane 0 x 8 串行:                   15.9 us  ← 78% 瓶颈
+tail    tma_store_wait<0>:                  0.16 us
+total                                       20.4 us
+```
+
+然后 C2 改成 warp-specialized parallel issue 修这个瓶颈.
+
+**问题: lane-0 串行 issue 8 次 atomic + meta + tma 这件事, 任何懂 GPU 异步硬件
+的人提交前都能预测它是瓶颈**. 不需要写出来跑数据才知道. HT 的
+`hybrid_ep.cuh` 在 2 年前就用 G2S / S2G / N2N 多 warp_group 解决了这个问题
+-- 这是已经有标准解的工业问题.
+
+我在 C1 浪费了一轮 build + sweep + 数据采集 (~20 分钟 round trip), 只为
+"验证一个已知答案的问题". 这是把 `benchmark-breakdown-first.mdc` 规则
+错误地用在不需要验证的场景.
+
+## 硬性流程 (设计阶段必做)
+
+1. **先读相邻已优化的同类实现**: 改 dispatch / combine 这种已有 production
+   实现的模块前, 先把已经在 production 跑的 kernel (hybrid_ep / DeepEP /
+   NCCL collectives) 的关键技术清单列出来:
+     - warp specialization (是/否, 哪些角色, 比例)
+     - mbarrier producer/consumer (是/否)
+     - multi-stage ring buffer (是/否, NUM_OF_STAGES)
+     - chunked (是/否, chunk size)
+     - cluster shared memory (是/否)
+     - L2 cache hint (是/否)
+
+2. **设计 commit 前自问 3 题**:
+   - "这个设计里**已知**会卡的点是什么?" -- 列出来
+   - "已知瓶颈跟相邻 production 实现的对比是不是**朝同方向**?" -- 必须是,
+     否则要么先解决, 要么明确说明"这是探索性, 故意走相反方向看数据"
+   - "如果跑出来发现确实卡在已知点, 我要做什么?" -- 如果答案是"再写一版去掉
+     这个瓶颈", **直接做去掉瓶颈的那一版作为第一版**, 跳过 strawman.
+
+3. **benchmark-breakdown-first 规则只用于**:
+   - **不知道**瓶颈在哪的优化 (探索性 profiling)
+   - 可能有多个候选方向需要数据决策
+   - 改动行为可能跟预期不一致 (e.g. memory ordering, race)
+   - **不用于**: 已经能预判会卡的"简化版"
+
+4. **`reuse-verified-recipes.mdc` 升级**: 不光是 build/run 命令要参考已工作
+   脚本, **算法实现也要参考已工作的同类 kernel** -- 不参考的代价是要重新发现
+   别人已经踩过的坑.
+
+## 反模式 (这次踩的)
+
+- 写 1 warp/block lane-0 串行 issue TMA, 心里知道 issue 会成为瓶颈, 还是先
+  写出来跑数据"看看", 然后下一个 commit 才修. **正确做法是直接写多 warp
+  parallel issue 版本作为 C1**.
+
+- 用 "增量打点验证" 这个借口推迟应用已知优化. 渐进的目的是控制 bug 风险, 不
+  是用来"先实现一个已知糟糕的设计".
+
+## 自检清单 (每次设计前必过)
+
+- [ ] 我是否读完了相邻已优化实现 (HT / DeepEP / NCCL) 的对应模块?
+- [ ] 这次设计的 first commit 是不是已经避开了**所有已知瓶颈**?
+- [ ] 如果某个组件是 "C2/C3 才做" 的状态, 它的 C1 占位实现是不是会被立刻推翻?
+      如果会被立刻推翻, 那 C1 应该跳过它而不是写一个糟糕的版本.
+- [ ] 我有没有把"渐进打点"当成不研究 HT 实现的借口?
