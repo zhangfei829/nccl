@@ -235,9 +235,18 @@ for mode in $MODES; do
         logf="$LOG_DIR/${name}.log"
         printf "\n[run ] %-30s ... " "$name" | tee -a "$LOG_DIR/sweep.log"
         start=$(date +%s)
+        # Forward every NCCL_EP_* env var the caller has set into the mpirun
+        # children. Without this, things like NCCL_EP_FULLMESH_DISPATCH_PATH
+        # and NCCL_EP_FULLMESH_NUM_SMS get silently dropped at the orterun
+        # boundary and the sweep tests the default config no matter what
+        # shell envvars said.
+        mpi_x_args=("-x" "LD_LIBRARY_PATH" "-x" "NCCL_GIN_TYPE")
+        for _v in $(compgen -e | grep '^NCCL_EP_' || true); do
+            mpi_x_args+=("-x" "$_v")
+        done
         mpirun --mca plm slurm -np "$EP_SIZE" --hostfile "$HOSTFILE" \
                --oversubscribe --bind-to none \
-               -x LD_LIBRARY_PATH -x NCCL_GIN_TYPE \
+               "${mpi_x_args[@]}" \
             "$EP_BENCH" --algorithm "$ALGO" \
                         --tokens "$t" --hidden "$HIDDEN" \
                         --top-k "$TOPK" --experts "$EXPERTS" \
