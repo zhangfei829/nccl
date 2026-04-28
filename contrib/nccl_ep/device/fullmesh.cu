@@ -18,47 +18,128 @@ namespace fullmesh {
 
 namespace {
 
-// Per-(token, k) fused slot allocation + payload push.
+// Phase 4 commit C1: TWO dispatch kernels (coop vs tma), env var selects.
+// ============================================================================
 //
-// Grid:  (num_tokens,)
-// Block: (32 * top_k,)   one warp per k in the top-k slice.
+// Both kernels do exactly the same work: per (token, k_in_topk) pair, atomicAdd
+// a slot at the destination's counter row, write 16B meta to the destination's
+// recv_buf entry, then write hidden_bytes payload to entry + meta_bytes. The
+// only difference is HOW the payload gets to the peer:
+//   coop : 32-lane cooperative uint4 store (one warp per k, all 32 lanes stride
+//          hidden_u4 uint4 elements). SM ALU bound. Original Phase 2 path.
+//   tma  : single cp.async.bulk store per k, from a per-block smem staging
+//          buffer. Frees SM ALU during transfer (TMA is async hardware unit).
+//          Cooperative load gmem->smem first, then per-k TMA store smem->peer.
 //
-// Lane-level layout inside a warp for a given (t, k):
-//   lane 0   : atomicAdd on peer dest_counter[myRank] to pull a slot id
-//              then broadcasts slot to the other 31 lanes via __shfl_sync.
-//   lane 0   : stores the 8-byte (src_rank, src_token_id) meta at entry[0..7].
-//   all 32   : cooperatively stream the hidden_u4 uint4 payload into
-//              entry[meta_bytes..meta_bytes+hidden_bytes).
+// Both kernels share the same name substring "dispatch_kernel" so CUPTI
+// substring matching in ep_bench.cu (ktimer.get_total_per_iter("dispatch_
+// kernel", iters)) still works -- only one kernel ever launches per call so
+// no double counting.
 //
-// Warps beyond top_k (if the block is padded up to a multiple of 32 in any
-// future tuning) early-exit. Tokens whose topk_idx==-1 (masked / dropped)
-// also early-exit without consuming a slot, which matches HT's is-routed
-// semantics in hybrid_ep.cuh.
-// Name pattern: "fullmesh_<op>_kernel[_<phase>]" so CUPTI name-substring
-// filters in ep_bench.cu (ktimer.get_avg_us("dispatch_kernel") and "combine
-// _kernel") still match, and grep in sweep logs can pick FULLMESH kernels
-// out by the fullmesh_ prefix.
-// Phase 4 commit C1: TMA-based dispatch kernel.
-// ----------------------------------------------------------------------------
-// Replaces the per-(token, k) cooperative uint4 store with a single TMA bulk
-// store per (token, k) pair. The token's hidden payload is staged once into
-// shared memory (cooperative warp load) and then TMA-store'd to all top_k
-// destination peers. SM stays free during the TMA transfers (TMA is async
-// hardware unit, not SM ALU), which is the per-SM efficiency gap vs HT
-// identified in the SM-effective-BW analysis.
-//
-// Grid:   min(num_tokens, num_sms)  blocks  (caller supplies num_sms)
-// Block:  32 threads  (1 warp; lane 0 handles slot/meta/TMA issue, others
-//                       cooperate on smem load)
-// Smem:   hidden_bytes  (one staging buffer; reused across grid-stride iters)
-//
-// TMA contract:
-//   - smem buffer 16B aligned (extern __shared__ alignment guaranteed)
-//   - hidden_bytes 16B aligned (caller asserts)
-//   - tma_store_1d issues cp.async.bulk + commit_group, so up to top_k
-//     bulk groups in flight before the per-iter wait
-//   - tma_store_wait<0>() at the end of each iter ensures smem is reusable
-__global__ void fullmesh_dispatch_kernel(
+// Profile counters (prof_dispatch, optional, 4 x uint64 device buffer):
+//   Block 0 lane 0 only (other blocks no-op to avoid contention). Each per-
+//   token iter, lane 0 calls clock64() at 4 timestamps and atomicAdd's deltas:
+//     [0] : load_cycles        -- cooperative gmem->smem load (tma path only,
+//                                  coop path leaves this at 0 since coop has
+//                                  no smem staging step)
+//     [1] : prelude_cycles     -- per-k atomicAdd peer counter + 16B meta store
+//     [2] : payload_cycles     -- per-k payload store path (coop: cooperative
+//                                  uint4 store loop; tma: tma_store_1d issue)
+//     [3] : tail_cycles        -- post-token sync (tma: tma_store_wait<0>;
+//                                  coop: 0 since cooperative store finishes
+//                                  before next iter naturally)
+//   Host divides by iters*num_tokens/grid_x to get per-token-per-stage ns.
+
+// Helper: clock64 only if prof_dispatch is non-null, block 0 lane 0.
+__device__ __forceinline__ unsigned long long clock_if_prof(
+    unsigned long long* prof_dispatch, int lane)
+{
+    if (prof_dispatch == nullptr) return 0ULL;
+    if (blockIdx.x != 0) return 0ULL;
+    if (lane != 0) return 0ULL;
+    return clock64();
+}
+
+__device__ __forceinline__ void prof_add(
+    unsigned long long* prof_dispatch, int slot, unsigned long long delta)
+{
+    if (prof_dispatch == nullptr) return;
+    if (blockIdx.x != 0) return;
+    atomicAdd(prof_dispatch + slot, delta);
+}
+
+__global__ void fullmesh_dispatch_kernel_coop(
+    const uint4*     __restrict__ x,                 // [num_tokens, hidden_u4]
+    const int64_t*   __restrict__ topk_idx,          // [num_tokens, top_k]
+    const float*     __restrict__ topk_weights,      // [num_tokens, top_k] or nullptr
+    void* const*     __restrict__ peer_recv_vas,    // [nRanks]
+    void* const*     __restrict__ peer_counter_vas, // [nRanks]
+    int num_tokens,
+    int top_k,
+    int num_local_experts,
+    int myRank,
+    int nRanks,
+    int max_tokens_per_rank,
+    int hidden_u4,
+    int bytes_per_entry,
+    int meta_bytes,
+    unsigned long long* prof_dispatch)
+{
+    int warp_id = static_cast<int>(threadIdx.x >> 5);
+    int lane    = static_cast<int>(threadIdx.x & 31);
+    if (warp_id >= top_k) return;
+    int k = warp_id;
+
+    for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
+        unsigned long long ck0 = clock_if_prof(prof_dispatch, lane);
+
+        int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
+        if (eid < 0) continue;
+
+        int dest = static_cast<int>(eid / num_local_experts);
+        if (dest < 0 || dest >= nRanks) continue;
+
+        int32_t* dest_counter = reinterpret_cast<int32_t*>(peer_counter_vas[dest]);
+        int slot = 0;
+        if (lane == 0) {
+            slot = atomicAdd(&dest_counter[myRank], 1);
+        }
+        slot = __shfl_sync(0xFFFFFFFFu, slot, 0);
+        if (slot >= max_tokens_per_rank) continue;
+
+        uint8_t* dest_recv = reinterpret_cast<uint8_t*>(peer_recv_vas[dest]);
+        size_t   entry_idx = static_cast<size_t>(myRank) * max_tokens_per_rank + slot;
+        uint8_t* entry     = dest_recv + entry_idx * static_cast<size_t>(bytes_per_entry);
+
+        if (lane == 0) {
+            float w = (topk_weights != nullptr)
+                    ? topk_weights[static_cast<size_t>(t) * top_k + k]
+                    : ((top_k > 0) ? (1.0f / static_cast<float>(top_k)) : 0.f);
+            uint4 meta_vec;
+            meta_vec.x = static_cast<uint32_t>(myRank);
+            meta_vec.y = static_cast<uint32_t>(t);
+            meta_vec.z = static_cast<uint32_t>(k);
+            meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
+            *reinterpret_cast<uint4*>(entry) = meta_vec;
+        }
+
+        unsigned long long ck1 = clock_if_prof(prof_dispatch, lane);
+
+        uint4*       dst_payload = reinterpret_cast<uint4*>(entry + meta_bytes);
+        const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
+        for (int i = lane; i < hidden_u4; i += 32) {
+            dst_payload[i] = src_payload[i];
+        }
+
+        unsigned long long ck2 = clock_if_prof(prof_dispatch, lane);
+
+        // For coop, [0] load_cycles = 0 (no smem load), [3] tail_cycles = 0.
+        prof_add(prof_dispatch, 1, ck1 - ck0);   // prelude (atomic + meta)
+        prof_add(prof_dispatch, 2, ck2 - ck1);   // cooperative payload store
+    }
+}
+
+__global__ void fullmesh_dispatch_kernel_tma(
     const uint4*     __restrict__ x,                 // [num_tokens, hidden_u4]
     const int64_t*   __restrict__ topk_idx,          // [num_tokens, top_k]
     const float*     __restrict__ topk_weights,      // [num_tokens, top_k] or nullptr
@@ -73,31 +154,27 @@ __global__ void fullmesh_dispatch_kernel(
     int hidden_u4,
     int hidden_bytes,
     int bytes_per_entry,
-    int meta_bytes)
+    int meta_bytes,
+    unsigned long long* prof_dispatch)
 {
-    // extern __shared__ uint4 array naturally 16B aligned (uint4 is 16B).
-    // Stores hidden_u4 elements; size = hidden_bytes set at launch time via
-    // the dynamic shared memory parameter.
     extern __shared__ uint4 smem_payload[];
 
     int lane = static_cast<int>(threadIdx.x & 31);
 
     for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
-        // (1) Cooperative warp load token from local gmem to smem. 32 lanes
-        //     stride hidden_u4 uint4 elements. This is local HBM load (not
-        //     the bottleneck); future C-step can also TMA-load here once we
-        //     introduce mbarrier-based pipelining.
+        unsigned long long ck0 = clock_if_prof(prof_dispatch, lane);
+
+        // (1) Cooperative warp load token from local gmem to smem.
         const uint4* src_payload = x + static_cast<size_t>(t) * hidden_u4;
         for (int i = lane; i < hidden_u4; i += 32) {
             smem_payload[i] = src_payload[i];
         }
         __syncwarp();
-        // Make smem stores visible to the TMA proxy before issuing bulk store.
         tma_store_fence();
 
+        unsigned long long ck1 = clock_if_prof(prof_dispatch, lane);
+
         // (2) Per-k iteration: lane 0 computes slot + meta + issues TMA store.
-        //     Other lanes idle here; they earned their keep on the cooperative
-        //     load above and will earn it again on the next iter.
         if (lane == 0) {
             for (int k = 0; k < top_k; k++) {
                 int64_t eid = topk_idx[static_cast<size_t>(t) * top_k + k];
@@ -114,8 +191,6 @@ __global__ void fullmesh_dispatch_kernel(
                 size_t   entry_idx = static_cast<size_t>(myRank) * max_tokens_per_rank + slot;
                 uint8_t* entry     = dest_recv + entry_idx * static_cast<size_t>(bytes_per_entry);
 
-                // 16B meta as a single uint4 store. Same layout as cooperative
-                // version so combine kernels read it identically.
                 float w = (topk_weights != nullptr)
                         ? topk_weights[static_cast<size_t>(t) * top_k + k]
                         : ((top_k > 0) ? (1.0f / static_cast<float>(top_k)) : 0.f);
@@ -126,17 +201,25 @@ __global__ void fullmesh_dispatch_kernel(
                 meta_vec.w = static_cast<uint32_t>(__float_as_int(w));
                 *reinterpret_cast<uint4*>(entry) = meta_vec;
 
-                // TMA bulk store: smem_payload (hidden_bytes) -> peer global
-                // (entry + meta_bytes). cp.async.bulk + auto commit_group.
                 tma_store_1d(smem_payload, entry + meta_bytes, hidden_bytes);
             }
+        }
+        __syncwarp();
 
-            // (3) Wait all TMA bulk stores for this token complete before we
-            //     overwrite smem_payload next iter. wait<0> = wait until 0
-            //     groups remain outstanding.
+        unsigned long long ck2 = clock_if_prof(prof_dispatch, lane);
+
+        // (3) Wait all TMA bulk stores complete before reusing smem.
+        if (lane == 0) {
             tma_store_wait<0>();
         }
         __syncwarp();
+
+        unsigned long long ck3 = clock_if_prof(prof_dispatch, lane);
+
+        prof_add(prof_dispatch, 0, ck1 - ck0);   // load + fence
+        prof_add(prof_dispatch, 1, 0ULL);        // (no separate prelude in tma path; fold into [2])
+        prof_add(prof_dispatch, 2, ck2 - ck1);   // per-k atomic + meta + TMA issue (lane 0 serial)
+        prof_add(prof_dispatch, 3, ck3 - ck2);   // tma_store_wait<0>
     }
 }
 
@@ -158,6 +241,8 @@ void launch_dispatch_kernel(
     int  bytes_per_entry,
     int  meta_bytes,
     int  num_sms,
+    DispatchPath path,
+    unsigned long long* prof_dispatch,
     cudaStream_t stream)
 {
     if (num_tokens <= 0) return;
@@ -169,10 +254,6 @@ void launch_dispatch_kernel(
                 hidden_bytes);
         return;
     }
-    // Same 16B alignment requirement applies to meta_bytes: dst_payload is
-    // entry + meta_bytes, so if meta_bytes % 16 != 0 the uint4 stores trap.
-    // init_fullmesh_intranode_fabric pads meta to 16 specifically for this;
-    // this assert catches any future caller that forgets.
     if ((meta_bytes & 15) != 0) {
         fprintf(stderr,
                 "[FULLMESH] launch_dispatch_kernel: meta_bytes=%d is not 16B "
@@ -181,41 +262,48 @@ void launch_dispatch_kernel(
                 meta_bytes);
         return;
     }
-    int hidden_u4 = hidden_bytes >> 4;
-
-    // C1 design: 1 warp per block. lane 0 issues TMA stores serially per k;
-    // other lanes share the cooperative smem load. top_k > 32 would only
-    // matter if we ever go back to per-k warp specialization; for the TMA
-    // path it's an inert bound on the smem-load loop.
-    if (top_k > 64) {
+    if (top_k > 32) {
         fprintf(stderr,
-                "[FULLMESH] launch_dispatch_kernel: top_k=%d > 64 unsupported.\n",
+                "[FULLMESH] launch_dispatch_kernel: top_k=%d > 32 unsupported "
+                "(coop path uses one warp per k; tma path uses lane-0 serial).\n",
                 top_k);
         return;
     }
-
-    int threads_per_block = 32;     // single warp: cooperative load + lane-0 TMA issue
+    int hidden_u4 = hidden_bytes >> 4;
 
     // Grid is min(num_tokens, num_sms) to cap SM use; kernel runs a grid-
     // stride loop over tokens. num_sms == 0 means "no cap" -> match num_tokens.
     int grid_x = (num_sms <= 0 || num_sms >= num_tokens) ? num_tokens : num_sms;
+    if (grid_x <= 0) return;
 
-    // Dynamic shared memory: 1 staging buffer of hidden_bytes per block.
-    // hidden_bytes is 16B-aligned by precondition, smem extern is 16B-aligned
-    // via __align__(16) on the buffer declaration in the kernel.
-    int smem_bytes = hidden_bytes;
-
-    dim3 grid(grid_x);
-    dim3 block(threads_per_block);
-    fullmesh_dispatch_kernel<<<grid, block, smem_bytes, stream>>>(
-        reinterpret_cast<const uint4*>(x_void),
-        topk_idx,
-        topk_weights,
-        peer_recv_vas_dev,
-        peer_counter_vas_dev,
-        num_tokens, top_k, num_local_experts,
-        myRank, nRanks, max_tokens_per_rank,
-        hidden_u4, hidden_bytes, bytes_per_entry, meta_bytes);
+    if (path == DispatchPath::kCoop) {
+        // Coop: 32 * top_k threads, one warp per k, no smem.
+        int threads_per_block = 32 * (top_k > 0 ? top_k : 1);
+        dim3 grid(grid_x);
+        dim3 block(threads_per_block);
+        fullmesh_dispatch_kernel_coop<<<grid, block, 0, stream>>>(
+            reinterpret_cast<const uint4*>(x_void),
+            topk_idx, topk_weights,
+            peer_recv_vas_dev, peer_counter_vas_dev,
+            num_tokens, top_k, num_local_experts,
+            myRank, nRanks, max_tokens_per_rank,
+            hidden_u4, bytes_per_entry, meta_bytes,
+            prof_dispatch);
+    } else {
+        // TMA: 32 threads (1 warp), smem = hidden_bytes for staging.
+        int threads_per_block = 32;
+        int smem_bytes = hidden_bytes;
+        dim3 grid(grid_x);
+        dim3 block(threads_per_block);
+        fullmesh_dispatch_kernel_tma<<<grid, block, smem_bytes, stream>>>(
+            reinterpret_cast<const uint4*>(x_void),
+            topk_idx, topk_weights,
+            peer_recv_vas_dev, peer_counter_vas_dev,
+            num_tokens, top_k, num_local_experts,
+            myRank, nRanks, max_tokens_per_rank,
+            hidden_u4, hidden_bytes, bytes_per_entry, meta_bytes,
+            prof_dispatch);
+    }
 }
 
 void launch_compact_to_output(

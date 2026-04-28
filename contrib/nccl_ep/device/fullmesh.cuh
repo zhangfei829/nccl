@@ -64,7 +64,29 @@
 namespace nccl_ep {
 namespace fullmesh {
 
-// Launch the fused atomicAdd-slot + cooperative payload-push kernel.
+// Launch the fused atomicAdd-slot + payload-push kernel.
+//
+// dispatch_path (commit C1):
+//   "coop" : per-(token, k) cooperative 32-lane uint4 store. Legacy path
+//            kept for A/B vs the TMA path so we can quantify TMA's actual
+//            contribution. Block size = 32 * top_k threads (one warp per k).
+//   "tma"  : per-(token, k) cp.async.bulk store from a per-block smem
+//            staging buffer. Block size = 32 threads (one warp; lane 0
+//            issues TMA serially across k). Aims to free SM ALU during
+//            data transfer so per-SM throughput rises.
+//   Selected by host via env var NCCL_EP_FULLMESH_DISPATCH_PATH={coop, tma},
+//   default "tma".
+//
+// prof_dispatch (commit C1 instrumentation):
+//   Optional device pointer to 4 x uint64 (cycle counters). When non-null,
+//   block 0 lane 0 atomicAdd's the per-token clock64 deltas into:
+//     [0] cooperative load us cycles
+//     [1] tma_store_fence + per-k atomicAdd + meta store cycles
+//     [2] sum of TMA store-issue cycles (coop: cooperative store cycles)
+//     [3] tma_store_wait<0>() cycles (coop: 0)
+//   Other blocks no-op; cuts contention while still giving a representative
+//   timeline. host divides by (iters * num_tokens / num_sms) to get per-token
+//   ns and prints. Pass nullptr to disable.
 //
 // SM budget (num_sms): caps grid.x at min(num_tokens, num_sms). When grid <
 //   num_tokens the kernel runs a grid-stride loop so each block handles
@@ -92,6 +114,8 @@ namespace fullmesh {
 //   on every combine call. nullptr falls back to a uniform 1/top_k written
 //   into meta.w; this matches HT's forward-combine semantics when callers
 //   don't pass weights.
+enum class DispatchPath { kCoop = 0, kTma = 1 };
+
 void launch_dispatch_kernel(
     const void*       x,                      // [num_tokens, hidden_bytes] device src
     const int64_t*    topk_idx,               // [num_tokens, top_k] int64
@@ -108,6 +132,8 @@ void launch_dispatch_kernel(
     int               bytes_per_entry,
     int               meta_bytes,
     int               num_sms,                // SM cap; 0 = no cap (= num_tokens)
+    DispatchPath      path,                   // kCoop or kTma
+    unsigned long long* prof_dispatch,        // device [4] cycle counters or nullptr
     cudaStream_t      stream);
 
 // Project this rank's recv_buf payload column into a dense user output tensor

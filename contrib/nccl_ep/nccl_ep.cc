@@ -251,6 +251,18 @@ struct ncclEpGroup {
     // NCCL_EP_FULLMESH_NUM_SMS for SM-scaling sweeps.
     unsigned int fullmesh_num_sms;
 
+    // Phase 4 commit C1: dispatch kernel path selection + per-stage profile.
+    // Path selected once at group init via NCCL_EP_FULLMESH_DISPATCH_PATH:
+    //   "tma"  (default) -> kTma : cp.async.bulk based payload store
+    //   "coop"            -> kCoop: cooperative 32-lane uint4 store (legacy)
+    // The two paths share the "dispatch_kernel" CUPTI substring so ktimer
+    // matches either; only one launches per call so no double counting.
+    nccl_ep::fullmesh::DispatchPath fullmesh_dispatch_path;
+    // Optional 4xuint64 device buffer for in-kernel clock64 profiling. NULL
+    // unless NCCL_EP_FULLMESH_PROFILE=1 at group init. cudaMemsetAsync(0) at
+    // the start of every ncclEpDispatch call, dump on rank 0 after kernel.
+    unsigned long long* fullmesh_prof_dispatch_dev;
+
     // Custom allocator function pointers
     ncclEpAllocFn_t alloc_fn;
     ncclEpFreeFn_t free_fn;
@@ -434,6 +446,8 @@ struct ncclEpGroup {
         device_sm_count(0),
         num_sms_ht(0),
         fullmesh_num_sms(0),
+        fullmesh_dispatch_path(nccl_ep::fullmesh::DispatchPath::kTma),
+        fullmesh_prof_dispatch_dev(nullptr),
         alloc_fn(nullptr),
         free_fn(nullptr),
         gpus_per_node(0),
@@ -1884,6 +1898,35 @@ ncclResult_t ncclEpCreateGroup(
         }
     }
 
+    // Phase 4 commit C1: dispatch path env + clock64 prof buffer.
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_FULLMESH) {
+        const char* path_env = std::getenv("NCCL_EP_FULLMESH_DISPATCH_PATH");
+        if (path_env != nullptr && (path_env[0] == 'c' || path_env[0] == 'C')) {
+            ep_group->fullmesh_dispatch_path = nccl_ep::fullmesh::DispatchPath::kCoop;
+        } else {
+            ep_group->fullmesh_dispatch_path = nccl_ep::fullmesh::DispatchPath::kTma;
+        }
+        const char* prof_env = std::getenv("NCCL_EP_FULLMESH_PROFILE");
+        bool prof_on = prof_env != nullptr && prof_env[0] != '0' && prof_env[0] != '\0';
+        if (prof_on) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->fullmesh_prof_dispatch_dev),
+                                  4 * sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(ep_group->fullmesh_prof_dispatch_dev,
+                                  0, 4 * sizeof(unsigned long long)));
+        }
+        if (ep_group->rank == 0) {
+            const char* path_name =
+                (ep_group->fullmesh_dispatch_path == nccl_ep::fullmesh::DispatchPath::kCoop)
+                    ? "coop" : "tma";
+            fprintf(stderr,
+                    "[NV72-ADAPT] FULLMESH dispatch_path=%s (env NCCL_EP_FULLMESH_DISPATCH_PATH=%s) "
+                    "prof_dispatch=%s\n",
+                    path_name, path_env ? path_env : "<unset, default tma>",
+                    prof_on ? "on" : "off");
+            fflush(stderr);
+        }
+    }
+
     CUDA_CHECK(ep_group->alloc_fn(&ep_group->ep_workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(ep_group->ep_workspace, 0, NUM_WORKSPACE_BYTES, stream));
 
@@ -2005,6 +2048,11 @@ ncclResult_t ncclEpGroupDestroy(
     if (ep_group->config.algorithm == NCCL_EP_ALGO_FULLMESH &&
         ep_group->fullmesh_buffers.initialized) {
         destroy_fullmesh_intranode_fabric(ep_group);
+    }
+    // Phase 4 commit C1: free prof_dispatch buffer if allocated.
+    if (ep_group->fullmesh_prof_dispatch_dev != nullptr) {
+        cudaFree(ep_group->fullmesh_prof_dispatch_dev);
+        ep_group->fullmesh_prof_dispatch_dev = nullptr;
     }
     // Clean up workspace memory
     if (ep_group->ep_workspace != nullptr) {
@@ -2906,6 +2954,14 @@ ncclResult_t ncclEpDispatch(
         NCCL_CHECK_RESULT(ncclBarrier(group->comm, stream, group->ep_workspace));
         if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d2, stream));
 
+        // Phase 4 C1: zero the prof buffer before this iteration so the
+        // counters reflect just this iter's per-token cycles. Async on the
+        // group stream so the kernel sees fresh zeros.
+        if (group->fullmesh_prof_dispatch_dev != nullptr) {
+            CUDA_CHECK(cudaMemsetAsync(group->fullmesh_prof_dispatch_dev,
+                                       0, 4 * sizeof(unsigned long long), stream));
+        }
+
         // (c) Fused atomicAdd-slot + payload push kernel.
         nccl_ep::fullmesh::launch_dispatch_kernel(
             x->data,
@@ -2923,7 +2979,56 @@ ncclResult_t ncclEpDispatch(
             static_cast<int>(fb.bytes_per_entry),
             static_cast<int>(fb.meta_bytes),
             static_cast<int>(group->fullmesh_num_sms),
+            group->fullmesh_dispatch_path,
+            group->fullmesh_prof_dispatch_dev,
             stream);
+
+        // Phase 4 C1: dump per-stage cycles. Done synchronously so we serialize
+        // host print with kernel completion -- only meant for one-off probes,
+        // not for hot path. Other ranks skip the print.
+        if (group->fullmesh_prof_dispatch_dev != nullptr && myRank == 0) {
+            unsigned long long prof_host[4] = {0, 0, 0, 0};
+            CUDA_CHECK(cudaMemcpyAsync(prof_host, group->fullmesh_prof_dispatch_dev,
+                                       sizeof(prof_host), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Convert cycles -> ns. clock64 is per-SM cycle counter at the
+            // device's GPU clock rate. cudaDeviceProp.clockRate is in kHz.
+            double cycles_per_ns = static_cast<double>(group->device_sm_count > 0
+                                       ? 1.41        // GB300 SM ~1.41 GHz approx
+                                       : 1.0);
+            // Pull actual clockRate (kHz) once per print to avoid hardcode drift.
+            cudaDeviceProp dp{};
+            cudaGetDeviceProperties(&dp, group->cuda_device_id);
+            // dp.clockRate (kHz) -> cycles/ns = clockRate / 1e6
+            cycles_per_ns = dp.clockRate / 1e6;
+            // Counters were atomicAdd'd by block 0 lane 0 once per token in
+            // this single iter call. block 0 sees num_tokens / grid_x tokens
+            // (grid-stride loop). Per-token us = cycles / (cycles_per_ns *
+            // tokens_in_block_0 * 1000).
+            int grid_x = (group->fullmesh_num_sms == 0 ||
+                          static_cast<int>(group->fullmesh_num_sms) >= handle->num_tokens)
+                         ? handle->num_tokens
+                         : static_cast<int>(group->fullmesh_num_sms);
+            int tokens_per_block0 = (handle->num_tokens + grid_x - 1) / grid_x;
+            const char* path_name =
+                (group->fullmesh_dispatch_path == nccl_ep::fullmesh::DispatchPath::kCoop)
+                    ? "coop" : "tma";
+            fprintf(stderr,
+                    "[FM-DISP-PROF] path=%s EP=%d t=%d num_sms=%u tokens_in_block0=%d "
+                    "cycles[load=%llu prelude=%llu payload=%llu tail=%llu] "
+                    "ns_per_tok[load=%.0f prelude=%.0f payload=%.0f tail=%.0f] "
+                    "us_per_tok=%.2f\n",
+                    path_name, nRanks, handle->num_tokens,
+                    group->fullmesh_num_sms, tokens_per_block0,
+                    prof_host[0], prof_host[1], prof_host[2], prof_host[3],
+                    static_cast<double>(prof_host[0]) / cycles_per_ns / tokens_per_block0,
+                    static_cast<double>(prof_host[1]) / cycles_per_ns / tokens_per_block0,
+                    static_cast<double>(prof_host[2]) / cycles_per_ns / tokens_per_block0,
+                    static_cast<double>(prof_host[3]) / cycles_per_ns / tokens_per_block0,
+                    static_cast<double>(prof_host[0] + prof_host[1] + prof_host[2] + prof_host[3])
+                        / cycles_per_ns / 1000.0 / tokens_per_block0);
+            fflush(stderr);
+        }
         if (fm_prof) CUDA_CHECK(cudaEventRecord(ev_d3, stream));
 
         // (d) Cross-rank barrier so every peer has finished writing into my recv_buf.
