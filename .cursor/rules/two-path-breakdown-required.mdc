@@ -1,0 +1,57 @@
+---
+description: 切换/回退算法路径前必须对两条路径都做 per-stage 打点; 单一总指标(kernel_us / BW)不足以做决策
+alwaysApply: true
+---
+
+# 路径切换 / 回退之前: 两条路径都要逐段打点
+
+这条规则是 2026-04-28 当天的直接产物。原话:
+> 不要急于回退代码,找到根本原因,每一段的时间都需要打点计时确认
+
+## 根因
+
+我在拿到一份 sweep summary 后, 看到 fused 路径 `combine_kernel_us = 2284us` 比 push_reduce `1795us` 慢, 就立刻把 default 切回 push_reduce 并写了一段"为什么 fused 是回归"的 commit message.
+
+问题是这个 commit message 里写的"原因"是**推断**, 不是**实证**:
+- 推断: "bf162 atomic_add 在 fabric memory 上多路争用 HBM 控制器序列化"
+- 实证缺失:
+  1. 没有 fused 路径自身 5 阶段细分 (memset_col0 / barrier1 / fused_kernel / barrier2 / memcpy2d)
+  2. 没有 push_reduce 路径 5 阶段细分 (memset / barrier1 / push / barrier2 / reduce)
+  3. 没有对比两个路径在每一段上的差异
+  4. 因此无法证明慢的真正是 fused_kernel 而不是 barrier / memcpy / memset
+
+`benchmark-breakdown-first.mdc` 已经规定了 "any optimization must be preceded by per-stage timing", 但**回退也是优化方向的一种** -- 先做总数差就 commit 回退是同样的违规.
+
+## 硬性流程 (路径切换前**必做**)
+
+任何"切换 default" / "回退 commit" 涉及多个候选实现的决策, 必须满足:
+
+1. **两个候选都跑 PROFILE**: 如 `NCCL_EP_FULLMESH_PROFILE=1` 给两条路径各跑一次, 拿到 5 阶段绝对时间.
+
+2. **逐段差异表**: 先列一个表, 行 = 阶段, 列 = 路径, cell = us. 然后**指出哪一行**是 winner 和 loser 的真正分歧点.
+
+3. **若总数差 X us, 必须能在某一段或几段累加凑出 X**: 不能允许"总数慢 500us 但每段只差 50us" 的内部不一致 -- 那说明打点没覆盖全部时间, 或某条路径有未打点的隐藏 stage.
+
+4. **决策必须 cite 具体段**: commit message / 用户回复**必须**写"决策依据是 stage X 在路径 A 比路径 B 快/慢 Yus, 因为..."而不能只写总数对比.
+
+5. **完成度门槛**: 没拿到两路径 PROFILE 数据之前, 不允许:
+   - 改 default
+   - 删任何路径的代码
+   - 写"路径 X 是回归"这样的 commit message
+   - 回答用户"建议回滚"这类话
+
+## 反模式 (这次踩的)
+
+- ❌ 只看 `combine_kernel_us` 总数差就立刻 commit 改 default.
+- ❌ commit message 里写"bf162 atomic 序列化"这种**没用 PROFILE 验证**的根因.
+- ❌ 同一个 commit 既改 default 又"解释为什么", 把推断当实证.
+
+## 自检清单 (每次决定路径切换 / 回退必过)
+
+- [ ] 我有路径 A 的 per-stage breakdown 数据吗?
+- [ ] 我有路径 B 的 per-stage breakdown 数据吗?
+- [ ] 我能从 stage 差异凑出总数差异吗 (sum 一致性 check)?
+- [ ] 我的决策是否 cite 了具体 stage, 而不是只看总数?
+- [ ] commit message 里的"原因"用的是 PROFILE 数据吗, 还是推断?
+
+如果任一答 No, 不准切换 default / 删代码 / commit "为什么 X 是回归".
