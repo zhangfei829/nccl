@@ -116,12 +116,15 @@ namespace fullmesh {
 //   don't pass weights.
 enum class DispatchPath { kCoop = 0, kTma = 1 };
 
-// C3: how many tokens each block processes concurrently in the TMA path.
-// Each token slot occupies 32 * top_k threads, so kNum * 32 * top_k must stay
-// <= 1024 (block thread cap). For top_k=8 and kNum=2 we use 512 threads.
+// C4 (was C3 with kFm=2): how many tokens each block processes concurrently
+// in the TMA path. Each token slot occupies 32 * top_k threads, so kFm * 32
+// * top_k must stay <= 1024 (block thread cap). For top_k=8 and kFm=4 we hit
+// the 1024-thread cap exactly; kFm=2 leaves the SM scheduler under-saturated
+// per C3 data (tail wait dominated, dispatch BW 499 vs HT 602). Bump to 4 to
+// double the concurrent warps per block and finish closing the gap to HT.
 // Exposed in the header so the host-side prof print can convert cycles back
 // to ns-per-token correctly (only token-slot 0 accumulates the counter).
-constexpr int kFmDispatchTokensPerBlock = 2;
+constexpr int kFmDispatchTokensPerBlock = 4;
 
 void launch_dispatch_kernel(
     const void*       x,                      // [num_tokens, hidden_bytes] device src
