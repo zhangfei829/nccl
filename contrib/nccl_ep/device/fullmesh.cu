@@ -149,16 +149,26 @@ __global__ void fullmesh_dispatch_kernel_coop(
 //   tail    tma_store_wait<0>    0.86 us/tok
 //
 // D1 splits the block into:
-//   1 producer warp (warp 0):  TMA load gmem -> smem ring buffer
+//   1 producer warp (warp 0):  cooperative gmem->smem load (32 lanes)
+//                              then mbarrier_arrive to signal payload ready
 //   top_k consumer warps:      per-k atomicAdd + meta + TMA store
 // Two-stage ring: while consumers process token[t] from smem[t&1], producer
-// already TMA-loads token[t+1] into smem[(t+1)&1]. Consumer wall and producer
-// wall run in parallel, total per-token wall = max(load, payload+tail).
+// already loads token[t+1] into smem[(t+1)&1]. Producer warp and consumer
+// warps share the SM scheduler so latency is hidden across them.
 //
-// Synchronization via shared-memory mbarriers (HT-style):
-//   produced_mbar[2] : signaled by producer when stage payload is in smem
-//                      (TMA's complete_tx variant means hardware signals on
-//                       cp.async.bulk completion -- no SM cycle spent waiting).
+// NOTE on TMA load: we initially tried tma_load_1d (cp.async.bulk.shared::
+// cluster.global.mbarrier::complete_tx::bytes) but that PTX form requires a
+// cluster launch context. HT sets clusterDim=2 via cudaLaunchKernelEx; FM
+// does not, and the TMA load silently failed to fire the mbarrier complete
+// _tx, causing consumers to hang forever waiting on produced_mbar. Fix is
+// either (a) launch FM with cluster=1 and keep TMA load, or (b) use cooper-
+// ative load for the producer warp. We picked (b) here -- simpler, no
+// cluster plumbing, and the cooperative-load cost is tiny (32 lanes covering
+// 7168 bytes ~ 14 uint4 each ~30 cycles), which is hidden by consumer work.
+//
+// Synchronization via shared-memory mbarriers:
+//   produced_mbar[2] : producer arrives once after cooperative load + fence,
+//                      consumers wait. arrive_count = 1.
 //   consumed_mbar[2] : signaled by consumers when stage smem is no longer
 //                      needed (each of top_k consumer warps' lane 0 arrives,
 //                      arrive_count = top_k).
@@ -234,23 +244,33 @@ __global__ void fullmesh_dispatch_kernel_tma(
     for (int t = blockIdx.x; t < num_tokens; t += gridDim.x) {
         const int stage = t & (kStages - 1);
 
-        // ===== Producer side (warp 0 lane 0 only) =====
-        if (is_producer && lane == 0) {
-            p_start = clock_if_prof(prof_dispatch, 0);
-
-            // Wait for previous use of this stage to drain (skip first kStages tokens).
-            if (t >= kStages) {
-                mbarrier_wait<true>(&consumed_mbar[stage], producer_phase, stage);
+        // ===== Producer side (warp 0, all 32 lanes cooperate on load) =====
+        if (is_producer) {
+            // Lane 0 records the iter start clock and waits the previous round
+            // of this stage to drain.
+            if (lane == 0) {
+                p_start = clock_if_prof(prof_dispatch, 0);
+                if (t >= kStages) {
+                    mbarrier_wait<true>(&consumed_mbar[stage], producer_phase, stage);
+                }
             }
+            __syncwarp();   // make sure all lanes see consumed_mbar release
 
-            // Issue async TMA load gmem -> smem[stage]; mbarrier.expect_tx tells
-            // the barrier how many bytes the TMA will deliver, and the hardware
-            // arrives on the barrier when cp.async.bulk completes.
-            mbarrier_arrive_and_expect_tx(&produced_mbar[stage], hidden_bytes);
+            // Cooperative gmem -> smem load: 32 lanes stride through hidden_u4.
             const uint4* src = x + static_cast<size_t>(t) * hidden_u4;
-            tma_load_1d(smem_payload[stage], src, &produced_mbar[stage], hidden_bytes);
+            for (int i = lane; i < hidden_u4; i += 32) {
+                smem_payload[stage][i] = src[i];
+            }
+            __syncwarp();   // all 32 lanes done loading
 
-            p_end = clock_if_prof(prof_dispatch, 0);
+            // Lane 0 fences smem visible to consumers' TMA stores, then arrives
+            // on produced_mbar. arrive_count was init to 1 so this single
+            // arrive flips parity -> consumers' wait returns.
+            if (lane == 0) {
+                tma_store_fence();   // fence.proxy.async.shared::cta
+                mbarrier_arrive(&produced_mbar[stage]);
+                p_end = clock_if_prof(prof_dispatch, 0);
+            }
         }
 
         // ===== Consumer side (warps 1..top_k, each lane 0 issues its k) =====
