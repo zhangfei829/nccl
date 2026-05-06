@@ -35,13 +35,21 @@
 #     CSV_FILE         default $LOG_DIR/results.csv
 #     EXTRA_BENCH_ARGS extra args appended to every ep_bench invocation
 #                      (e.g. EXTRA_BENCH_ARGS="--validate" for Phase 0 checks)
+#     HOSTFILE_OVERRIDE  Optional path to a pre-built mpirun hostfile, e.g.
+#                        '/tmp/hosts.ep16'. Use when you don't have Slurm and
+#                        instead manually ssh'd into the head node of a known
+#                        set of nodes. File format: one line per node, e.g.
+#                          pod4-gb300-2-tray01-f3 slots=4
+#                          pod4-gb300-2-tray02-f3 slots=4
+#                        When set, takes precedence over SLURM_JOB_NODELIST.
 #
 # Output:
 #     <LOG_DIR>/ep{N}_{mode}_t{tokens}.log   raw ep_bench output
 #     <LOG_DIR>/results.csv                  one row per config, Excel-ready
 #
 # Assumptions:
-#     * Current shell has $SLURM_JOB_ID / $SLURM_JOB_NODELIST set
+#     * Either SLURM_JOB_NODELIST is set (in salloc shell) OR HOSTFILE_OVERRIDE
+#       points to a pre-built hostfile (manual node reservation, no Slurm)
 #     * SLURM_TRES_PER_TASK is already unset (see README pitfalls)
 #     * nccl_ep libraries + ep_bench binary available under $NCCL_HOME
 # =============================================================================
@@ -86,14 +94,30 @@ export NCCL_GIN_TYPE="${NCCL_GIN_TYPE:-3}"
 # launches orted internally; harmless if already unset.
 unset SLURM_TRES_PER_TASK || true
 
-# Generate hostfile from current allocation
+# Generate hostfile. Two paths:
+#   1. SLURM mode: SLURM_JOB_NODELIST is set (we are in an salloc shell)
+#      -> derive hostfile via scontrol show hostnames
+#   2. Manual mode: HOSTFILE_OVERRIDE points to a pre-built hostfile
+#      -> just copy it. Use this when you ssh directly into a node and have
+#      no Slurm allocation, e.g. testing a manually-reserved set of nodes.
 HOSTFILE="$LOG_DIR/hosts.ep${EP_SIZE}"
-if [[ -z "${SLURM_JOB_NODELIST:-}" ]]; then
-    echo "[ep_sweep] ERROR: SLURM_JOB_NODELIST is not set; are you inside an salloc?" >&2
+if [[ -n "${HOSTFILE_OVERRIDE:-}" ]]; then
+    if [[ ! -f "$HOSTFILE_OVERRIDE" ]]; then
+        echo "[ep_sweep] ERROR: HOSTFILE_OVERRIDE=$HOSTFILE_OVERRIDE does not exist" >&2
+        exit 2
+    fi
+    cp "$HOSTFILE_OVERRIDE" "$HOSTFILE"
+    echo "[ep_sweep] using HOSTFILE_OVERRIDE=$HOSTFILE_OVERRIDE (no Slurm)" >&2
+elif [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
+    scontrol show hostnames "$SLURM_JOB_NODELIST" \
+        | awk -v s=4 '{print $1" slots="s}' > "$HOSTFILE"
+else
+    echo "[ep_sweep] ERROR: neither SLURM_JOB_NODELIST nor HOSTFILE_OVERRIDE set." >&2
+    echo "[ep_sweep]   Either run inside an salloc shell, OR pre-build a hostfile" >&2
+    echo "[ep_sweep]   ('host1 slots=4\\nhost2 slots=4\\n...') and pass" >&2
+    echo "[ep_sweep]   HOSTFILE_OVERRIDE=/path/to/hostfile" >&2
     exit 2
 fi
-scontrol show hostnames "$SLURM_JOB_NODELIST" \
-    | awk -v s=4 '{print $1" slots="s}' > "$HOSTFILE"
 
 echo "==========================================================="
 echo "EP Sweep"
