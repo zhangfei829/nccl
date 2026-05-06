@@ -102,7 +102,12 @@ echo
 # Sanity: every tray must be ssh-reachable without password from this head
 # node, otherwise mpirun --mca plm slurm or rsh/ssh launchers will hang.
 echo "[run_ep16_4bay] Verifying ssh reachability of each tray..."
+LOCAL_HOST="$(hostname)"
 for tray in $TRAYS; do
+    if [[ "$tray" == "$LOCAL_HOST" || "$tray" == "$(hostname -f 2>/dev/null || hostname)" ]]; then
+        echo "[run_ep16_4bay] $tray is local host, skip ssh self-check"
+        continue
+    fi
     if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$tray" "echo ok-from-\$(hostname)" 2>/dev/null | grep -q ok-from-; then
         echo "[run_ep16_4bay] ERROR: cannot ssh $tray (no passwordless ssh?). Aborting." >&2
         exit 2
