@@ -6,53 +6,64 @@
 # Runs from the head node (e.g. pod4-gb300-2-tray01-f3) after you ssh into
 # it from the jumphost. It will:
 #
-#   1. cd to NCCL_REPO (default $HOME/fizhang/nccl), git fetch + hard reset
-#      to origin/master so we run exactly what was pushed.
-#   2. Write /tmp/hosts.ep16 with the 4 default trays
-#      (override TRAYS env var to use a different set).
-#   3. Autobuild: if any contrib/nccl_ep/*.{cu,cuh,cc,h} is newer than the
-#      ep_bench binary (or binary missing), run `make -j3`.
-#   4. Run baseline sweep: EP=16, MODES="ht_bf16 ht_fp8 fullmesh_bf16",
+#   1. Clone NCCL_GIT_URL into NCCL_REPO if missing (fresh tray case),
+#      else git fetch + hard reset to origin/$NCCL_GIT_BRANCH.
+#   2. Write hostfile from $TRAYS into $OUT/hosts.ep16.
+#   3. Verify passwordless ssh to every tray (mpirun prereq).
+#   4. Autobuild stage 1: if libnccl.so missing, run `make src.build`.
+#   5. Autobuild stage 2: if libnccl_ep.so / ep_bench missing OR EP source
+#      newer than binary, run `make -C contrib/nccl_ep`.
+#   6. Run baseline sweep: EP=16, MODES="ht_bf16 ht_fp8 fullmesh_bf16",
 #      TOKENS="16 32 64 128 256 4096 8192", into $OUT/baseline.
-#   5. Run HT NV72 9-cell calibrate via ht_nv72_calibrate.sh, into $OUT.
-#   6. Merge baseline results into ~/fizhang/nccl_ep_master.csv.
-#   7. Print HT vs FULLMESH summary with ep_summary.py.
+#   7. Run HT NV72 9-cell calibrate via ht_nv72_calibrate.sh, into $OUT.
+#   8. Merge baseline into MASTER_CSV (default /home/fizhang/nccl_ep_master.csv).
+#   9. Print HT vs FULLMESH summary with ep_summary.py.
 #
-# Usage from jumphost:
-#   ssh -i ~/Desktop/my/id_ed25519 fizhang@pod4-gb300-2-tray01-f3 \
-#       bash -lc 'cd ~/fizhang/nccl && \
-#                 git fetch origin master && git reset --hard origin/master && \
-#                 bash contrib/nccl_ep/sweep/run_ep16_4bay.sh'
+# Usage from jumphost (fresh tray, /home is ceph-shared, $HOME is local):
+#   ssh -i id_ed25519 fizhang@pod4-gb300-2-tray01-f3 bash -l <<'REMOTE'
+#     curl -sL https://raw.githubusercontent.com/zhangfei829/nccl/master/contrib/nccl_ep/sweep/run_ep16_4bay.sh -o /tmp/run_ep16_4bay.sh
+#     bash /tmp/run_ep16_4bay.sh 2>&1 | tee /home/fizhang/run_ep16_$(date +%Y%m%d_%H%M%S).log
+#   REMOTE
+#
+# Or, if NCCL_REPO already cloned:
+#   ssh ... "bash /home/fizhang/nccl/contrib/nccl_ep/sweep/run_ep16_4bay.sh"
 #
 # Env overrides:
-#   NCCL_REPO   default $HOME/fizhang/nccl
-#   NCCL_HOME   default $NCCL_REPO/build
-#   CUDA_HOME   default /usr/local/cuda
-#   NVCC_GENCODE default "-gencode=arch=compute_103,code=sm_103"
-#   TRAYS       default "pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 \
-#                        pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3"
-#   OUT         default $HOME/fizhang/nccl-sweep-<ts>-ep16-4bay
-#   SKIP_BASELINE       set to 1 to skip the baseline sweep
-#   SKIP_NV72_CALIBRATE set to 1 to skip the 9-cell HT NV72 sweep
-#   EXTRA_BENCH_ARGS    forwarded to ep_bench (e.g. "--validate")
+#   NCCL_REPO            default /home/fizhang/nccl   (ceph-shared, all trays see it)
+#   NCCL_HOME            default $NCCL_REPO/build
+#   NCCL_GIT_URL         default https://github.com/zhangfei829/nccl.git
+#   NCCL_GIT_BRANCH      default master
+#   CUDA_HOME            default /usr/local/cuda
+#   NVCC_GENCODE         default "-gencode=arch=compute_103,code=sm_103"
+#   TRAYS                default "pod4-gb300-2-tray01..04-f3"
+#   OUT                  default /home/fizhang/nccl-sweeps/nccl-sweep-<ts>-ep16-4bay
+#   MASTER_CSV           default /home/fizhang/nccl_ep_master.csv
+#   SKIP_BASELINE        set to 1 to skip the baseline sweep
+#   SKIP_NV72_CALIBRATE  set to 1 to skip the 9-cell HT NV72 sweep
+#   SKIP_NCCL_BUILD      set to 1 to skip 'make src.build' (assume libnccl.so exists)
+#   EXTRA_BENCH_ARGS     forwarded to ep_bench (e.g. "--validate")
 #
-# Wall time on a healthy 4-BAY GB300:
+# Wall time on a healthy 4-BAY GB300 (assuming repo + libs already built):
 #   - baseline (3 modes x 7 tokens): ~30-40 min
 #   - NV72 9 cells x 7 tokens:        ~60-90 min
-#   Total ~2h. Plan your reservation accordingly.
+#   Total ~2h. First-time `make src.build` adds ~15-40 min.
 # =============================================================================
 set -u
 # DO NOT set -e: per-cell failures should not kill the whole run.
 
-NCCL_REPO="${NCCL_REPO:-$HOME/fizhang/nccl}"
+NCCL_REPO="${NCCL_REPO:-/home/fizhang/nccl}"
 NCCL_HOME="${NCCL_HOME:-$NCCL_REPO/build}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 NVCC_GENCODE="${NVCC_GENCODE:--gencode=arch=compute_103,code=sm_103}"
+NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
+NCCL_GIT_BRANCH="${NCCL_GIT_BRANCH:-master}"
 TRAYS="${TRAYS:-pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3}"
 TS="$(date +%Y%m%d_%H%M%S)"
-OUT="${OUT:-$HOME/fizhang/nccl-sweep-${TS}-ep16-4bay}"
+OUT_BASE="${OUT_BASE:-/home/fizhang/nccl-sweeps}"
+OUT="${OUT:-$OUT_BASE/nccl-sweep-${TS}-ep16-4bay}"
 SKIP_BASELINE="${SKIP_BASELINE:-0}"
 SKIP_NV72_CALIBRATE="${SKIP_NV72_CALIBRATE:-0}"
+SKIP_NCCL_BUILD="${SKIP_NCCL_BUILD:-0}"
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 
 mkdir -p "$OUT"
@@ -100,7 +111,22 @@ done
 echo "[run_ep16_4bay] All trays reachable."
 echo
 
+# Clone repo if missing (fresh tray, ceph-shared /home/fizhang typical layout)
+if [[ ! -d "$NCCL_REPO/.git" ]]; then
+    echo "[run_ep16_4bay] $NCCL_REPO not a git repo, cloning $NCCL_GIT_URL ..."
+    mkdir -p "$(dirname "$NCCL_REPO")"
+    git clone --branch "$NCCL_GIT_BRANCH" "$NCCL_GIT_URL" "$NCCL_REPO" || {
+        echo "[run_ep16_4bay] ERROR: git clone failed" >&2; exit 2;
+    }
+fi
+
 cd "$NCCL_REPO" || { echo "[run_ep16_4bay] ERROR: NCCL_REPO=$NCCL_REPO missing"; exit 2; }
+
+# Pull latest if writable
+git fetch origin "$NCCL_GIT_BRANCH" && git reset --hard "origin/$NCCL_GIT_BRANCH" || {
+    echo "[run_ep16_4bay] WARN: git pull failed; using current checkout $(git rev-parse --short HEAD)"
+}
+echo "[run_ep16_4bay] HEAD = $(git rev-parse --short HEAD) ($(git log -1 --format=%s))"
 
 export NCCL_HOME CUDA_HOME NVCC_GENCODE
 which mpirun >/dev/null || { echo "[run_ep16_4bay] ERROR: mpirun not in PATH"; exit 2; }
@@ -108,12 +134,26 @@ export MPI_HOME="$(dirname $(dirname $(readlink -f $(which mpirun))))"
 [[ -f "$MPI_HOME/include/mpi.h" ]] || { echo "[run_ep16_4bay] ERROR: mpi.h not at $MPI_HOME/include/mpi.h"; exit 2; }
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/extras/CUPTI/lib64:$NCCL_HOME/lib:${LD_LIBRARY_PATH:-}"
 
-# Autobuild
+# ---- Stage 1: main NCCL src.build (libnccl.so + headers) ----
+NCCL_LIB="$NCCL_HOME/lib/libnccl.so"
+NCCL_INC="$NCCL_HOME/include/nccl.h"
+if [[ "$SKIP_NCCL_BUILD" != "1" ]] && [[ ! -f "$NCCL_LIB" || ! -f "$NCCL_INC" ]]; then
+    echo "[autobuild] $NCCL_LIB or $NCCL_INC missing -- running 'make src.build' (~15-40 min)"
+    time make -j src.build BUILDDIR="$NCCL_HOME" NVCC_GENCODE="$NVCC_GENCODE"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "[autobuild] main NCCL src.build FAILED rc=$rc" >&2
+        exit 3
+    fi
+fi
+[[ -f "$NCCL_LIB" ]] || { echo "[run_ep16_4bay] ERROR: $NCCL_LIB still missing after build"; exit 3; }
+
+# ---- Stage 2: contrib/nccl_ep build (libnccl_ep.so + ep_bench) ----
 BIN="$NCCL_HOME/test/nccl_ep/ep_bench"
 LIB="$NCCL_HOME/lib/libnccl_ep.so"
 NEED_BUILD=0
 if [[ ! -x "$BIN" || ! -f "$LIB" ]]; then
-    echo "[autobuild] $BIN or $LIB missing, will build"
+    echo "[autobuild] $BIN or $LIB missing, will build NCCL EP"
     NEED_BUILD=1
 else
     NEWER=$(find contrib/nccl_ep \
@@ -121,7 +161,7 @@ else
            -o -name '*.h' -o -name '*.hpp' -o -name 'Makefile' \) \
         -newer "$BIN" 2>/dev/null | head -5)
     if [[ -n "$NEWER" ]]; then
-        echo "[autobuild] sources newer than $BIN:"
+        echo "[autobuild] EP sources newer than $BIN:"
         echo "$NEWER" | sed 's/^/  /'
         NEED_BUILD=1
     else
@@ -133,7 +173,7 @@ if [[ $NEED_BUILD -eq 1 ]]; then
               NVCC_GENCODE="$NVCC_GENCODE" MPI_HOME="$MPI_HOME"
     rc=$?
     if [[ $rc -ne 0 ]]; then
-        echo "[autobuild] FAILED rc=$rc" >&2
+        echo "[autobuild] NCCL EP build FAILED rc=$rc" >&2
         exit 3
     fi
     ls -l "$BIN" "$LIB"
@@ -168,8 +208,9 @@ else
     echo "[run_ep16_4bay] SKIP_NV72_CALIBRATE=1, skipping NV72 calibrate"
 fi
 
-# Merge baseline into long-lived master csv
-MASTER_CSV="${MASTER_CSV:-$HOME/fizhang/nccl_ep_master.csv}"
+# Merge baseline into long-lived master csv (default to ceph-shared /home for
+# cross-tray + jumphost visibility; override MASTER_CSV to relocate)
+MASTER_CSV="${MASTER_CSV:-/home/fizhang/nccl_ep_master.csv}"
 if [[ "$SKIP_BASELINE" != "1" && -f "$OUT/baseline/results.csv" ]]; then
     if python3 contrib/nccl_ep/sweep/merge_into_master.py "$MASTER_CSV" "$OUT/baseline/results.csv"; then
         echo "[run_ep16_4bay] merged baseline into $MASTER_CSV"
