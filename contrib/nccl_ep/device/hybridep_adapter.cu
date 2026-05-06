@@ -455,6 +455,8 @@ void dispatch_impl(
     int max_tokens_per_rank,
     int num_nodes,
     bool use_fp8,
+    int num_blocks,
+    int chunk_tokens,
     cudaStream_t stream
 ) {
     HYBRIDEP_SWITCH_DATATYPE(use_fp8, {
@@ -473,13 +475,32 @@ void dispatch_impl(
 
                 auto kp = build_dispatch_param<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>(params);
 
-                HybridEPType::template dispatch<
-                    TOKEN_DATA_TYPE,
-                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                    HT_OF_NUM_TOKENS_PER_CHUNK,
-                    HYBRIDEP_DISPATCH_NUM_OF_BLOCKS,
-                    FORWARD_DISPATCH>(kp, stream);
+                if constexpr (NUM_LSA_TEAMS == 1) {
+                    // NV72 / MNNVL full-coverage tuning path. Only the
+                    // single-LSA-domain template gets the expanded
+                    // NUM_BLOCKS x CHUNK instantiations; RDMA/multi-domain
+                    // paths keep their production constants to avoid compile
+                    // time explosion and behavior drift.
+                    HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
+                        HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
+                            HybridEPType::template dispatch<
+                                TOKEN_DATA_TYPE,
+                                HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                CHUNK_TOKENS_TUNED,
+                                NUM_BLOCKS_TUNED,
+                                FORWARD_DISPATCH>(kp, stream);
+                        });
+                    });
+                } else {
+                    HybridEPType::template dispatch<
+                        TOKEN_DATA_TYPE,
+                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                        HT_OF_NUM_TOKENS_PER_CHUNK,
+                        HYBRIDEP_DISPATCH_NUM_OF_BLOCKS,
+                        FORWARD_DISPATCH>(kp, stream);
+                }
             });
         });
     });
@@ -491,18 +512,20 @@ void call_dispatch(
     int num_nodes,
     bool use_fp8,
     bool forward_dispatch,
+    int num_blocks,
+    int chunk_tokens,
     cudaStream_t stream
 ) {
     // Dispatch based on forward/backward and sync mode
     if (forward_dispatch) {
         dispatch_impl<true>(
             params, max_tokens_per_rank,
-            num_nodes, use_fp8, stream);
+            num_nodes, use_fp8, num_blocks, chunk_tokens, stream);
 
     } else {
         dispatch_impl<false>(
             params, max_tokens_per_rank,
-            num_nodes, use_fp8, stream);
+            num_nodes, use_fp8, num_blocks, chunk_tokens, stream);
 
     }
 }
@@ -580,6 +603,8 @@ void combine_impl(
     const CombineParams& params,
     int max_tokens_per_rank,
     int num_nodes,
+    int num_blocks,
+    int chunk_tokens,
     cudaStream_t stream
 ) {
     // HT combine doesn't support FP8, only BF16
@@ -607,14 +632,30 @@ void combine_impl(
                     ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G
                     : HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
 
-                HybridEPType::template combine<
-                    num_stages_g2s,
-                    num_stages_s2g,
-                    HT_OF_NUM_TOKENS_PER_CHUNK,
-                    HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
-                    HYBRIDEP_COMBINE_NUM_OF_BLOCKS,
-                    HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
-                    BACKWARD_COMBINE>(kp, stream);
+                if constexpr (NUM_LSA_TEAMS == 1) {
+                    // NV72 / MNNVL full-coverage tuning path only.
+                    HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
+                        HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
+                            HybridEPType::template combine<
+                                num_stages_g2s,
+                                num_stages_s2g,
+                                CHUNK_TOKENS_TUNED,
+                                HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                                NUM_BLOCKS_TUNED,
+                                HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                                BACKWARD_COMBINE>(kp, stream);
+                        });
+                    });
+                } else {
+                    HybridEPType::template combine<
+                        num_stages_g2s,
+                        num_stages_s2g,
+                        HT_OF_NUM_TOKENS_PER_CHUNK,
+                        HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                        HYBRIDEP_COMBINE_NUM_OF_BLOCKS,
+                        HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                        BACKWARD_COMBINE>(kp, stream);
+                }
             });
         });
 }
@@ -624,16 +665,18 @@ void call_combine(
     int max_tokens_per_rank,
     int num_nodes,
     bool backward_combine,
+    int num_blocks,
+    int chunk_tokens,
     cudaStream_t stream
 ) {
     if (backward_combine) {
         combine_impl<true>(
             params, max_tokens_per_rank,
-            num_nodes, stream);
+            num_nodes, num_blocks, chunk_tokens, stream);
     } else {
         combine_impl<false>(
             params, max_tokens_per_rank,
-            num_nodes, stream);
+            num_nodes, num_blocks, chunk_tokens, stream);
     }
 }
 

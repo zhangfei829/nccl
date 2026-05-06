@@ -168,6 +168,29 @@ void dense_to_sparse_prob_combine(
         } \
     } while(0)
 
+// NV72-only tuning switches. Keep the accepted values small and explicit so
+// template instantiation remains bounded. Defaults match the production HT
+// constants: 16 blocks (SM budget) and 64 tokens/chunk.
+#define HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks_val, ...) \
+    do { \
+        switch (num_blocks_val) { \
+            case 16: { constexpr int NUM_BLOCKS_TUNED = 16; __VA_ARGS__; } break; \
+            case 32: { constexpr int NUM_BLOCKS_TUNED = 32; __VA_ARGS__; } break; \
+            case 64: { constexpr int NUM_BLOCKS_TUNED = 64; __VA_ARGS__; } break; \
+            default: assert(false && "Unsupported HT NV72 NUM_SMS (expected one of {16,32,64})"); \
+        } \
+    } while(0)
+
+#define HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens_val, ...) \
+    do { \
+        switch (chunk_tokens_val) { \
+            case  64: { constexpr int CHUNK_TOKENS_TUNED =  64; __VA_ARGS__; } break; \
+            case 128: { constexpr int CHUNK_TOKENS_TUNED = 128; __VA_ARGS__; } break; \
+            case 256: { constexpr int CHUNK_TOKENS_TUNED = 256; __VA_ARGS__; } break; \
+            default: assert(false && "Unsupported HT NV72 CHUNK tokens (expected one of {64,128,256})"); \
+        } \
+    } while(0)
+
 // ============================================================================
 // Preprocessing wrapper with template parameter resolution
 // ============================================================================
@@ -285,6 +308,8 @@ void call_dispatch(
     int num_nodes,              // Number of nodes (RDMA domain size)
     bool use_fp8,               // false = BF16 (uint16_t), true = FP8 (uint8_t)
     bool forward_dispatch,      // True for forward, false for backward
+    int num_blocks,             // HT blocks/SM budget template value
+    int chunk_tokens,           // HT tokens per chunk template value
     cudaStream_t stream);
 
 // ============================================================================
@@ -348,6 +373,8 @@ void call_combine(
     int max_tokens_per_rank,    // Max tokens for buffer sizing
     int num_nodes,              // Number of nodes (RDMA domain size)
     bool backward_combine,      // True for backward (training), false for forward
+    int num_blocks,             // HT blocks/SM budget template value
+    int chunk_tokens,           // HT tokens per chunk template value
     cudaStream_t stream);
 
 

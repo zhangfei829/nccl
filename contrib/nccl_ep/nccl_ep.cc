@@ -242,6 +242,16 @@ struct ncclEpGroup {
     int hidden;               // Hidden size (token_size_bytes / ncclTypeSize(ncclBfloat16))
     unsigned int device_sm_count; // Number of SMs on the device
     unsigned int num_sms_ht; // Number of SMs to use for HT kernels
+    // HT NV72-only tuning knobs. Defaults keep production HT behavior
+    // unchanged (16 blocks, 64 tokens/chunk). When HT runs on MNNVL full
+    // coverage (ht_buffers.use_fabric_memory=true, nNodes folded to 1), these
+    // can be overridden with:
+    //   NCCL_EP_HT_NV72_NUM_SMS=16|32|64
+    //   NCCL_EP_HT_NV72_CHUNK=64|128|256
+    // They are compile-time template values selected through small runtime
+    // switches in hybridep_adapter.cu; non-NV72 HT ignores the env vars.
+    int ht_nv72_num_sms;
+    int ht_nv72_chunk_tokens;
     // Number of SMs to use for FULLMESH kernels (dispatch / combine push /
     // combine reduce / combine fused). Default 16 to match
     // HYBRIDEP_MAX_NUM_SMS_PER_RANK so HT vs FM benchmark is apples-to-apples
@@ -445,6 +455,8 @@ struct ncclEpGroup {
         hidden(0),
         device_sm_count(0),
         num_sms_ht(0),
+        ht_nv72_num_sms(16),
+        ht_nv72_chunk_tokens(HT_OF_NUM_TOKENS_PER_CHUNK),
         fullmesh_num_sms(0),
         fullmesh_dispatch_path(nccl_ep::fullmesh::DispatchPath::kTma),
         fullmesh_prof_dispatch_dev(nullptr),
@@ -1866,6 +1878,39 @@ ncclResult_t ncclEpCreateGroup(
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, ep_group->cuda_device_id));
     ep_group->device_sm_count = device_prop.multiProcessorCount;
 
+    // HT NV72-only tuning knobs. These are intentionally ignored outside the
+    // MNNVL full-coverage HT path so RDMA / normal intra-node HT behavior stays
+    // unchanged. Values are compile-time template parameters selected later by
+    // small runtime switches in hybridep_adapter.cu.
+    ep_group->ht_nv72_num_sms = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS;
+    ep_group->ht_nv72_chunk_tokens = HT_OF_NUM_TOKENS_PER_CHUNK;
+    if (hybridep_mode && ep_group->ht_buffers.use_fabric_memory) {
+        const char* sms_env = std::getenv("NCCL_EP_HT_NV72_NUM_SMS");
+        const char* chunk_env = std::getenv("NCCL_EP_HT_NV72_CHUNK");
+
+        auto parse_allowed = [](const char* v, int def, int a, int b, int c) -> int {
+            if (v == nullptr || v[0] == '\0') return def;
+            int parsed = std::atoi(v);
+            return (parsed == a || parsed == b || parsed == c) ? parsed : def;
+        };
+
+        ep_group->ht_nv72_num_sms =
+            parse_allowed(sms_env, HYBRIDEP_DISPATCH_NUM_OF_BLOCKS, 16, 32, 64);
+        ep_group->ht_nv72_chunk_tokens =
+            parse_allowed(chunk_env, HT_OF_NUM_TOKENS_PER_CHUNK, 64, 128, 256);
+
+        if (ep_group->rank == 0) {
+            fprintf(stderr,
+                    "[NV72-ADAPT] HT NV72 tuning: num_sms=%d chunk=%d "
+                    "(env NCCL_EP_HT_NV72_NUM_SMS=%s NCCL_EP_HT_NV72_CHUNK=%s)\n",
+                    ep_group->ht_nv72_num_sms,
+                    ep_group->ht_nv72_chunk_tokens,
+                    sms_env ? sms_env : "<unset, default 16>",
+                    chunk_env ? chunk_env : "<unset, default 64>");
+            fflush(stderr);
+        }
+    }
+
     // FULLMESH SM cap: parse NCCL_EP_FULLMESH_NUM_SMS once. Default 16 to
     // match HYBRIDEP_MAX_NUM_SMS_PER_RANK so the HT vs FM comparison runs at
     // equal SM budget. Caller can set 0 to mean "no cap" (debug only -- breaks
@@ -3239,6 +3284,8 @@ ncclResult_t ncclEpDispatch(
             group->nNodes,
             use_fp8,
             forward_dispatch,
+            group->ht_nv72_num_sms,
+            group->ht_nv72_chunk_tokens,
             stream
         );
 
@@ -3861,6 +3908,8 @@ ncclResult_t ncclEpCombine(
             group->config.max_tokens_per_rank, // max_tokens_per_rank
             group->nNodes, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
+            group->ht_nv72_num_sms,
+            group->ht_nv72_chunk_tokens,
             stream
         );
 
