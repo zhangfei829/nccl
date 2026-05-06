@@ -1,0 +1,114 @@
+---
+description: 在多节点 cluster (GB300 NVL72 trays / GPU pod) 上发命令前必须先做环境发现，禁止凭 jumphost 印象推断 tray 布局
+alwaysApply: true
+---
+
+# 跨节点 cluster 跑测试: 环境发现先于命令构造
+
+这条规则是 2026-05-06 当天的直接产物。原话:
+> 你命令记错了，正确的是: ssh -i id_ed25519 fizhang@pod4-gb300-2-tray01-f3
+> 在跳转机上可以用 ssh -i id_ed25519 fizhang@pod4-gb300-2-tray01-f3 登录，我不知道在测试 4 NODE 时怎么编译和跑测试比较好
+
+以及随后一系列踩坑:
+- 凭 jumphost `$HOME/fizhang/nccl` 路径推 tray 的路径，结果 tray 上 `$HOME=/mnt/local/home/fizhang` 把它挂到 `/mnt/local/home/fizhang/fizhang/nccl` (双 fizhang)
+- 用 `ssh ... bash -lc '...'` 单引号被 jumphost shell 吃掉，server 端把 `bash -lc cd ~/fizhang/nccl && git fetch ...` 拆错
+- 漏了 NCCL EP `Makefile` 头注释里的 `Requires NCCL to be built first: make src.build`，让 fresh tray 直接 fail
+- mpirun 跨 tray 要求每 tray 互相免密 ssh，但因为 `$HOME` 是 local，每个 tray 的 `~/.ssh/authorized_keys` 各自独立，需要每 tray 装一遍
+
+## 根因
+
+我把"在 jumphost 上能跑"的命令直接翻译成"在 tray 上换个 hostname 也能跑"。三个隐含假设全错:
+
+1. **路径假设**: `$HOME` 在 jumphost 和 tray 上指向同一处文件 → **错**。jumphost 的 home 是 ceph 共享 (`/home/fizhang`)，tray 的 `$HOME` 被重定向到本地 (`/mnt/local/home/fizhang`)，跨 tray 不共享。
+2. **build 依赖假设**: jumphost 上 `~/fizhang/nccl/build` 已经存在 → **错**。tray 上 `/mnt/local/home/fizhang` 全新，`libnccl.so` 都没。
+3. **ssh quoting 假设**: `ssh host bash -lc 'cmd1 && cmd2'` 单引号会原样传到 server → **错**。jumphost 端 shell 先吃单引号，server 端只看到 token 列表，组合后被 server 默认 shell 二次解析。
+
+## 硬性流程: 给跨节点命令前必做的 4 个 discovery
+
+### Discovery 1: 共享盘和本地盘是哪些路径
+
+```bash
+ssh -i <key> <user>@<head_tray> 'echo "HOME=$HOME"; ls -la ~/; mount | grep -Ei "home|nfs|lustre|gpfs|ceph|share"; ls -la /home/ /mnt/ /shared/ /scratch/ 2>&1 | head -20'
+```
+
+必须明确回答:
+- `$HOME` 是 local (`/mnt/local/...` / `/tmp/...`) 还是 shared？
+- 哪个绝对路径是 shared (ceph/NFS/Lustre)？所有 tray 都能看到吗？
+- 共享盘对当前 user 可写吗？(`touch /shared_path/.write_test_$$ && rm`)
+
+**任何 build artifact 必须放在 shared 路径**，否则 mpirun 在 tray2 上 `dlopen` 不到 tray1 上 build 的 `libnccl_ep.so`。
+
+### Discovery 2: 跨 tray 免密 ssh 是否通
+
+```bash
+ssh -i <key> <user>@<head_tray> 'for h in <tray2> <tray3> <tray4>; do echo -n "$h: "; ssh -o ConnectTimeout=5 -o BatchMode=yes "$h" hostname 2>&1 | head -1; done'
+```
+
+`BatchMode=yes` 强制不弹密码，不通就 print 错误。任一 tray 不通 → mpirun 会半路 hang，必须先装公钥到每 tray 的 `authorized_keys` (如果 home 是 local 就要每 tray 独立装)。
+
+### Discovery 3: 网络出网 + repo / image 拉取
+
+```bash
+ssh -i <key> <user>@<head_tray> 'curl -s -m 5 -o /dev/null -w "github.com http=%{http_code} time=%{time_total}s\n" https://github.com/'
+```
+
+不通就用内网 mirror 或 `scp` 从 jumphost 拷过去。
+
+### Discovery 4: build 依赖链 (NCCL EP / 任何上层组件)
+
+读 `Makefile` / `CMakeLists.txt` 头部的 `# Requires` 注释或 `find_package` 段。NCCL EP 的例子:
+
+```makefile
+# contrib/nccl_ep/Makefile:4
+# Requires NCCL to be built first: make src.build
+```
+
+→ runbook 必须包含 stage 1 (主 NCCL `make src.build`) 才能跑 stage 2 (`make -C contrib/nccl_ep`)。
+
+## ssh 嵌套 quoting: 唯一可靠形式是 heredoc
+
+**反模式**:
+
+```bash
+# 单引号被 jumphost shell 吃掉, server 端拆错
+ssh host bash -lc 'cd /path && cmd1 && cmd2 | tee log_$(date +%s).log'
+```
+
+**正确**:
+
+```bash
+# heredoc + 'REMOTE' 引号阻止 jumphost 端展开 $(...)
+ssh host bash -l <<'REMOTE'
+cd /path
+cmd1 && cmd2 | tee log_$(date +%s).log
+REMOTE
+```
+
+或:
+
+```bash
+# 外双内单 + escape $ 让 server 端展开
+ssh host "bash -lc 'cd /path && cmd2 | tee log_\$(date +%s).log'"
+```
+
+复杂命令一律用 heredoc，不要嵌套 quote。
+
+## 反模式 (今天实际踩的)
+
+- ❌ 给 `ssh ... bash -lc 'cd ~/fizhang/nccl && git fetch ...'`，结果 tray 上 `$HOME` 不是 jumphost 的 home，`~/fizhang/nccl` 解析到 `/mnt/local/home/fizhang/fizhang/nccl` (双 fizhang)。
+- ❌ runbook 默认 `NCCL_REPO=$HOME/fizhang/nccl`，没考虑 fresh tray + ceph 共享 home 的真实布局；fresh tray 跑直接 cd fail。
+- ❌ runbook 只 build EP，漏了主 NCCL `make src.build`，fresh tray 上 `libnccl.so` 不在，`make -C contrib/nccl_ep` link error。
+- ❌ 在 PowerShell 里用 `git commit -m "$(cat <<'EOF' ... EOF)"`，PowerShell 不支持 `<<` heredoc，整条命令解析失败。改用 `git commit -F .git_commit_msg.tmp` (写文件再读)。
+- ❌ 假设 ssh 互通，没 verify 就发 mpirun 命令。
+
+## 自检清单 (跨节点 cluster 命令必过)
+
+- [ ] 跑 Discovery 1-4 sanity check 命令，明确知道 shared 路径 / ssh 互通 / 出网 / build 依赖？
+- [ ] runbook / 命令里所有路径用 **绝对路径** (`/home/<user>/...`) 而非 `~` / `$HOME`？
+- [ ] runbook 自带 clone fallback (repo 不在就 git clone) + build stage 检测 (lib 不在就 build)？
+- [ ] mpirun / 跨 tray 命令前有 ssh verify 步骤? 不通直接 abort，不让 mpirun hang？
+- [ ] ssh remote command 用 heredoc `<<'REMOTE'`，不用 `ssh ... 'cmd'` 单引号嵌套？
+- [ ] PowerShell 跑 git commit 用 `-F file` 而不是 `-m "$(cat <<EOF...)"`？
+- [ ] log / 数据 / artifacts 落到 **shared 路径** 让 jumphost 能直接 `cat`，而不是 local `$HOME` 还要 scp？
+
+如果任一答 No, 不准把命令发给用户; 先补做 discovery 或修 runbook。
