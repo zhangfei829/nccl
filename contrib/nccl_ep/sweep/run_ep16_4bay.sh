@@ -13,8 +13,11 @@
 #   4. Autobuild stage 1: if libnccl.so missing, run `make src.build`.
 #   5. Autobuild stage 2: if libnccl_ep.so / ep_bench missing OR EP source
 #      newer than binary, run `make -C contrib/nccl_ep`.
-#   6. Run baseline sweep: EP=16, MODES="ht_bf16 ht_fp8 fullmesh_bf16",
+#   6. Run baseline sweep: EP=16, MODES="ht_bf16 ht_fp8" by default,
 #      TOKENS="16 32 64 128 256 4096 8192", into $OUT/baseline.
+#      FULLMESH is disabled by default because EP16 manual 4-BAY testing
+#      observed a hang at t=16; set INCLUDE_FULLMESH=1 only when explicitly
+#      debugging that path.
 #   7. Run HT NV72 9-cell calibrate via ht_nv72_calibrate.sh, into $OUT.
 #   8. Merge baseline into MASTER_CSV (default /home/fizhang/nccl_ep_master.csv).
 #   9. Print HT vs FULLMESH summary with ep_summary.py.
@@ -44,7 +47,10 @@
 #   EXTRA_BENCH_ARGS     forwarded to ep_bench (e.g. "--validate")
 #
 # Wall time on a healthy 4-BAY GB300 (assuming repo + libs already built):
-#   - baseline (3 modes x 7 tokens): ~30-40 min
+#   INCLUDE_FULLMESH      set to 1 to add fullmesh_bf16 to baseline modes
+#
+# Wall time on a healthy 4-BAY GB300 (assuming repo + libs already built):
+#   - HT-only baseline (2 modes x 7 tokens): ~20-30 min
 #   - NV72 9 cells x 7 tokens:        ~60-90 min
 #   Total ~2h. First-time `make src.build` adds ~15-40 min.
 # =============================================================================
@@ -64,6 +70,7 @@ OUT="${OUT:-$OUT_BASE/nccl-sweep-${TS}-ep16-4bay}"
 SKIP_BASELINE="${SKIP_BASELINE:-0}"
 SKIP_NV72_CALIBRATE="${SKIP_NV72_CALIBRATE:-0}"
 SKIP_NCCL_BUILD="${SKIP_NCCL_BUILD:-0}"
+INCLUDE_FULLMESH="${INCLUDE_FULLMESH:-0}"
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 
 mkdir -p "$OUT"
@@ -94,6 +101,7 @@ EP16 4-BAY runbook
   OUT         : $OUT
   SKIP_BASELINE       : $SKIP_BASELINE
   SKIP_NV72_CALIBRATE : $SKIP_NV72_CALIBRATE
+  INCLUDE_FULLMESH    : $INCLUDE_FULLMESH
 ===========================================================
 EOF
 sed 's/^/  /' "$HOSTFILE"
@@ -187,11 +195,15 @@ fi
 # Baseline sweep
 if [[ "$SKIP_BASELINE" != "1" ]]; then
     echo
-    echo "===== Baseline sweep (HT bf16/fp8 + FULLMESH bf16) ====="
+    BASELINE_MODES="ht_bf16 ht_fp8"
+    if [[ "$INCLUDE_FULLMESH" == "1" ]]; then
+        BASELINE_MODES="$BASELINE_MODES fullmesh_bf16"
+    fi
+    echo "===== Baseline sweep ($BASELINE_MODES) ====="
     HOSTFILE_OVERRIDE="$HOSTFILE" \
         EP_SIZE="$EP_SIZE" \
         TOKENS="16 32 64 128 256 4096 8192" \
-        MODES="ht_bf16 ht_fp8 fullmesh_bf16" \
+        MODES="$BASELINE_MODES" \
         LOG_DIR="$OUT/baseline" \
         CSV_FILE="$OUT/baseline/results.csv" \
         EXTRA_BENCH_ARGS="$EXTRA_BENCH_ARGS" \
@@ -226,7 +238,7 @@ fi
 
 # Summary
 echo
-echo "===== HT vs FULLMESH baseline summary ====="
+echo "===== Baseline summary ====="
 if [[ -f "$OUT/baseline/results.csv" ]]; then
     python3 contrib/nccl_ep/sweep/ep_summary.py "$OUT/baseline/results.csv" || true
 fi
