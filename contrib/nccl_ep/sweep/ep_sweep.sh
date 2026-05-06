@@ -268,7 +268,15 @@ for mode in $MODES; do
         for _v in $(compgen -e | grep '^NCCL_EP_' || true); do
             mpi_x_args+=("-x" "$_v")
         done
-        mpirun --mca plm slurm -np "$EP_SIZE" --hostfile "$HOSTFILE" \
+        # In Slurm allocations, use OpenMPI's Slurm process launcher.  When
+        # HOSTFILE_OVERRIDE is set we are in the manual-reserved-node path
+        # (ssh'd directly into a head tray), so forcing plm=slurm makes mpirun
+        # fail even though the hostfile is valid.
+        mpi_launcher_args=()
+        if [[ -z "${HOSTFILE_OVERRIDE:-}" ]]; then
+            mpi_launcher_args=("--mca" "plm" "slurm")
+        fi
+        mpirun "${mpi_launcher_args[@]}" -np "$EP_SIZE" --hostfile "$HOSTFILE" \
                --oversubscribe --bind-to none \
                "${mpi_x_args[@]}" \
             "$EP_BENCH" --algorithm "$ALGO" \
