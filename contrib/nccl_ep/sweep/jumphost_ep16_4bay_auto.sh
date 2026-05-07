@@ -41,6 +41,9 @@ TRAYS="${TRAYS:-pod4-gb300-2-tray05-f3 pod4-gb300-2-tray06-f3 pod4-gb300-2-tray0
 HEAD_TRAY="${HEAD_TRAY:-$(echo "$TRAYS" | awk '{print $1}')}"
 TOKENS="${TOKENS:-128 256 4096 8192}"
 BASELINE_MODES="${BASELINE_MODES:-ht_bf16}"
+SKIP_BASELINE="${SKIP_BASELINE:-0}"
+SKIP_NV72_CALIBRATE="${SKIP_NV72_CALIBRATE:-0}"
+INCLUDE_FULLMESH="${INCLUDE_FULLMESH:-0}"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/ep16_4bay_${TS}}"
 REMOTE_RUNBOOK_URL="${REMOTE_RUNBOOK_URL:-https://raw.githubusercontent.com/zhangfei829/nccl/master/contrib/nccl_ep/sweep/run_ep16_4bay.sh}"
@@ -58,6 +61,9 @@ Jumphost EP16 4-BAY automation
   TRAYS          : $TRAYS
   TOKENS         : $TOKENS
   BASELINE_MODES : $BASELINE_MODES
+  SKIP_BASELINE       : $SKIP_BASELINE
+  SKIP_NV72_CALIBRATE : $SKIP_NV72_CALIBRATE
+  INCLUDE_FULLMESH    : $INCLUDE_FULLMESH
   LOCAL_OUT      : $LOCAL_OUT
 ===========================================================
 EOF
@@ -110,6 +116,9 @@ curl -sL "$REMOTE_RUNBOOK_URL" -o /tmp/run_ep16_4bay.sh
 TRAYS="$TRAYS" \\
 TOKENS="$TOKENS" \\
 BASELINE_MODES="$BASELINE_MODES" \\
+SKIP_BASELINE="$SKIP_BASELINE" \\
+SKIP_NV72_CALIBRATE="$SKIP_NV72_CALIBRATE" \\
+INCLUDE_FULLMESH="$INCLUDE_FULLMESH" \\
 bash /tmp/run_ep16_4bay.sh 2>&1 | tee /home/fizhang/run_ep16_auto_${TS}.log
 REMOTE
 
