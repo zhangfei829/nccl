@@ -1,0 +1,84 @@
+---
+description: Common pitfalls when generating remote shell commands (pkill -f self-kill, ssh eats stdin in bash for-loops, output buffered by trailing tail/grep). Avoid these before sending a command the user will paste.
+alwaysApply: true
+---
+
+# 远程 shell 命令的常见自爆陷阱
+
+这条规则是 2026-05-07 的直接产物。同一天我连续踩了三个不同坑, 让用户重复粘贴命令 + 浪费 round-trip。
+
+## 陷阱 1: `pkill -f X` 自杀
+
+我给的命令:
+
+```bash
+ssh ... 'pkill -9 -f ep_bench; pkill -9 -f mpirun; sleep 3; ps ...'
+```
+
+`-f` 让 pkill 匹配 *full cmdline*, 不是 process name。ssh 远端跑这条 bash 时, bash 自己的 cmdline 是
+`bash -c 'pkill -9 -f ep_bench; ...'` —— 字符串里**含 "ep_bench"**! pkill 把当前 bash 杀了, 后续命令 (sleep / ps / output) 全没跑. 用户看到 `ssh tray` 立刻断开, **命令输出空**, 还以为目标进程被杀了, 实际什么都没发生.
+
+正确做法:
+
+- 按进程名 kill: `pkill -9 ep_bench`(默认匹配 process name, 不匹配 cmdline)
+- 必须用 -f 时, 改 pattern 让它**不匹配自己**, 例如 `pkill -9 -f '/ep_bench --algorithm'` (前缀加 `/` 强制匹配 binary path)
+- 或者 `pkill -9 -f 'ep_bench --algo'`(加目标专用参数, 当前 bash cmdline 不含)
+- 自检: 我打算让这条 pkill 在 ssh 远端跑时, 远端 bash 的 cmdline 会不会被 pkill pattern 匹配到?
+
+## 陷阱 2: bash for 循环里的 ssh 吞 stdin
+
+```bash
+for x in a b c d; do
+  ssh ... '...'   # <-- ssh 默认从 stdin 读
+done
+```
+
+ssh 默认 stdin 是 controlling terminal 或上层 pipe. 在 for 循环里, ssh 会读 *上游 stdin* 直到 EOF —— 把 for 循环还没迭代到的 `b c d` 当成 ssh stdin **吃掉**, 循环只跑一次.
+
+正确做法:
+
+- 远端无 stdin 需求时: 加 `-n` (`ssh -n`)
+- 显式 redirect: `ssh ... < /dev/null`
+- 自检: 这条 ssh 是不是在 for 循环 / pipe / heredoc 里? 如果是, 必须 `-n`
+
+## 陷阱 3: `| tail -N` / `| head -N` 让 stream output 一次性出现
+
+```bash
+long_running_command 2>&1 | tail -80
+```
+
+`tail -80` 必须读完整 stdin (等命令结束) 才知道哪 80 行是 *最后*, 然后才一次性 print. 跑了 15 分钟 build 的命令外面套 `| tail`, 用户**看不到任何中间进度**, 误以为命令卡住, Ctrl-C 杀掉重跑, 浪费 build 时间.
+
+正确做法:
+
+- 长命令 + 实时进度: 用 `tee /tmp/log` 然后跑完再 `tail` 文件
+  ```bash
+  long_command 2>&1 | tee /tmp/run.log
+  tail -80 /tmp/run.log
+  ```
+- 想限制最终输出量: 用 `awk '{lines[NR]=$0} END{for (i=NR-79; i<=NR; i++) print lines[i]}'` (流式) 或 `tail -n 80 -f` 跟踪文件
+- 自检: 这条 pipeline 的最后一段 (tail/head/awk END) 会不会等 stdin EOF? 如果是, 中间过程用户看不到, 后台跑 + 结束后 cat 文件比较安全
+
+## 通用自检清单 (生成远程命令前必过)
+
+每条 `ssh / pkill / for-loop with ssh / pipe with tail or head` 命令发出去之前:
+
+- [ ] 我用了 `pkill -f X` 吗? 远端 bash 的 cmdline 含 X 吗? 如果含, 改 -f pattern 或去掉 -f.
+- [ ] 我有 `for ... do ... ssh ...; done` 循环吗? ssh 是否加 `-n`?
+- [ ] 我有 `... | tail -N` / `| head -N` 在最后吗? 中间过程会等 stdin EOF 吗? 如果用户需要看实时进度, 改 tee + 后续 cat.
+- [ ] 我让用户 *后台跑* + 后续 cat 文件了吗? 这是最稳的长命令模式.
+
+任一答 No, **重写命令** 再发, 不要让用户发现命令吃了输出 / 自爆 / hang 才浪费 round-trip 来 debug 我的命令设计.
+
+## 反模式 (这一天踩过的)
+
+- ❌ `pkill -9 -f ep_bench` 让 ssh 远端 bash 自杀, sleep / ps 没跑, 用户重新粘贴命令两次.
+- ❌ `for tray in ...; do ssh ... 'cmd'; done` 没加 `-n`, 第一个 tray 跑了, 后续 tray 被吞 stdin 跳过. (这次没正面踩, 但容易踩)
+- ❌ `command 2>&1 | tail -80` 在 build 命令外面, 用户看不到 build 进度, 误以为卡 ~10 分钟.
+
+## 与现有规则的关系
+
+- `verify-clean-gpu-before-benchmark.mdc`: 跑 benchmark 前要 ps + pkill 干净
+- 这条规则: pkill 命令本身不要自爆; 远程命令不要自吞输出
+
+两条 paired: 上面那条说 "需要清", 这条说 "清的命令别写错".

@@ -69,15 +69,16 @@ for tray in $TRAYS; do
 done
 ```
 
-如有 stale, 杀掉:
+如有 stale, 杀掉 (注意: `pkill -f X` 会匹配 ssh 远端 bash 自身的 cmdline 中的 X 字符串而把自己杀掉, 见 `remote-command-pitfalls.mdc`. 用按进程名匹配 + `ssh -n` 避免吃 stdin):
 
 ```bash
 for tray in $TRAYS; do
-  ssh -i $KEY $USER@$tray '
-    pkill -9 -f "ep_bench --algorithm" 2>/dev/null || true
+  echo "=== $tray ==="
+  ssh -n -i $KEY $USER@$tray '
+    pkill -9 ep_bench 2>/dev/null || true
     pkill -9 mpirun 2>/dev/null || true
-    sleep 1
-    ps -ef | grep -E "ep_bench|mpirun" | grep -v grep | head -3 || echo "(clean)"
+    sleep 3
+    ps -ef | grep -E "ep_bench|mpirun" | grep -v grep | wc -l
   '
 done
 ```
