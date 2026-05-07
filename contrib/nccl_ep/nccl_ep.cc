@@ -3378,6 +3378,7 @@ ncclResult_t ncclEpDispatch(
         int ht_nv72_chunk_tokens = 0;
         select_ht_nv72_tuning(group, handle->num_tokens, use_fp8,
                               &ht_nv72_num_sms, &ht_nv72_chunk_tokens);
+#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
         static const bool ht_dispatch_tma_copy = [](){
             const char* v = std::getenv("NCCL_EP_HT_DISPATCH_TMA_COPY");
             return v != nullptr && v[0] != '0' && v[0] != '\0';
@@ -3385,7 +3386,6 @@ ncclResult_t ncclEpDispatch(
         const bool recv_x_tma_aligned =
             recv_x != nullptr &&
             ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
-#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
         const bool ht_dispatch_tma_copy_enabled =
             ht_dispatch_tma_copy && !use_fp8 && recv_x != nullptr &&
             recv_x->datatype == ncclBfloat16 && recv_x_tma_aligned &&
