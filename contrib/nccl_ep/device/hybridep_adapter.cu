@@ -619,9 +619,13 @@ void dispatch_impl(
                     // matrix only gets the ENABLE_TMA_COPY=false instance.
                     // This keeps default builds untouched and macro-on builds
                     // bounded to a few extra instantiations.
+                    //
+                    // Note: preprocessor directives inside macro arguments are
+                    // undefined behavior (ISO C99 6.10.3p11), so the #ifdef
+                    // must wrap the macro call rather than appear in its body.
+#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
-#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                             constexpr bool kAllowTmaCopy =
                                 std::is_same<TOKEN_DATA_TYPE, uint16_t>::value &&
                                 ((NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
@@ -656,7 +660,11 @@ void dispatch_impl(
                                     FORWARD_DISPATCH,
                                     false>(kp, stream);
                             }
+                        });
+                    });
 #else
+                    HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
+                        HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
                             HybridEPType::template dispatch<
                                 TOKEN_DATA_TYPE,
                                 HYBRIDEP_DISPATCH_NUM_OF_STAGES,
@@ -665,9 +673,9 @@ void dispatch_impl(
                                 NUM_BLOCKS_TUNED,
                                 FORWARD_DISPATCH,
                                 false>(kp, stream);
-#endif
                         });
                     });
+#endif
                 } else {
                     HybridEPType::template dispatch<
                         TOKEN_DATA_TYPE,
