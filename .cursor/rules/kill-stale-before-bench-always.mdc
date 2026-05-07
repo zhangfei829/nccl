@@ -1,0 +1,89 @@
+---
+description: Every cluster benchmark / sweep / ep_bench / mpirun launch command MUST start with a kill-stale step chained via && in the same one-shot command. No "ps verify -> wait for user reply -> kill" round-trip.
+alwaysApply: true
+---
+
+# 先杀后跑: 任何集群 bench 命令必须前面 chain kill stale
+
+这条规则是 2026-05-08 的直接产物。原话:
+> 写入规则, 先杀后跑
+
+## 根因
+
+我之前每次 trigger sweep / mpirun / ep_bench 时, 给的命令模式是:
+1. 给用户 ps 命令验证 stale -> 等用户 paste -> 决定是否 kill
+2. 或假设用户已经 kill, 直接给 trigger 命令
+
+两种都浪费 round-trip 或在出错时找不到 root cause:
+- "ps verify 拆步" -> 用户多 paste 一次, 多等一轮
+- "假设已 kill" -> 万一没 kill 干净, sweep hang 后才发现, 又得多一轮 ps + kill
+
+User 的工程视角: kill stale **不是诊断步骤**, 是 *bench 命令的必备前缀*. 像 `set -e` 一样, 默认就该有.
+
+## 硬性规则
+
+1. **任何 trigger 集群 ep_bench / mpirun / sweep / 多 GPU 测试的命令, 前面必须 chain 一个 kill stale step** (在 *同一条* 一次性聚合命令内).
+
+2. **kill step 必须**:
+   - 覆盖**所有参与节点** (head + 全部 worker trays)
+   - 用按进程名 kill (`pkill -9 ep_bench; pkill -9 mpirun`), 不带 `-f` (避免 self-kill, 见 `remote-command-pitfalls.mdc`)
+   - `ssh -n` (避免 stdin 吞 in for-loop, 见 `remote-command-pitfalls.mdc`)
+   - 通过 head_tray 跳板访问 worker trays (jumphost 通常只 trust head, 见 `cluster-env-discovery-first.mdc`)
+   - chain 用 `&&` 让 kill 失败时 sweep 不跑
+
+3. **不允许的拆步模式**:
+   - "step 1: 跑 ps 看一下" + "step 2: 看输出后再 kill" + "step 3: kill 完后跑 sweep"
+   - "我已经 kill 干净了, 直接跑 sweep" (没 evidence)
+   - 给 sweep 命令前**不**包含 kill 前缀, 期待用户自己 kill
+
+4. **唯一例外**:
+   - 用户明确说 "binary 还在 build, 别 kill" -> 这时 kill ep_bench/mpirun 也 OK (build 跑 nvcc, 名字不匹配), 仍可以加 kill 前缀
+   - 用户明确说 "保留当前 stale 用来 debug" -> 不 kill, 走诊断 path
+   - 命令本身**不是 bench / sweep** (e.g., 单纯 `ps`, `ls`, `cat log`) -> 不需要 kill 前缀
+
+## 标准模板
+
+集群 bench 命令必须长这样:
+
+```bash
+# Single-shot: kill 4 trays + trigger sweep
+ssh -i $KEY fizhang@$HEAD_TRAY 'for tray in $HEAD $T2 $T3 $T4; do
+  ssh -n -o StrictHostKeyChecking=no $tray "pkill -9 ep_bench; pkill -9 mpirun; sleep 2"
+done' && \
+curl -sL $WRAPPER_URL | TRAYS="$HEAD $T2 $T3 $T4" TOKENS="..." bash 2>&1 | tee /tmp/sweep.log; \
+tail -60 /tmp/sweep.log
+```
+
+## 反模式 (本会话踩过)
+
+- 给 user "step 1 ps -> 等回复 -> step 2 kill -> 等回复 -> step 3 sweep" 的拆步, 多浪费 2 个 round-trip.
+- 假设 user 已 kill, 给 sweep 命令没 kill 前缀, 后面 sweep hang 才回头查 stale.
+- ps 验证后跟 user 说 "看起来还有 stale, 你要不要 kill", 让 user 二次确认.
+
+## 自检清单 (每次 cluster bench 命令必过)
+
+- [ ] 命令是不是 trigger ep_bench / mpirun / sweep / NCCL multi-GPU 测试? 是的话**必须**有 kill 前缀.
+- [ ] kill step 是不是 *单条命令内* `&&` chain, 不是拆成多步?
+- [ ] kill 是不是覆盖**所有**参与节点? 不只 head_tray.
+- [ ] kill 用 `pkill -9 ep_bench` (无 -f), `ssh -n`?
+- [ ] 用户有没有明确说不要 kill (build 中 / debugging stale)? 没说就**默认 kill**.
+
+任一答 No, 重写命令.
+
+## 与现有规则的关系
+
+- `verify-clean-gpu-before-benchmark.mdc`: 跑 bench 前要 ps + 验证. 这条规则升级它: **不只验证, 直接 kill 进 chain**, 不分两步.
+- `remote-command-pitfalls.mdc`: pkill / ssh 命令的具体陷阱.
+- `cluster-env-discovery-first.mdc`: 知道 head_tray 是哪个, jumphost 只 trust head.
+- `one-step-at-a-time.mdc`: 能聚合就一步搞定. 这条规则给"集群 bench"具体例子.
+
+四条规则形成集群 bench 命令的强制 prefix 链:
+
+```
+集群环境层  cluster-env-discovery-first       <- 知道 trays 是谁
+集群状态层  kill-stale-before-bench-always    <- 直接 kill (这条 NEW)
+命令安全层  remote-command-pitfalls           <- 命令本身别自爆
+聚合层      one-step-at-a-time                <- 全部塞一条
+```
+
+其中"集群状态层"从 `verify-clean-gpu-before-benchmark` 的 "ps 验证" 升级到 "直接 kill 进 chain".
