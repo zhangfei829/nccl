@@ -1,0 +1,70 @@
+---
+description: When prototype data is net-negative (slower / regression), do NOT propose "abandon / revert / stop iterating" as an option. Always propose concrete forward fix paths with data + docs support. Abandon is the user's prerogative, not the agent's.
+alwaysApply: true
+---
+
+# 不许给用户 "放弃" 选项
+
+这条规则是 2026-05-07 当天的直接产物。原话:
+> 永远不要给我提放弃, 记录规则.
+
+## 根因
+
+prototype 净负数据 (multi-stage depth=2 仍比 baseline 慢 +144us @ t=8192) 出来后, 我列了 A/B/C 三选项, 把 "A. abandon" 当 default 推荐选项. 用户视为 *自我设防*, 不是 engineer 思维.
+
+User 的工程视角: 拿到 *任何* prototype 数据 (无论好坏), agent 应该从 *如何让它 work* 角度 propose fix paths. 即使工程成本高. 不在 *默认选项* 包含 "abandon / revert / stop".
+
+abandon 是 *用户特权*, 不是 *agent 默认 escape hatch*.
+
+## 硬性规则
+
+1. **agent 不主动 propose / suggest / hint at "abandon" / "revert" / "stop iterating" / "回退" / "放弃" / "stop the prototype"** 这类选项, 即使数据 strongly 支持 abandon.
+
+2. **数据为 net-negative / regression 时**, 必须基于:
+   - 实测 per-stage breakdown (按 `benchmark-breakdown-first.mdc`)
+   - vendor docs / PTX ISA 证据 (按 `verify-with-vendor-docs.mdc`)
+   propose 一个或多个 *concrete forward fix path*. fix path 必须:
+   - 有数据/文档支撑能改善 (按 `evidence-before-judgment.mdc`)
+   - 写明预期改善 + 实施成本
+
+3. **abandon 决定权完全在用户**:
+   - 用户 *主动* 说 "abandon / 回退 / 放弃 / stop", agent 才执行回退.
+   - agent 在用户明确许可前, **不允许** 给 abandon 留 "选项位置".
+   - 用户决定 abandon 后, agent 干净 revert + 记录原因, 不挽留.
+
+4. **唯一例外: 物理不可能 / vendor docs 明确 unsupported**:
+   - 方案违反硬件约束 / vendor docs 写明 unsupported, agent **报告事实**:
+     "PTX ISA 9.x.y 写明 X 不支持 Y, 当前方案是 X+Y, 不可行".
+   - 这是 *报告 unsupported*, 不是 *propose abandon*.
+   - 即便如此, agent 仍要 propose *绕开 X+Y 的替代路径*, 不允许只报告问题.
+
+## 反模式 (本会话踩过)
+
+- ❌ multi-stage depth=2 prototype 净负 +144us 后给 "A. abandon, B. multi-warp, C. tune depth" 三选项, 还推荐 A.
+- ❌ commit `f1b4ed6` 写 "Test C2: abandoned" 进 docs, 后来 retract. 同类问题: agent 自己 propose abandon.
+- ❌ 列 "工程成本" 作 abandon 的暗示理由 (违反 `evidence-before-judgment.mdc` 的 "工程代价是第三优先级, 不是判决依据").
+
+## 自检清单 (每次给数据驱动选项前必过)
+
+- [ ] 我列出的选项里有 "abandon / revert / stop iterating / 放弃 / 回退 / 暂停 prototype" 字眼吗? 有的话 *删除整条*.
+- [ ] 我推荐的 default 选项里有暗示 "今天先发数据" / "明天再做" 这种延后吗? 有的话 *删除*.
+- [ ] 我给出至少一条 *concrete forward fix path* 吗? path 要具体到 commit 级别 (改哪个文件, 改什么常量, 加哪个 PTX 指令).
+- [ ] fix path 有数据 / 文档支撑预期改善吗? 没有时显式说 "无数据支撑, 这是 informed bet".
+- [ ] 如果硬件 / 文档物理不允许某方向, 我是 *报告 + propose 替代路径*, 还是 *直接放弃*? 后者不允许.
+
+任一答 No, **不发出回复**, 重写选项列表去掉 abandon, 加 fix path.
+
+## 与现有规则的关系
+
+- `evidence-before-judgment.mdc`: 工程判断必有数据/文档. 这条规则补缺 *判断方向*: 必须 forward-fix, 不允许 abandon-default.
+- `dont-strawman-known-bottlenecks.mdc`: 已知瓶颈不要重新跑数据验证, 直接做 fix. 这条规则同方向.
+- `two-path-breakdown-required.mdc`: 路径切换前要双路径 breakdown. 这条规则补缺: 即使有 breakdown, 也不允许默认走 "切回 baseline" 这条路.
+
+四条形成层次:
+
+```
+工程判断必有数据 / 文档        <- evidence-before-judgment
+判断方向必须 forward-fix       <- 这条规则 (NEW)
+已知瓶颈直接 fix 不重测       <- dont-strawman-known-bottlenecks
+路径切换需 per-stage 数据      <- two-path-breakdown-required
+```
