@@ -174,6 +174,27 @@ echo
 echo "===== baseline/results.csv ====="
 cat "\$OUT/baseline/results.csv" 2>/dev/null || true
 echo
+echo "===== NCCL_EP env/header lines ====="
+if [[ -n "$REMOTE_LOG" && -f "$REMOTE_LOG" ]]; then
+    grep -h "NCCL_EP_\\* envs\\|NCCL_EP_HT_PROFILE\\|HT NV72 tuning" "$REMOTE_LOG" || echo "NO NCCL_EP env/header lines"
+else
+    echo "NO remote run log"
+fi
+echo
+echo "===== HT-PROFILE lines ====="
+if grep -h "\\[HT-PROFILE\\]" "\$OUT"/baseline/*.log 2>/dev/null; then
+    :
+else
+    echo "NO HT-PROFILE lines"
+fi
+echo
+echo "===== WARN/ERROR/FAIL lines ====="
+if [[ -n "$REMOTE_LOG" && -f "$REMOTE_LOG" ]]; then
+    grep -h -E "WARN|ERROR|FAIL" "$REMOTE_LOG" || echo "NO WARN/ERROR/FAIL lines in run log"
+else
+    echo "NO remote run log"
+fi
+echo
 echo "===== phase-specific best from existing cell CSVs ====="
 python3 - <<'PY'
 import csv, glob, re

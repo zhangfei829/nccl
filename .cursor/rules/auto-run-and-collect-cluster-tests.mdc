@@ -17,7 +17,11 @@ Provide or create a **single jumphost-side automation** that:
 4. Builds all required stages (`make src.build` before `make -C contrib/nccl_ep` for NCCL EP).
 5. Runs the benchmark with the requested reduced scope.
 6. Collects remote logs and CSVs back to a stable local/jumphost directory.
-7. Prints summary tables directly, including best config and speedup.
+7. Greps all expected diagnostic markers from logs (for example `[HT-PROFILE]`,
+   `[FM-PROFILE]`, `ERROR`, `WARN`, `FAIL`) and prints them in the final
+   summary. If a requested diagnostic marker is missing, print `NO ... lines`
+   explicitly and include the env/header proving whether it was enabled.
+8. Prints summary tables directly, including best config and speedup.
 
 For NCCL EP manual 4-BAY GB300 testing, the canonical script is:
 
@@ -37,11 +41,18 @@ contrib/nccl_ep/sweep/jumphost_ep16_4bay_auto.sh
 - Do not hand the user one command for setup, then another for run, then another for collection when a single script can do all of it.
 - Do not ask the user to manually copy paths out of logs when the script can discover the latest output directory.
 - Do not make the user paste raw CSVs if the automation can print the pivot/summary table.
+- Do not tell the user to run a second grep for profile/debug lines after the
+  benchmark completed. If the profile was requested, the automation must collect
+  profile lines in the same run.
 
 ## Checklist before responding
 
 - [ ] Is there a one-command path from jumphost?
 - [ ] Does it collect `baseline/results.csv`, `ht_nv72_calibrate.csv`, and the run log?
+- [ ] If a profile/debug env is requested, does it grep the expected marker
+      from all logs and print either matching lines or `NO <marker> lines`?
+- [ ] Does the final summary include the relevant env/header lines that prove
+      the profile/debug env reached the remote run?
 - [ ] Does it print phase-specific best and single-config D+C best?
 - [ ] Are FULLMESH and FP8 excluded unless explicitly requested?
 - [ ] Are tokens and dtype defaults aligned with the latest user constraint?
