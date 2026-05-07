@@ -36,6 +36,9 @@ if [[ ! -f "$EP_SWEEP" ]]; then
     echo "[ht_nv72_focused_validate] ERROR: $EP_SWEEP not found" >&2
     exit 2
 fi
+NCCL_REPO="${NCCL_REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+NCCL_HOME="${NCCL_HOME:-$NCCL_REPO/build}"
+export NCCL_HOME
 
 COMBINED_CSV="$OUT/ht_nv72_focused_validate.csv"
 : > "$COMBINED_CSV"
@@ -48,6 +51,7 @@ HT NV72 focused validation
   NV72_PAIR_LIST   : $NV72_PAIR_LIST
   REPEATS          : $REPEATS
   OUT              : $OUT
+  NCCL_HOME        : $NCCL_HOME
   HOSTFILE_OVERRIDE: ${HOSTFILE_OVERRIDE:-<unset, will use SLURM_JOB_NODELIST>}
 ===========================================================
 EOF

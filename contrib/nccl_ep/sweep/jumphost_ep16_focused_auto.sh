@@ -85,6 +85,8 @@ export MPI_HOME=/usr/mpi/gcc/openmpi-4.1.9a1
 export PATH=\$MPI_HOME/bin:/usr/local/cuda/bin:\$PATH
 export LD_LIBRARY_PATH=\$MPI_HOME/lib:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:\${LD_LIBRARY_PATH:-}
 export CUDA_HOME=/usr/local/cuda
+export NCCL_REPO=/home/fizhang/nccl
+export NCCL_HOME=/home/fizhang/nccl/build
 curl -sL "$REMOTE_RUNBOOK_URL" -o /tmp/run_ep16_4bay.sh
 TRAYS="$TRAYS" SKIP_BASELINE=1 SKIP_NV72_CALIBRATE=1 bash /tmp/run_ep16_4bay.sh
 REMOTE
@@ -97,6 +99,8 @@ export MPI_HOME=/usr/mpi/gcc/openmpi-4.1.9a1
 export PATH=\$MPI_HOME/bin:/usr/local/cuda/bin:\$PATH
 export LD_LIBRARY_PATH=\$MPI_HOME/lib:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:\${LD_LIBRARY_PATH:-}
 export CUDA_HOME=/usr/local/cuda
+export NCCL_REPO=/home/fizhang/nccl
+export NCCL_HOME=/home/fizhang/nccl/build
 
 cd /home/fizhang/nccl
 git fetch origin master && git reset --hard origin/master

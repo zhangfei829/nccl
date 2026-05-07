@@ -67,6 +67,9 @@ if [[ ! -f "$EP_SWEEP" ]]; then
     echo "[ht_nv72_calibrate] ERROR: $EP_SWEEP not found" >&2
     exit 2
 fi
+NCCL_REPO="${NCCL_REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+NCCL_HOME="${NCCL_HOME:-$NCCL_REPO/build}"
+export NCCL_HOME
 
 COMBINED_CSV="$OUT/ht_nv72_calibrate.csv"
 : > "$COMBINED_CSV"
@@ -78,6 +81,7 @@ echo "  TOKENS           : $TOKENS"
 echo "  NV72_NUM_SMS_LIST: $NV72_NUM_SMS_LIST"
 echo "  NV72_CHUNK_LIST  : $NV72_CHUNK_LIST"
 echo "  OUT              : $OUT"
+echo "  NCCL_HOME        : $NCCL_HOME"
 echo "  HOSTFILE_OVERRIDE: ${HOSTFILE_OVERRIDE:-<unset, will use SLURM_JOB_NODELIST>}"
 echo "==========================================================="
 
