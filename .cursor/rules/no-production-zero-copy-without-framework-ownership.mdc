@@ -1,0 +1,51 @@
+---
+description: Do not propose production zero-copy for NCCL EP by registering user output buffers unless framework tensor ownership changes are allowed
+alwaysApply: true
+---
+
+# NCCL EP zero-copy: registering user output buffers is not production-feasible without framework changes
+
+This rule was added after EP16 HT profiling showed large D2D copy costs and we discussed zero-copy. The user explicitly rejected "register OUTPUT/user buffer" as infeasible because it requires changing framework tensor ownership / allocator behavior.
+
+## Hard rule
+
+Do **not** propose production zero-copy that requires:
+
+- registering arbitrary framework-owned `recv_x` / `expert_out` tensors for peer access;
+- wrapping NCCL EP internal buffers as framework tensors;
+- changing the framework allocator so expert kernels read/write EP-owned storage;
+- changing expert compute output contract.
+
+Those are framework behavior changes and are out of scope unless the user explicitly reopens that design.
+
+## Current production constraint
+
+Assume the framework contract is fixed:
+
+```text
+EP dispatch writes user-owned recv_x
+expert compute reads recv_x and writes user-owned expert_out
+EP combine reads expert_out
+```
+
+Under this contract, the two D2D copies measured in HT are API tax:
+
+```text
+dispatch output_copy: internal IPC/fabric buffer -> user recv_x
+combine  input_copy : user expert_out -> internal IPC/fabric buffer
+```
+
+Optimization must work **without** changing this contract.
+
+## Allowed directions
+
+- Pipeline/overlap the required copies with chunked kernel work if correctness allows.
+- Improve copy scheduling, split copies into chunks, or move copy into a kernel/TMA path while preserving user-visible tensor semantics.
+- Reduce bytes or improve layout/alignment.
+- Add measurement first (`NCCL_EP_HT_PROFILE`) and prove overlap/savings with stage data.
+
+## Disallowed directions
+
+- Benchmark-only no-copy shortcuts that bypass user tensors and cannot map to production.
+- Per-iteration peer registration/import of user output tensors as the main optimization path; registration overhead and framework ownership make it non-viable.
+- Claiming "zero-copy" when the framework still owns ordinary tensors and no allocator/ownership contract changed.
