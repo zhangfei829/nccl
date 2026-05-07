@@ -1,0 +1,95 @@
+---
+description: Engineering judgments (bottleneck, design quality, abandon decisions) must be grounded in vendor docs or measured data; code grep / type / analogy / intuition is not enough
+alwaysApply: true
+---
+
+# 做出判断之前先有客观资料和数据
+
+这条规则是 2026-05-07 当天的直接产物。原话:
+> 写入规则, 做出判断之前基于客观资料和数据再说
+
+## 根因
+
+我做 TMA dispatch overlap prototype 时, 给出过判断:
+> "1 warp / lane-0 serial issue is a known anti-pattern; HT/DeepEP production
+> kernels avoid it. Even with the race fixed, this design would not beat the
+> existing copy engine path."
+
+这个判断的 *证据来源*:
+- HT 代码用多 warp G2S/S2G (代码 grep)
+- 我对 TMA 的模糊记忆 ("warp 多 issue 就快")
+
+完全没有 *客观资料*:
+- 没查 PTX ISA 9.7.9.25.6.1 (cp.async.bulk.commit_group)
+- 没查 PTX ISA 9.7.9.25.6.2 (cp.async.bulk.wait_group)
+
+完全没有 *实测数据*:
+- prototype 还没跑过 (hang 了)
+- baseline vs overlap 的 dispatch_avg / output_copy 都没拿到
+
+用户质疑 "和单个 WARP 有毛关系, 你到底懂不懂" 后我去查 PTX ISA, 发现:
+- cp.async.bulk 是 **per-thread async**, 由 TMA hardware (async proxy) 执行
+- 单 thread issue 多个 cp.async.bulk, commit_group 把它们成组, **组内无 ordering 保证, 并行执行**
+- wait_group N 让任意多 group 同时 in-flight
+
+issue 端不是 throughput bottleneck. 我的 "lane-0 是已知瓶颈" 判断**直接错误**, 连带的 abandon 决定也是 a-priori 推断, 不是数据驱动.
+
+## 硬性规则: 工程判断必有 (a) 文档 OR (b) 数据
+
+"工程判断" 包括但不限于:
+
+- "X 是性能瓶颈"
+- "Y 设计是糟糕的 / 已知 anti-pattern"
+- "方案 Z 不可行 / 应该 abandon"
+- "A 比 B 快 / 慢"
+- "硬件支持 / 不支持 P"
+- "改动 Q 一定 / 大概率 / 不可能 work"
+
+下结论前必须满足之一:
+
+1. **官方文档证据**: vendor docs / PTX ISA / Driver API / SDK guide 的具体 section + 引用关键句子. 没引用 = 没证据.
+2. **实测数据证据**: 跑过的 benchmark / profile 输出, 含具体 us / GB/s / cycles 数字. 跑前的预测不算数据.
+
+**禁止**单独基于以下做出判断:
+
+- 代码 grep ("HT 这样写所以 X 是瓶颈")
+- 类型 / 注释 推断 ("代码 comment 说 not yet supported")
+- 类比 ("DeepEP 这么做所以最优")
+- 直觉 / 记忆 ("我觉得 lane-0 issue 会慢")
+- 编译时间长短 ("编译 20 分钟所以是病态" -- 没 baseline 不算)
+
+## 当文档与数据都没有时
+
+明示 "我没有文档证据也没有实测, 这是基于 [代码 grep / 类比 / 直觉] 的间接推断, 强度不够下结论". 然后:
+
+- 要么先去查文档 (走 `verify-with-vendor-docs.mdc`)
+- 要么先跑数据 (走 `benchmark-breakdown-first.mdc`)
+- 要么把决策权交回用户 ("我没数据, 是否要先 micro-benchmark 再决定?")
+
+不允许用 "经验上" / "通常" / "应该" 作为最终证据.
+
+## 反模式 (这次踩的)
+
+- ❌ 基于 HT 代码用多 warp 推断 "单 warp lane-0 是瓶颈", 没去查 PTX cp.async.bulk 是不是 per-thread async
+- ❌ 用 "已知 anti-pattern" 这个标签把 prototype 关掉, 而 *已知* 这个状态本身没文档支撑
+- ❌ 在 prototype hang 还没跑通 / 没 baseline 对比数据时, 写 "abandon" 的 docs commit
+- ❌ 用规则 `dont-strawman-known-bottlenecks.mdc` 反向给自己的错误判断背书
+
+## 自检清单 (每次下工程判断前必过)
+
+- [ ] 我下的是 *工程判断* 还是 *事实陈述*? (前者必须走这条规则)
+- [ ] 我的判断有 (a) 官方文档 URL + 具体 section / 句子引用?
+- [ ] 或者有 (b) 实测数据 + 具体数字 (us / GB/s / cycles)?
+- [ ] 如果 (a) (b) 都没有, 我有没有显式说 "无证据, 这是间接推断"?
+- [ ] 当判断会触发 *回退 / abandon / 切换路径* 等 high-stakes 决策时, 双倍证据 (文档 + 数据 都要)?
+
+任一答 No, 不准下判断. 先去查 / 先去跑 / 先告诉用户 "我没证据".
+
+## 与现有规则的关系
+
+- `verify-with-vendor-docs.mdc`: 文档证据来源的具体形式 (PTX / API / SDK)
+- `no-unfounded-speculation.mdc`: 事实陈述的证据要求 (X 存在/不存在)
+- `benchmark-breakdown-first.mdc`: 实测数据来源的具体形式 (per-stage timing)
+- `two-path-breakdown-required.mdc`: 路径切换的数据要求 (双路径 breakdown)
+
+这条规则是 *上层元规则*, 把 "工程判断" 这个动作本身约束到 (a)+(b) 任一上, 防止 a-priori 推断在做出 high-stakes 决策时被当作证据。
