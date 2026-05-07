@@ -609,69 +609,54 @@ void dispatch_impl(
                 auto kp = build_dispatch_param<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>(params);
 
                 if constexpr (NUM_LSA_TEAMS == 1) {
-#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
-                    // Dev-only focused build for the overlap prototype.  Do
-                    // not instantiate the full NUM_SMS x CHUNK matrix here:
-                    // the production matrix is compiled in normal builds, and
-                    // the overlap experiment only needs the validated large
-                    // token cases (32,128) and (64,128).
-                    if constexpr (std::is_same<TOKEN_DATA_TYPE, uint16_t>::value) {
-                        if (num_blocks == 32 && chunk_tokens == 128) {
-                            if (params.user_output_token != nullptr) {
-                                HybridEPType::template dispatch<
-                                    TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                    128,
-                                    32,
-                                    FORWARD_DISPATCH,
-                                    true>(kp, stream);
-                            } else {
-                                HybridEPType::template dispatch<
-                                    TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                    128,
-                                    32,
-                                    FORWARD_DISPATCH,
-                                    false>(kp, stream);
-                            }
-                        } else if (num_blocks == 64 && chunk_tokens == 128) {
-                            if (params.user_output_token != nullptr) {
-                                HybridEPType::template dispatch<
-                                    TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                    128,
-                                    64,
-                                    FORWARD_DISPATCH,
-                                    true>(kp, stream);
-                            } else {
-                                HybridEPType::template dispatch<
-                                    TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                    128,
-                                    64,
-                                    FORWARD_DISPATCH,
-                                    false>(kp, stream);
-                            }
-                        } else {
-                            // Focused overlap dev build intentionally supports
-                            // only the two large-token configs under test.
-                            assert(false && "NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP supports only (32,128) and (64,128)");
-                        }
-                    } else {
-                        assert(false && "NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP is BF16-only");
-                    }
-#else
-                    // NV72 / MNNVL full-coverage tuning path. Only the
-                    // single-LSA-domain template gets the expanded
-                    // NUM_BLOCKS x CHUNK instantiations; RDMA/multi-domain
-                    // paths keep their production constants to avoid compile
-                    // time explosion and behavior drift.
+                    // NV72 / MNNVL full-coverage tuning path. Single-LSA-domain
+                    // gets the expanded NUM_BLOCKS x CHUNK instantiations;
+                    // RDMA/multi-domain paths keep production constants to
+                    // avoid compile time explosion.
+                    //
+                    // ENABLE_TMA_COPY=true is opt-in via macro and limited to
+                    // BF16 + (32,128) / (64,128) only, so the rest of the
+                    // matrix only gets the ENABLE_TMA_COPY=false instance.
+                    // This keeps default builds untouched and macro-on builds
+                    // bounded to a few extra instantiations.
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
+#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
+                            constexpr bool kAllowTmaCopy =
+                                std::is_same<TOKEN_DATA_TYPE, uint16_t>::value &&
+                                ((NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
+                                 (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128));
+                            if constexpr (kAllowTmaCopy) {
+                                if (params.user_output_token != nullptr) {
+                                    HybridEPType::template dispatch<
+                                        TOKEN_DATA_TYPE,
+                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                        CHUNK_TOKENS_TUNED,
+                                        NUM_BLOCKS_TUNED,
+                                        FORWARD_DISPATCH,
+                                        true>(kp, stream);
+                                } else {
+                                    HybridEPType::template dispatch<
+                                        TOKEN_DATA_TYPE,
+                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                        CHUNK_TOKENS_TUNED,
+                                        NUM_BLOCKS_TUNED,
+                                        FORWARD_DISPATCH,
+                                        false>(kp, stream);
+                                }
+                            } else {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    false>(kp, stream);
+                            }
+#else
                             HybridEPType::template dispatch<
                                 TOKEN_DATA_TYPE,
                                 HYBRIDEP_DISPATCH_NUM_OF_STAGES,
@@ -680,9 +665,9 @@ void dispatch_impl(
                                 NUM_BLOCKS_TUNED,
                                 FORWARD_DISPATCH,
                                 false>(kp, stream);
+#endif
                         });
                     });
-#endif
                 } else {
                     HybridEPType::template dispatch<
                         TOKEN_DATA_TYPE,
