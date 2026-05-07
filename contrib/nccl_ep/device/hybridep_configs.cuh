@@ -27,39 +27,56 @@
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE 4
 
-// Experimental dispatch output copy-overlap path.  Peer ranks still write this
-// rank's internal HT output buffer; a local copy warp copies ready output
-// chunks from internal buffer to the user recv_x buffer inside dispatch kernel.
-// Keep small: this is meant to test overlap, not to steal many warps from the
-// main G2S/S2G pipeline.
-#define HYBRIDEP_DISPATCH_TMA_COPY_WARPS 1
+// Experimental dispatch output copy-overlap path.  Peer ranks still write
+// this rank's internal HT output buffer; the COPY warp group inside
+// dispatch_kernel copies ready output chunks from internal buffer to the
+// user recv_x buffer.
+//
+// Multi-warp design (per the 2026-05-07 PTX-driven redesign):
+//   The bottleneck of the depth=2 single-warp prototype was issue-side
+//   sequential overhead: lane 0 sequentially executes wait_mbar -> fence
+//   -> issue_s2g -> commit_group -> wait_group_read -> issue_g2s_prefetch
+//   (~6 PTX ops, ~9 us per token round).  PTX ISA 9.7.9.25.6.1 says the
+//   bulk async-group is per-thread, so 4 lanes (one per warp) can issue
+//   in parallel and each tracks its own in-flight group.  Multi-warp =
+//   4x issue rate, saturating the TMA hardware that was previously idle
+//   on single-warp.
+//
+//   Each warp owns 1 ring slot (single-stage per warp); 4 warps total
+//   = 4 in-flight transfers system-wide.  Token assignment: warp w
+//   handles tokens w, w+4, w+8, ...  No cross-warp mbarrier is needed
+//   because each warp uses its own slot, mbarrier and commit-group.
+#define HYBRIDEP_DISPATCH_TMA_COPY_WARPS 4
 #define HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE 1
 #define HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS 32
 
-// Multi-stage producer/consumer pipeline depth for TMA copy.  Enables
-// overlap of g2s (internal -> shared) and s2g (shared -> user) by keeping
-// multiple cp.async.bulk operations in flight at once.  PTX ISA 9.7.9.25.6
-// guarantees per-thread async-group tracking, so a single lane (lane 0) can
-// issue this many in-flight bulk transfers.  Each stage costs:
-//
-//   smem buffer: TOKENS_PER_STAGE * hidden_dim * sizeof(token_dtype)
-//   mbarrier:    8 bytes
-//
-// Depth=2 keeps the pipeline simple (one in-flight g2s while s2g is reading
-// the other slot's smem).  Larger depths were tried but blow the sm_103 max
-// dynamic smem budget (~228 KiB) when stacked on top of the main G2S/S2G
-// pipeline's ~212 KiB token+prob+s2d buffers.  Depth=2 + reduced main
-// NUM_OF_STAGES_OVERLAP fits within budget; see hybridep_adapter.cu where
-// ENABLE_TMA_COPY=true instances are launched with NUM_OF_STAGES_OVERLAP.
-#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES 2
+// Per-warp ring depth.  1 means single-stage within each warp (g2s and
+// s2g serialise inside the warp), but 4 warps in parallel give 4 total
+// in-flight transfers, hiding the per-warp wait_group_read<0> cost.
+#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES 1
 
-// Reduced main G2S/S2G pipeline depth used only by the ENABLE_TMA_COPY=true
-// dispatch_kernel instance.  Saves (12 - 10) * hidden * sizeof(token) bytes
-// of smem to make room for the TMA copy ring buffer.  Must be divisible by
-// HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK (2) and yield a
-// stages_per_pipeline > HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G (4); 10 / 2
-// = 5 stages_per_pipeline > 4 satisfies that.
-#define HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP 10
+// Reduced main G2S/S2G pipeline depth used only by ENABLE_TMA_COPY=true
+// dispatch_kernel instances.  Frees smem for the 4-slot TMA copy ring
+// buffer (4 * hidden * sizeof(token) = 56 KiB at hidden=7168 BF16).
+//
+// SMEM budget for ENABLE_TMA_COPY=true (64,128) BF16:
+//   main token  : 8 stages * 14 KiB = 112 KiB
+//   main prob   : 8 KiB
+//   s2d         : 32 KiB
+//   TMA ring    : 4 slots * 14 KiB = 56 KiB
+//   total       : ~208 KiB                  fits sm_103 ~228 KiB
+//
+// 8 / NUM_PIPELINES=2 = 4 stages_per_pipeline.  The static_assert in
+// S2G_warp_group_device_function requires NUM_OF_IN_FLIGHT_S2G <
+// stages_per_pipeline (strictly), so we need a reduced in-flight count
+// for the overlap path (see HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP
+// below).
+#define HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP 8
+
+// Reduced in-flight S2G depth for ENABLE_TMA_COPY=true dispatch_kernel.
+// Default (4) doesn't fit because NUM_OF_STAGES_OVERLAP=8 / NUM_PIPELINES=2
+// = 4 stages_per_pipeline, and the assertion is < (strict).
+#define HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP 3
 
 
 // ============================================================================

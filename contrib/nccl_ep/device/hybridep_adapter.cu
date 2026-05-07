@@ -642,7 +642,7 @@ void dispatch_impl(
                                     HybridEPType::template dispatch<
                                         TOKEN_DATA_TYPE,
                                         HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
-                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP,
                                         CHUNK_TOKENS_TUNED,
                                         NUM_BLOCKS_TUNED,
                                         FORWARD_DISPATCH,
@@ -693,16 +693,18 @@ void dispatch_impl(
                         if constexpr (kAllowTmaCopy) {
                             if (params.user_output_token != nullptr) {
                                 // ENABLE_TMA_COPY=true instance uses the
-                                // reduced NUM_OF_STAGES_OVERLAP (10 vs 12)
-                                // to free smem room for the TMA copy ring
-                                // buffer.  Without this reduction
+                                // reduced NUM_OF_STAGES_OVERLAP (8 vs 12)
+                                // and NUM_OF_IN_FLIGHT_S2G_OVERLAP (3 vs 4)
+                                // to free smem room for the 4-warp TMA
+                                // copy ring buffer (4 slots * 14 KiB =
+                                // 56 KiB).  Without these reductions
                                 // cudaFuncSetAttribute returns 'invalid
                                 // argument' on sm_103 because total smem
-                                // exceeds the per-block max.
+                                // exceeds the per-block max ~228 KiB.
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
                                     HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP,
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
                                     FORWARD_DISPATCH,

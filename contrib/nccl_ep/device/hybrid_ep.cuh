@@ -3723,50 +3723,56 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
     return;
   }
 
-  const int lane = COPY_GROUP::thread_rank() & 31;
-  const int num_chunks = (num_tokens_for_experts + dispatch_copy_chunk_tokens - 1) /
-                         dispatch_copy_chunk_tokens;
-  constexpr int kCopyTokensPerStage = HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE;
-  constexpr int kNumStages = HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES;
-  const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
-
-  // Multi-stage producer/consumer pipeline executed by lane 0 only.  Other
-  // lanes return early; cp.async.bulk + mbarrier are per-thread async (PTX
-  // ISA 9.7.9.25.6.1 "creates a new per-thread bulk async-group"), so a
-  // single lane can keep kNumStages bulk operations in flight against the
-  // TMA hardware engine.
+  // Multi-warp design: COPY group has HYBRIDEP_DISPATCH_TMA_COPY_WARPS
+  // warps; each warp's lane 0 acts as an independent issuer for one ring
+  // slot.  Token assignment: warp w handles tokens [w, w+NUM_WARPS,
+  // w+2*NUM_WARPS, ...] within each chunk.  This parallelises the
+  // ~6-PTX-op sequential overhead per token round across NUM_WARPS lanes,
+  // saturating the TMA hardware engine that was idle in the single-warp
+  // prototype.
   //
-  // Race analysis:
-  //   - Initial prefetch issues kNumStages g2s into slots [0..kNumStages-1].
-  //   - At round k:
-  //       wait mbarrier[k%N] (g2s tx-complete for token k)
-  //       fence_proxy_async (smem write -> read transition for the slot)
-  //       issue s2g(slot k%N), commit_group
-  //       cp_async_bulk_wait_group_read<kNumStages-1>: bound in-flight
-  //         s2g read to kNumStages-1, freeing slot (k+1) % N's smem
-  //         (its previous s2g_(k-N+1) read is now done).
-  //       prefetch g2s for token (k+1) into slot (k+1) % N if available
-  //         (only takes effect at round k >= kNumStages-1, when wait_group
-  //         _read actually waited and freed a slot).
+  // Per-thread async-group tracking (PTX ISA 9.7.9.25.6.1) means each
+  // warp's lane 0 has an INDEPENDENT bulk async-group, so wait_group_read
+  // <0> in one warp does NOT affect another warp's in-flight ops.
   //
-  //   The key invariant: slot s' = (k+1) % N's most recent s2g (group
-  //   k - N + 1, slot s') is read-done before we overwrite smem[s'] with
-  //   the next g2s.  See PTX ISA 9.7.9.25.6.2 wait_group .read modifier.
+  // Race analysis (per warp): each warp owns its own slot and mbarrier.
+  //   - Initial prefetch: issue g2s into slot warp_id, mbarrier_arrive.
+  //   - Per round (this warp's tokens only):
+  //       wait mbarrier[warp_id] (g2s tx-complete)
+  //       fence_proxy_async (smem write -> read transition)
+  //       issue s2g(slot warp_id), commit_group
+  //       cp_async_bulk_wait_group_read<0>: wait until this warp's s2g
+  //         read of smem[warp_id] is done before reusing the slot
+  //       if more tokens: prefetch g2s for next assigned token into
+  //         smem[warp_id], mbarrier_arrive_expect_tx (next phase)
   //
   // Epoch-counter synchronization, per-dispatch copy range:
   //   - dispatch_copy_ready[chunk_id] and dispatch_copy_expected[chunk_id]
   //     are CUMULATIVE counters across the bench loop (host never resets
-  //     them per-dispatch; see nccl_ep.cc rationale).  Used only to wait
-  //     for THIS dispatch's S2G writes into chunk_id to be done.
+  //     them per-dispatch).  Used only to wait for THIS dispatch's S2G
+  //     writes into chunk_id to be done.  All warps' lane 0 spin on the
+  //     same shared counter (each load is a global ld.acquire; readers do
+  //     not contend with each other).
   //   - The actual copy range is bounded by num_tokens_for_experts (THIS
   //     dispatch's active recv-token count), so the COPY warp group never
   //     re-copies stale rows that earlier dispatches left in the internal
   //     IPC buffer.
-  if (lane != 0) return;
+  const int warp_id = COPY_GROUP::warp_rank();   // 0..NUM_WARPS-1
+  const int lane    = COPY_GROUP::thread_rank() & 31;
 
-  uint32_t phase[kNumStages];
-  #pragma unroll
-  for (int s = 0; s < kNumStages; s++) phase[s] = 0;
+  if (lane != 0) return;  // each warp's lane 0 does work; rest of warp idles
+
+  const int num_chunks = (num_tokens_for_experts + dispatch_copy_chunk_tokens - 1) /
+                         dispatch_copy_chunk_tokens;
+  constexpr int kCopyTokensPerStage = HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE;
+  constexpr int kNumWarps           = HYBRIDEP_DISPATCH_TMA_COPY_WARPS;
+  const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
+
+  // Each warp's lane 0 owns slot=warp_id and mbarrier=warp_id.  Phase is
+  // a single-bit toggle per warp (single-stage within the warp).
+  uint32_t phase = 0;
+  void*     smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(warp_id);
+  uint64_t* mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(warp_id);
 
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     const int chunk_start = chunk_id * dispatch_copy_chunk_tokens;
@@ -3780,7 +3786,9 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
     const uint32_t expected = dispatch_copy_expected[chunk_id];
     if (expected == 0) continue;
 
-    // Wait for cross-rank S2G writes into this chunk_id to land.
+    // Wait for cross-rank S2G writes into this chunk_id to land.  All
+    // warps' lane 0 spin on the same global counter (independent ld.acquire
+    // operations; no cross-warp contention).
     uint32_t ready = 0;
     do {
       asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
@@ -3789,20 +3797,19 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
                    : "memory");
     } while (ready < expected);
 
-    // Initial prefetch: prime kNumStages slots with the first kNumStages
-    // tokens (or fewer if chunk_active < kNumStages).
-    int issued = 0;
-    #pragma unroll
-    for (int s = 0; s < kNumStages; s++) {
-      const int token_off = s * kCopyTokensPerStage;
-      if (token_off >= chunk_active) break;
-      const int cur_tokens = (chunk_active - token_off) < kCopyTokensPerStage
-                                 ? (chunk_active - token_off)
+    // Token assignment for this warp: tokens [warp_id, warp_id + kNumWarps,
+    // warp_id + 2*kNumWarps, ...] within this chunk.
+    const int my_first_token = warp_id * kCopyTokensPerStage;
+    if (my_first_token >= chunk_active) continue;
+
+    // Initial prefetch: this warp's first assigned token into its slot.
+    {
+      const int cur_tokens = (chunk_active - my_first_token) < kCopyTokensPerStage
+                                 ? (chunk_active - my_first_token)
                                  : kCopyTokensPerStage;
       const int copy_bytes = cur_tokens * bytes_per_token;
-      const size_t elem_offset = static_cast<size_t>(chunk_start + token_off) * HIDDEN_DIM;
-      void* smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(s);
-      uint64_t* mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(s);
+      const size_t elem_offset =
+          static_cast<size_t>(chunk_start + my_first_token) * HIDDEN_DIM;
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_shared,
           cuda::ptx::space_global,
@@ -3815,29 +3822,25 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
                                            cuda::ptx::space_shared,
                                            mbar_s,
                                            static_cast<uint32_t>(copy_bytes));
-      issued = s + 1;
     }
 
-    // Main pipeline loop.
-    const int total_rounds = (chunk_active + kCopyTokensPerStage - 1) / kCopyTokensPerStage;
-    for (int r = 0; r < total_rounds; r++) {
-      const int token_off = r * kCopyTokensPerStage;
-      const int s = r % kNumStages;
+    // Main pipeline loop for this warp.  Each warp processes tokens
+    // [my_first_token, my_first_token + kNumWarps, ...] until chunk_active.
+    for (int my_token = my_first_token; my_token < chunk_active;
+         my_token += kNumWarps * kCopyTokensPerStage) {
 
-      uint64_t* mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(s);
-      void* smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(s);
-
-      // Wait g2s tx-complete for this slot.
-      while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase[s])) {}
-      phase[s] ^= 1;
+      // Wait g2s tx-complete on this warp's slot.
+      while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase)) {}
+      phase ^= 1;
       cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
 
-      // Issue s2g from this slot.
-      const int cur_tokens = (chunk_active - token_off) < kCopyTokensPerStage
-                                 ? (chunk_active - token_off)
+      // Issue s2g from this warp's slot.
+      const int cur_tokens = (chunk_active - my_token) < kCopyTokensPerStage
+                                 ? (chunk_active - my_token)
                                  : kCopyTokensPerStage;
       const int copy_bytes = cur_tokens * bytes_per_token;
-      const size_t elem_offset = static_cast<size_t>(chunk_start + token_off) * HIDDEN_DIM;
+      const size_t elem_offset =
+          static_cast<size_t>(chunk_start + my_token) * HIDDEN_DIM;
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global,
           cuda::ptx::space_shared,
@@ -3846,41 +3849,36 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
           static_cast<uint32_t>(copy_bytes));
       cuda::ptx::cp_async_bulk_commit_group();
 
-      // Bound in-flight s2g read to kNumStages-1.  At round r >= kNumStages-1
-      // this frees slot (r+1) % kNumStages (its previous s2g read done).
-      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<kNumStages - 1>{});
+      // Wait this warp's s2g read of its own slot done before reusing
+      // smem.  Per-thread async-group tracking ensures other warps'
+      // in-flight ops are not affected.
+      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
 
-      // Prefetch the next un-issued token into the just-freed slot.
-      // The freed slot equals issued % kNumStages (== (r + 1) % kNumStages
-      // in steady state).  No prefetch needed if all tokens already issued.
-      if (r >= kNumStages - 1 && issued < total_rounds) {
-        const int next_token_off = issued * kCopyTokensPerStage;
-        const int next_slot = issued % kNumStages;
-        const int next_cur_tokens = (chunk_active - next_token_off) < kCopyTokensPerStage
-                                       ? (chunk_active - next_token_off)
+      // Prefetch this warp's next assigned token (if any) into its slot.
+      const int next_token = my_token + kNumWarps * kCopyTokensPerStage;
+      if (next_token < chunk_active) {
+        const int next_cur_tokens = (chunk_active - next_token) < kCopyTokensPerStage
+                                       ? (chunk_active - next_token)
                                        : kCopyTokensPerStage;
         const int next_copy_bytes = next_cur_tokens * bytes_per_token;
         const size_t next_elem_offset =
-            static_cast<size_t>(chunk_start + next_token_off) * HIDDEN_DIM;
-        void* next_smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(next_slot);
-        uint64_t* next_mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(next_slot);
+            static_cast<size_t>(chunk_start + next_token) * HIDDEN_DIM;
         cuda::ptx::cp_async_bulk(
             cuda::ptx::space_shared,
             cuda::ptx::space_global,
-            next_smem_s,
+            smem_s,
             reinterpret_cast<const void*>(internal_output_token + next_elem_offset),
             static_cast<uint32_t>(next_copy_bytes),
-            next_mbar_s);
+            mbar_s);
         cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
                                              cuda::ptx::scope_cta,
                                              cuda::ptx::space_shared,
-                                             next_mbar_s,
+                                             mbar_s,
                                              static_cast<uint32_t>(next_copy_bytes));
-        issued++;
       }
     }
 
-    // Drain any remaining s2g writes before exiting this chunk.
+    // Drain this warp's s2g (each warp's groups are independent).
     cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
   }
 }
