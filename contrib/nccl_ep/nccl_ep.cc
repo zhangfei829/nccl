@@ -3385,10 +3385,14 @@ ncclResult_t ncclEpDispatch(
         const bool recv_x_tma_aligned =
             recv_x != nullptr &&
             ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
+#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
         const bool ht_dispatch_tma_copy_enabled =
             ht_dispatch_tma_copy && !use_fp8 && recv_x != nullptr &&
             recv_x->datatype == ncclBfloat16 && recv_x_tma_aligned &&
             group->ht_buffers.use_fabric_memory;
+#else
+        const bool ht_dispatch_tma_copy_enabled = false;
+#endif
         params.dispatch_copy_ready_ptrs = group->ht_buffers.dispatch_copy_ready_buffer_ptrs;
         params.user_output_token = ht_dispatch_tma_copy_enabled ? recv_x->data : nullptr;
         params.user_output_num_tokens = ht_dispatch_tma_copy_enabled ? static_cast<int>(recv_x->sizes[0]) : 0;

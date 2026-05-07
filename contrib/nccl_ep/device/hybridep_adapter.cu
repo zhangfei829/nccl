@@ -577,6 +577,7 @@ void dispatch_impl(
                     // time explosion and behavior drift.
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
+#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                             if constexpr (std::is_same<TOKEN_DATA_TYPE, uint16_t>::value) {
                                 if (params.user_output_token != nullptr) {
                                     HybridEPType::template dispatch<
@@ -610,6 +611,16 @@ void dispatch_impl(
                                     FORWARD_DISPATCH,
                                     false>(kp, stream);
                             }
+#else
+                            HybridEPType::template dispatch<
+                                TOKEN_DATA_TYPE,
+                                HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                CHUNK_TOKENS_TUNED,
+                                NUM_BLOCKS_TUNED,
+                                FORWARD_DISPATCH,
+                                false>(kp, stream);
+#endif
                         });
                     });
                 } else {
