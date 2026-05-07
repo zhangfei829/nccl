@@ -30,12 +30,18 @@ INCFLAGS = -I. -I./include -I./device -I$(BUILDDIR)/include -I$(BUILDDIR)/includ
 # GIN (Global Input Network) support - adds multinode RDMA capabilities
 
 
+# Optional developer-only flags for focused experiments, e.g.
+#   EXTRA_NVCCFLAGS=-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
+#   EXTRA_CXXFLAGS=-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
+EXTRA_NVCCFLAGS ?=
+EXTRA_CXXFLAGS ?=
+
 # Rebuild NVCUFLAGS with our NVCC_GENCODE (after INCFLAGS is complete)
 # Add --expt-relaxed-constexpr for std::max, std::min, etc. in device code
 # CUDA code MUST use -fvisibility=hidden for kernel registration to work correctly.
 # The ncclEp* API is in nccl_ep.cc (compiled with CXXFLAGS), so it still gets exported.
-NVCUFLAGS := $(NVCC_GENCODE) $(INCFLAGS) --expt-relaxed-constexpr --compiler-options "-fPIC -fvisibility=hidden" -ccbin $(CXX) $(CXXSTD)
-CXXFLAGS += $(INCFLAGS) -fPIC -fvisibility=default
+NVCUFLAGS := $(NVCC_GENCODE) $(EXTRA_NVCCFLAGS) $(INCFLAGS) --expt-relaxed-constexpr --compiler-options "-fPIC -fvisibility=hidden" -ccbin $(CXX) $(CXXSTD)
+CXXFLAGS += $(EXTRA_CXXFLAGS) $(INCFLAGS) -fPIC -fvisibility=default
 
 # Dependency generation flags for automatic header tracking
 DEPFLAGS = -MMD -MP
