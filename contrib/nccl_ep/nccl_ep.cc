@@ -252,6 +252,7 @@ struct ncclEpGroup {
     // switches in hybridep_adapter.cu; non-NV72 HT ignores the env vars.
     int ht_nv72_num_sms;
     int ht_nv72_chunk_tokens;
+    bool ht_nv72_env_override;
     // Number of SMs to use for FULLMESH kernels (dispatch / combine push /
     // combine reduce / combine fused). Default 16 to match
     // HYBRIDEP_MAX_NUM_SMS_PER_RANK so HT vs FM benchmark is apples-to-apples
@@ -457,6 +458,7 @@ struct ncclEpGroup {
         num_sms_ht(0),
         ht_nv72_num_sms(16),
         ht_nv72_chunk_tokens(HT_OF_NUM_TOKENS_PER_CHUNK),
+        ht_nv72_env_override(false),
         fullmesh_num_sms(0),
         fullmesh_dispatch_path(nccl_ep::fullmesh::DispatchPath::kTma),
         fullmesh_prof_dispatch_dev(nullptr),
@@ -1884,9 +1886,13 @@ ncclResult_t ncclEpCreateGroup(
     // small runtime switches in hybridep_adapter.cu.
     ep_group->ht_nv72_num_sms = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS;
     ep_group->ht_nv72_chunk_tokens = HT_OF_NUM_TOKENS_PER_CHUNK;
+    ep_group->ht_nv72_env_override = false;
     if (hybridep_mode && ep_group->ht_buffers.use_fabric_memory) {
         const char* sms_env = std::getenv("NCCL_EP_HT_NV72_NUM_SMS");
         const char* chunk_env = std::getenv("NCCL_EP_HT_NV72_CHUNK");
+        ep_group->ht_nv72_env_override =
+            (sms_env != nullptr && sms_env[0] != '\0') ||
+            (chunk_env != nullptr && chunk_env[0] != '\0');
 
         auto parse_allowed = [](const char* v, int def, int a, int b, int c) -> int {
             if (v == nullptr || v[0] == '\0') return def;
@@ -1901,10 +1907,11 @@ ncclResult_t ncclEpCreateGroup(
 
         if (ep_group->rank == 0) {
             fprintf(stderr,
-                    "[NV72-ADAPT] HT NV72 tuning: num_sms=%d chunk=%d "
+                    "[NV72-ADAPT] HT NV72 tuning: num_sms=%d chunk=%d override=%s "
                     "(env NCCL_EP_HT_NV72_NUM_SMS=%s NCCL_EP_HT_NV72_CHUNK=%s)\n",
                     ep_group->ht_nv72_num_sms,
                     ep_group->ht_nv72_chunk_tokens,
+                    ep_group->ht_nv72_env_override ? "yes" : "no",
                     sms_env ? sms_env : "<unset, default 16>",
                     chunk_env ? chunk_env : "<unset, default 64>");
             fflush(stderr);
@@ -2401,6 +2408,36 @@ static bool tensor_is_contiguous(ncclNDTensor_t tensor) {
         if (tensor->strides[i] != 1)
             return false;
     return true;
+}
+
+static inline void select_ht_nv72_tuning(
+    ncclEpGroup_t group,
+    int num_tokens,
+    bool use_fp8,
+    int* num_sms,
+    int* chunk_tokens
+) {
+    *num_sms = group->ht_nv72_num_sms;
+    *chunk_tokens = group->ht_nv72_chunk_tokens;
+
+    // Only the MNNVL full-coverage HT path has the expanded template set.
+    if (!group->ht_buffers.use_fabric_memory) return;
+    // Manual env vars are a strong override for A/B and emergency fallback.
+    if (group->ht_nv72_env_override) return;
+    // Tuning data collected so far is BF16-only. Keep FP8 on production
+    // defaults until it has its own sweep.
+    if (use_fp8) return;
+
+    if (num_tokens >= 8192) {
+        *num_sms = 64;
+        *chunk_tokens = 128;
+    } else if (num_tokens >= 4096) {
+        *num_sms = 32;
+        *chunk_tokens = 128;
+    } else {
+        *num_sms = HYBRIDEP_DISPATCH_NUM_OF_BLOCKS;
+        *chunk_tokens = HT_OF_NUM_TOKENS_PER_CHUNK;
+    }
 }
 
 // static const ncclNDTensor_t* find_tensor_by_tag(const ncclNDTensor_t* const* tensors, int num_tensors, ncclEpTensorTag_t tag) {
@@ -3277,6 +3314,11 @@ ncclResult_t ncclEpDispatch(
         params.node_rank = group->node_id;
         params.num_tokens_per_rank = handle->num_tokens;
 
+        int ht_nv72_num_sms = 0;
+        int ht_nv72_chunk_tokens = 0;
+        select_ht_nv72_tuning(group, handle->num_tokens, use_fp8,
+                              &ht_nv72_num_sms, &ht_nv72_chunk_tokens);
+
         // Call dispatch kernel
         nccl_ep::hybridep::call_dispatch(
             params,
@@ -3284,8 +3326,8 @@ ncclResult_t ncclEpDispatch(
             group->nNodes,
             use_fp8,
             forward_dispatch,
-            group->ht_nv72_num_sms,
-            group->ht_nv72_chunk_tokens,
+            ht_nv72_num_sms,
+            ht_nv72_chunk_tokens,
             stream
         );
 
@@ -3902,14 +3944,19 @@ ncclResult_t ncclEpCombine(
         params.num_tokens_per_rank = num_combined_tokens;
         params.num_recv_tokens = num_tokens;
 
+        int ht_nv72_num_sms = 0;
+        int ht_nv72_chunk_tokens = 0;
+        select_ht_nv72_tuning(group, handle->num_tokens, handle->use_fp8,
+                              &ht_nv72_num_sms, &ht_nv72_chunk_tokens);
+
         /* ===== Call combine kernel ===== */
         nccl_ep::hybridep::call_combine(
             params,
             group->config.max_tokens_per_rank, // max_tokens_per_rank
             group->nNodes, // num_nodes (RDMA domain size)
             backward_combine, // backward mode flag
-            group->ht_nv72_num_sms,
-            group->ht_nv72_chunk_tokens,
+            ht_nv72_num_sms,
+            ht_nv72_chunk_tokens,
             stream
         );
 
