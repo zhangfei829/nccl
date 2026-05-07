@@ -52,6 +52,15 @@ SSH_BASE=(ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept
 
 mkdir -p "$LOCAL_OUT"
 
+# Forward all NCCL_EP_* variables from the jumphost into the remote runbook.
+# The remote ep_sweep.sh will then forward them again into mpirun children.
+NCCL_EP_REMOTE_EXPORTS=""
+for _v in $(compgen -e | grep '^NCCL_EP_' || true); do
+    _val="${!_v}"
+    printf -v _q '%q' "$_val"
+    NCCL_EP_REMOTE_EXPORTS+="export ${_v}=${_q}; "
+done
+
 cat <<EOF
 ===========================================================
 Jumphost EP16 4-BAY automation
@@ -64,6 +73,7 @@ Jumphost EP16 4-BAY automation
   SKIP_BASELINE       : $SKIP_BASELINE
   SKIP_NV72_CALIBRATE : $SKIP_NV72_CALIBRATE
   INCLUDE_FULLMESH    : $INCLUDE_FULLMESH
+  NCCL_EP_* envs      : ${NCCL_EP_REMOTE_EXPORTS:-<none>}
   LOCAL_OUT      : $LOCAL_OUT
 ===========================================================
 EOF
@@ -110,6 +120,7 @@ export MPI_HOME=/usr/mpi/gcc/openmpi-4.1.9a1
 export PATH=\$MPI_HOME/bin:/usr/local/cuda/bin:\$PATH
 export LD_LIBRARY_PATH=\$MPI_HOME/lib:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:\${LD_LIBRARY_PATH:-}
 export CUDA_HOME=/usr/local/cuda
+$NCCL_EP_REMOTE_EXPORTS
 
 curl -sL "$REMOTE_RUNBOOK_URL" -o /tmp/run_ep16_4bay.sh
 
