@@ -1,0 +1,115 @@
+---
+description: Before comparing benchmark numbers (especially across days / commits), verify GPU/cluster state is clean (no stale ep_bench / mpirun / hung kernels); a regression claim without this check is not evidence
+alwaysApply: true
+---
+
+# 对照 benchmark 数据之前必须先确认 GPU 状态干净
+
+这条规则是 2026-05-07 当天的直接产物。
+
+## 根因
+
+我看到对照数据:
+
+```
+03:10:48 (history)   t=128 d_kernel = 121 us
+11:00:20 (this run)  t=128 d_kernel = 2526 us   <- 21x slower
+```
+
+直接判断 "macro-on build 引入 21x regression", 还基于这个判断写了几个 commit, 让用户多花 ~30 分钟跑 force-rebuild macro-off baseline 来验证.
+
+后来 ssh 上去 ps 才发现:
+
+```
+fizhang 45863  09:13  mpirun ... ep_bench ...    <- 已经跑了 2h 36 min
+fizhang 45870..73     ep_bench (CPU 99%)          <- 4 个 spin 进程
+fizhang 52176  09:39  mpirun ... ep_bench ...    <- 跑了 2h 10 min
+fizhang 52184..87     ep_bench (CPU 99%)
+```
+
+这是更早 jumphost_ep16_tma_overlap_compare.sh hang 残留的 16 个 spin 进程 (跨 4 trays). 它们占用:
+
+- GPU compute (4 ep_bench/tray * 4 trays, CPU 99% spin)
+- IPC fabric memory (mega buffer 没释放)
+- cross-rank sync flags
+
+11:00 baseline 跑的是被污染的 GPU, cross-rank wait 时间被 stale 进程拖累. **跟 build 无关**.
+
+我之前那条规则 `evidence-before-judgment.mdc` 要求"工程判断必有数据", 但**没规定数据采集前要验证环境状态**. 这条补缺的环境状态 check.
+
+## 硬性规则: 对照数据 / 跑 benchmark 之前必做 GPU 状态 check
+
+在做以下任一动作前, 必须先在 *所有参与 benchmark 的节点* 上跑 `ps` 检查无 stale 进程:
+
+1. 跑新 benchmark sweep 之前
+2. 拿 *新数据* vs *历史数据* 对照下结论之前
+3. 任何"X 比 Y 慢/快"的判断之前 (X 和 Y 是不同时间 / 不同 commit / 不同 build flag 的数据)
+
+**check 内容**:
+
+- `ps -ef | grep -E "ep_bench|mpirun|cuda" | grep -v grep` — 不应有 stale 进程
+- 如果有 *正在跑的* ep_bench 不属于本次任务, 必须先 kill 干净, 等 fabric memory release
+- 多节点 benchmark 必须**遍历所有节点** check, 不能只看 head node
+
+**check 时机**:
+
+- benchmark 跑之前 — 防止数据被污染
+- 对照数据之前 — 防止用被污染数据下错误结论
+
+## 实操命令模板
+
+跨 N 个 tray 检查 + 杀 stale:
+
+```bash
+for tray in $TRAYS; do
+  echo "=== $tray ==="
+  ssh -i $KEY $USER@$tray '
+    ps -ef | grep -E "ep_bench|mpirun" | grep -v grep | head -5
+  '
+done
+```
+
+如有 stale, 杀掉:
+
+```bash
+for tray in $TRAYS; do
+  ssh -i $KEY $USER@$tray '
+    pkill -9 -f "ep_bench --algorithm" 2>/dev/null || true
+    pkill -9 mpirun 2>/dev/null || true
+    sleep 1
+    ps -ef | grep -E "ep_bench|mpirun" | grep -v grep | head -3 || echo "(clean)"
+  '
+done
+```
+
+## 反模式 (这次踩的)
+
+- 看到对照数据 21x 差异立刻下 "macro-on regression" 判断, 没去 ps
+- 让用户重新 force-rebuild macro-off 对照 (浪费 ~15 min build 时间), 而真正问题只需 ps + pkill 就能定位
+- 把 "macro-on regression" 写进 abandon doc commit (另一次违规, 见 `evidence-before-judgment.mdc`)
+
+## 自检清单 (每次对照 benchmark 数据 / 跑 benchmark 必过)
+
+- [ ] 当前对照的两组数据是否在 *相同 GPU 状态* 下采集? 如果跨天, 不一定相同
+- [ ] 我有没有跑过 `ps` 在所有节点上确认无 stale ep_bench / mpirun?
+- [ ] 如果有 stale, 我有没有先 kill + 重跑 benchmark, 还是直接用了被污染数据?
+- [ ] 多节点 benchmark, 我有没有遍历所有节点 check, 还是只看 head node?
+- [ ] 当 benchmark 数据"看起来慢"或"看起来异常方差大"时, 我第一反应是去看代码改动, 还是先去 ps 看机器状态?
+
+任一答 No, 不准下 *性能对比* 类判断, 也不准开始下一轮 benchmark.
+
+## 与现有规则的关系
+
+- `evidence-before-judgment.mdc` (元规则): 工程判断必有 docs / 数据证据
+- `cluster-env-discovery-first.mdc`: 跨集群命令前先发现环境 (hostname, path, user)
+- 这条规则: 数据本身可能被污染, 用之前必须验证 GPU / cluster 进程状态干净
+
+三条形成层次:
+
+```
+集群环境 (谁、在哪)        <- cluster-env-discovery-first
+集群状态 (干净否)            <- 这条规则
+判断依据 (docs / 数据)       <- evidence-before-judgment
+```
+
+任何 high-stakes 判断 (regression / abandon / 切换路径) 必须三层全过.
