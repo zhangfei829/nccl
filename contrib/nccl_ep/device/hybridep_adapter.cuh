@@ -312,6 +312,18 @@ void call_dispatch(
     int chunk_tokens,           // HT tokens per chunk template value
     cudaStream_t stream);
 
+// Optional HT dispatch output copy prototype. Copies the local HT internal
+// dispatch output buffer into the caller's recv_x using a TMA global->shared
+// then shared->global path. This is a benchmark/optimization experiment guarded
+// by NCCL_EP_HT_DISPATCH_TMA_COPY=1 at the host layer.
+void launch_dispatch_output_tma_copy_bf16(
+    const void* src,
+    void* dst,
+    int num_tokens,
+    int hidden,
+    int num_blocks,
+    cudaStream_t stream);
+
 // ============================================================================
 // Combine wrapper with template parameter resolution
 // ============================================================================

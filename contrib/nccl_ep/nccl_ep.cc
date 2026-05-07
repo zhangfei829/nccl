@@ -3357,11 +3357,28 @@ ncclResult_t ncclEpDispatch(
             assert(recv_x->ndim == 2 && tensor_is_contiguous(recv_x));
             size_t copy_size = static_cast<size_t>(recv_x->sizes[0]) * recv_x->sizes[1] * ncclTypeSize(recv_x->datatype);
 
-            CUDA_CHECK(cudaMemcpyAsync(recv_x->data,
-                group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],
-                copy_size,
-                cudaMemcpyDeviceToDevice,
-                stream));
+            static const bool ht_dispatch_tma_copy = [](){
+                const char* v = std::getenv("NCCL_EP_HT_DISPATCH_TMA_COPY");
+                return v != nullptr && v[0] != '0' && v[0] != '\0';
+            }();
+            const bool recv_x_tma_aligned =
+                ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
+            if (ht_dispatch_tma_copy && !use_fp8 &&
+                recv_x->datatype == ncclBfloat16 && recv_x_tma_aligned) {
+                nccl_ep::hybridep::launch_dispatch_output_tma_copy_bf16(
+                    group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],
+                    recv_x->data,
+                    static_cast<int>(recv_x->sizes[0]),
+                    static_cast<int>(recv_x->sizes[1]),
+                    ht_nv72_num_sms,
+                    stream);
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(recv_x->data,
+                    group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],
+                    copy_size,
+                    cudaMemcpyDeviceToDevice,
+                    stream));
+            }
         }
         if (ht_prof_d) CUDA_CHECK(cudaEventRecord(ev_h4, stream));
 

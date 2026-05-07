@@ -13,10 +13,98 @@
 #include "hybridep_adapter.cuh"
 #include "hybridep_configs.cuh"
 #include "hybrid_ep.cuh"
+#include "device_primitives.cuh"
 #include "include/common.hpp"
+#include <cstdint>
+#include <cstdio>
 
 namespace nccl_ep {
 namespace hybridep {
+
+namespace {
+
+__global__ void dispatch_output_tma_copy_bf16_kernel(
+    const uint16_t* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int num_tokens,
+    int hidden,
+    int copy_tokens_per_iter)
+{
+    extern __shared__ uint8_t smem_raw[];
+    uint16_t* smem = reinterpret_cast<uint16_t*>(smem_raw);
+    const int bytes_per_token = hidden * static_cast<int>(sizeof(uint16_t));
+    const int bytes_per_iter = copy_tokens_per_iter * bytes_per_token;
+    uint64_t* mbar = reinterpret_cast<uint64_t*>(smem_raw + bytes_per_iter);
+
+    if (threadIdx.x == 0) {
+        mbarrier_init(mbar, 1);
+        fence_barrier_init();
+    }
+    __syncthreads();
+
+    uint32_t phase = 0;
+    const int num_chunks = (num_tokens + copy_tokens_per_iter - 1) / copy_tokens_per_iter;
+    for (int chunk = blockIdx.x; chunk < num_chunks; chunk += gridDim.x) {
+        const int token_start = chunk * copy_tokens_per_iter;
+        const int remaining_tokens = num_tokens - token_start;
+        const int cur_tokens = remaining_tokens < copy_tokens_per_iter ? remaining_tokens : copy_tokens_per_iter;
+        const int copy_bytes = cur_tokens * bytes_per_token;
+        const size_t elem_offset = static_cast<size_t>(token_start) * hidden;
+
+        if (threadIdx.x == 0) {
+            cuda::ptx::cp_async_bulk(
+                cuda::ptx::space_shared,
+                cuda::ptx::space_global,
+                reinterpret_cast<void*>(smem),
+                reinterpret_cast<const void*>(src + elem_offset),
+                static_cast<uint32_t>(copy_bytes),
+                mbar);
+            mbarrier_arrive_and_expect_tx(mbar, copy_bytes);
+            mbarrier_wait(mbar, phase);
+
+            tma_store_1d(
+                reinterpret_cast<const void*>(smem),
+                reinterpret_cast<void*>(dst + elem_offset),
+                copy_bytes);
+            tma_store_wait<0>();
+        }
+        __syncthreads();
+    }
+}
+
+} // namespace
+
+void launch_dispatch_output_tma_copy_bf16(
+    const void* src,
+    void* dst,
+    int num_tokens,
+    int hidden,
+    int num_blocks,
+    cudaStream_t stream)
+{
+    if (src == nullptr || dst == nullptr || num_tokens <= 0 || hidden <= 0) return;
+    const int bytes_per_token = hidden * static_cast<int>(sizeof(uint16_t));
+    if ((bytes_per_token & 15) != 0) {
+        fprintf(stderr,
+                "[HT-TMA-COPY] bytes_per_token=%d is not 16B aligned; skip TMA copy\n",
+                bytes_per_token);
+        return;
+    }
+    // Keep dynamic shared memory conservative (<48KiB) to avoid launch-attr
+    // dependencies. 2 tokens @ hidden=7168 bf16 = 28KiB; plus 8B mbarrier.
+    const int copy_tokens_per_iter = 2;
+    const int smem_bytes = copy_tokens_per_iter * bytes_per_token + static_cast<int>(sizeof(uint64_t));
+    int blocks = num_blocks > 0 ? num_blocks : 16;
+    if (blocks > num_tokens) blocks = num_tokens;
+    if (blocks <= 0) return;
+
+    dispatch_output_tma_copy_bf16_kernel<<<blocks, 32, smem_bytes, stream>>>(
+        reinterpret_cast<const uint16_t*>(src),
+        reinterpret_cast<uint16_t*>(dst),
+        num_tokens,
+        hidden,
+        copy_tokens_per_iter);
+}
 
 // ============================================================================
 // Kernel: Convert sparse topk_idx to dense routing map
