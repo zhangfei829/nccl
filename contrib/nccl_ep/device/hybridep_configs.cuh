@@ -36,6 +36,19 @@
 #define HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE 1
 #define HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS 32
 
+// Multi-stage producer/consumer pipeline depth for TMA copy.  Enables
+// overlap of g2s (internal -> shared) and s2g (shared -> user) by keeping
+// multiple cp.async.bulk operations in flight at once.  PTX ISA 9.7.9.25.6
+// guarantees per-thread async-group tracking, so a single lane (lane 0) can
+// issue this many in-flight bulk transfers.  Each stage costs:
+//
+//   smem buffer: TOKENS_PER_STAGE * hidden_dim * sizeof(token_dtype)
+//   mbarrier:    8 bytes
+//
+// For BF16, hidden=7168, TOKENS_PER_STAGE=1, NUM_STAGES=4: ~57 KiB total
+// (well within the SM dynamic smem budget on sm_103).
+#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES 4
+
 
 // ============================================================================
 // Combine configuration constants

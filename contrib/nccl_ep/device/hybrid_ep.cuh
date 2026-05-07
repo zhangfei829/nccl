@@ -254,8 +254,12 @@ struct dispatch_smem_layout_t {
   uint64_t* intra_node_mbarrier_buffer;
   uint64_t* sparse_to_dense_map_mbarrier_buffer;
   uint64_t* S2G_group_mbarrier_buffer;
+  // Multi-stage TMA copy ring buffer: NUM_STAGES contiguous slots, each
+  // sized TOKENS_PER_STAGE * hidden_dim * sizeof(token_dtype).  Stride is
+  // resolved at kernel runtime (depends on hidden_dim/dtype).
   void* dispatch_tma_copy_buffer;
   uint64_t* dispatch_tma_copy_mbarrier_buffer;
+  int dispatch_tma_copy_stage_stride;  // bytes per stage in the ring buffer
 
   int token_buffer_stage_stride;  // bytes
   int prob_buffer_stage_stride;   // bytes
@@ -328,8 +332,16 @@ struct dispatch_smem_layout_t {
   __device__ __forceinline__ void* get_dispatch_tma_copy_buffer() const {
     return dispatch_tma_copy_buffer;
   }
+  __device__ __forceinline__ void* get_dispatch_tma_copy_buffer(int stage) const {
+    return reinterpret_cast<void*>(
+        reinterpret_cast<uint8_t*>(dispatch_tma_copy_buffer) +
+        stage * dispatch_tma_copy_stage_stride);
+  }
   __device__ __forceinline__ uint64_t* get_dispatch_tma_copy_mbar() const {
     return dispatch_tma_copy_mbarrier_buffer;
+  }
+  __device__ __forceinline__ uint64_t* get_dispatch_tma_copy_mbar(int stage) const {
+    return dispatch_tma_copy_mbarrier_buffer + stage;
   }
 };
 
@@ -424,15 +436,18 @@ __device__ dispatch_smem_layout_t create_dispatch_smem_layout(
     offset = (offset + 127) & ~127;
     layout.dispatch_tma_copy_buffer = reinterpret_cast<void*>(
         reinterpret_cast<uint8_t*>(smem_base) + offset);
-    offset += HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE *
-              model.hidden_dim * token_size;
+    layout.dispatch_tma_copy_stage_stride =
+        HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE * model.hidden_dim * token_size;
+    offset += HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES *
+              layout.dispatch_tma_copy_stage_stride;
     offset = (offset + 7) & ~7;
     layout.dispatch_tma_copy_mbarrier_buffer = reinterpret_cast<uint64_t*>(
         reinterpret_cast<uint8_t*>(smem_base) + offset);
-    offset += sizeof(uint64_t);
+    offset += HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES * sizeof(uint64_t);
   } else {
     layout.dispatch_tma_copy_buffer = nullptr;
     layout.dispatch_tma_copy_mbarrier_buffer = nullptr;
+    layout.dispatch_tma_copy_stage_stride = 0;
   }
   return layout;
 }
@@ -488,10 +503,11 @@ static size_t calculate_dispatch_smem_layout_size(
   }
   if (config.dispatch_tma_copy) {
     total_size = (total_size + 127) & ~127;
-    total_size += HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE *
+    total_size += HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES *
+                  HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE *
                   model.hidden_dim * token_size;
     total_size = (total_size + 7) & ~7;
-    total_size += sizeof(uint64_t);
+    total_size += HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES * sizeof(uint64_t);
   }
   // Add padding for alignment
   total_size = (total_size + 127) & ~127;
@@ -3711,23 +3727,47 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
   const int num_chunks = (num_tokens_for_experts + dispatch_copy_chunk_tokens - 1) /
                          dispatch_copy_chunk_tokens;
   constexpr int kCopyTokensPerStage = HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE;
+  constexpr int kNumStages = HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES;
   const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
-  uint32_t phase = 0;
 
+  // Multi-stage producer/consumer pipeline executed by lane 0 only.  Other
+  // lanes return early; cp.async.bulk + mbarrier are per-thread async (PTX
+  // ISA 9.7.9.25.6.1 "creates a new per-thread bulk async-group"), so a
+  // single lane can keep kNumStages bulk operations in flight against the
+  // TMA hardware engine.
+  //
+  // Race analysis:
+  //   - Initial prefetch issues kNumStages g2s into slots [0..kNumStages-1].
+  //   - At round k:
+  //       wait mbarrier[k%N] (g2s tx-complete for token k)
+  //       fence_proxy_async (smem write -> read transition for the slot)
+  //       issue s2g(slot k%N), commit_group
+  //       cp_async_bulk_wait_group_read<kNumStages-1>: bound in-flight
+  //         s2g read to kNumStages-1, freeing slot (k+1) % N's smem
+  //         (its previous s2g_(k-N+1) read is now done).
+  //       prefetch g2s for token (k+1) into slot (k+1) % N if available
+  //         (only takes effect at round k >= kNumStages-1, when wait_group
+  //         _read actually waited and freed a slot).
+  //
+  //   The key invariant: slot s' = (k+1) % N's most recent s2g (group
+  //   k - N + 1, slot s') is read-done before we overwrite smem[s'] with
+  //   the next g2s.  See PTX ISA 9.7.9.25.6.2 wait_group .read modifier.
+  //
   // Epoch-counter synchronization, per-dispatch copy range:
   //   - dispatch_copy_ready[chunk_id] and dispatch_copy_expected[chunk_id]
   //     are CUMULATIVE counters across the bench loop (host never resets
-  //     them per-dispatch; see nccl_ep.cc rationale).  They are used only
-  //     to wait for "this dispatch's S2G writes into chunk_id are done":
-  //     when ready >= expected, the per-dispatch increment that S2G atomic-
-  //     added into ready (one increment per active token written to this
-  //     chunk_id on this receiver) has been observed.
+  //     them per-dispatch; see nccl_ep.cc rationale).  Used only to wait
+  //     for THIS dispatch's S2G writes into chunk_id to be done.
   //   - The actual copy range is bounded by num_tokens_for_experts (THIS
   //     dispatch's active recv-token count), so the COPY warp group never
   //     re-copies stale rows that earlier dispatches left in the internal
-  //     IPC buffer.  Rows written by an earlier dispatch but not by THIS
-  //     dispatch are simply not exposed to the user, since user side reads
-  //     only [0, num_tokens_for_experts).
+  //     IPC buffer.
+  if (lane != 0) return;
+
+  uint32_t phase[kNumStages];
+  #pragma unroll
+  for (int s = 0; s < kNumStages; s++) phase[s] = 0;
+
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     const int chunk_start = chunk_id * dispatch_copy_chunk_tokens;
     const int chunk_end_unbounded = chunk_start + dispatch_copy_chunk_tokens;
@@ -3740,47 +3780,108 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
     const uint32_t expected = dispatch_copy_expected[chunk_id];
     if (expected == 0) continue;
 
-    if (lane == 0) {
-      uint32_t ready = 0;
-      do {
-        asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
-                     : "=r"(ready)
-                     : "l"(__cvta_generic_to_global(dispatch_copy_ready + chunk_id))
-                     : "memory");
-      } while (ready < expected);
+    // Wait for cross-rank S2G writes into this chunk_id to land.
+    uint32_t ready = 0;
+    do {
+      asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                   : "=r"(ready)
+                   : "l"(__cvta_generic_to_global(dispatch_copy_ready + chunk_id))
+                   : "memory");
+    } while (ready < expected);
 
-      for (int off = 0; off < chunk_active; off += kCopyTokensPerStage) {
-        const int cur_tokens = (chunk_active - off) < kCopyTokensPerStage ? (chunk_active - off) : kCopyTokensPerStage;
-        const int copy_bytes = cur_tokens * bytes_per_token;
-        const size_t elem_offset = static_cast<size_t>(chunk_start + off) * HIDDEN_DIM;
-        void* smem = smem_buffer_ptr->get_dispatch_tma_copy_buffer();
-        uint64_t* mbar = smem_buffer_ptr->get_dispatch_tma_copy_mbar();
+    // Initial prefetch: prime kNumStages slots with the first kNumStages
+    // tokens (or fewer if chunk_active < kNumStages).
+    int issued = 0;
+    #pragma unroll
+    for (int s = 0; s < kNumStages; s++) {
+      const int token_off = s * kCopyTokensPerStage;
+      if (token_off >= chunk_active) break;
+      const int cur_tokens = (chunk_active - token_off) < kCopyTokensPerStage
+                                 ? (chunk_active - token_off)
+                                 : kCopyTokensPerStage;
+      const int copy_bytes = cur_tokens * bytes_per_token;
+      const size_t elem_offset = static_cast<size_t>(chunk_start + token_off) * HIDDEN_DIM;
+      void* smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(s);
+      uint64_t* mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(s);
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          smem_s,
+          reinterpret_cast<const void*>(internal_output_token + elem_offset),
+          static_cast<uint32_t>(copy_bytes),
+          mbar_s);
+      cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
+                                           cuda::ptx::scope_cta,
+                                           cuda::ptx::space_shared,
+                                           mbar_s,
+                                           static_cast<uint32_t>(copy_bytes));
+      issued = s + 1;
+    }
 
+    // Main pipeline loop.
+    const int total_rounds = (chunk_active + kCopyTokensPerStage - 1) / kCopyTokensPerStage;
+    for (int r = 0; r < total_rounds; r++) {
+      const int token_off = r * kCopyTokensPerStage;
+      const int s = r % kNumStages;
+
+      uint64_t* mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(s);
+      void* smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(s);
+
+      // Wait g2s tx-complete for this slot.
+      while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase[s])) {}
+      phase[s] ^= 1;
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+
+      // Issue s2g from this slot.
+      const int cur_tokens = (chunk_active - token_off) < kCopyTokensPerStage
+                                 ? (chunk_active - token_off)
+                                 : kCopyTokensPerStage;
+      const int copy_bytes = cur_tokens * bytes_per_token;
+      const size_t elem_offset = static_cast<size_t>(chunk_start + token_off) * HIDDEN_DIM;
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_global,
+          cuda::ptx::space_shared,
+          reinterpret_cast<void*>(user_output_token + elem_offset),
+          reinterpret_cast<const void*>(smem_s),
+          static_cast<uint32_t>(copy_bytes));
+      cuda::ptx::cp_async_bulk_commit_group();
+
+      // Bound in-flight s2g read to kNumStages-1.  At round r >= kNumStages-1
+      // this frees slot (r+1) % kNumStages (its previous s2g read done).
+      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<kNumStages - 1>{});
+
+      // Prefetch the next un-issued token into the just-freed slot.
+      // The freed slot equals issued % kNumStages (== (r + 1) % kNumStages
+      // in steady state).  No prefetch needed if all tokens already issued.
+      if (r >= kNumStages - 1 && issued < total_rounds) {
+        const int next_token_off = issued * kCopyTokensPerStage;
+        const int next_slot = issued % kNumStages;
+        const int next_cur_tokens = (chunk_active - next_token_off) < kCopyTokensPerStage
+                                       ? (chunk_active - next_token_off)
+                                       : kCopyTokensPerStage;
+        const int next_copy_bytes = next_cur_tokens * bytes_per_token;
+        const size_t next_elem_offset =
+            static_cast<size_t>(chunk_start + next_token_off) * HIDDEN_DIM;
+        void* next_smem_s = smem_buffer_ptr->get_dispatch_tma_copy_buffer(next_slot);
+        uint64_t* next_mbar_s = smem_buffer_ptr->get_dispatch_tma_copy_mbar(next_slot);
         cuda::ptx::cp_async_bulk(
             cuda::ptx::space_shared,
             cuda::ptx::space_global,
-            smem,
-            reinterpret_cast<const void*>(internal_output_token + elem_offset),
-            static_cast<uint32_t>(copy_bytes),
-            mbar);
+            next_smem_s,
+            reinterpret_cast<const void*>(internal_output_token + next_elem_offset),
+            static_cast<uint32_t>(next_copy_bytes),
+            next_mbar_s);
         cuda::ptx::mbarrier_arrive_expect_tx(cuda::ptx::sem_release,
                                              cuda::ptx::scope_cta,
                                              cuda::ptx::space_shared,
-                                             mbar,
-                                             static_cast<uint32_t>(copy_bytes));
-        while (!cuda::ptx::mbarrier_try_wait_parity(mbar, phase)) {}
-        phase ^= 1;
-        cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_global,
-            cuda::ptx::space_shared,
-            reinterpret_cast<void*>(user_output_token + elem_offset),
-            reinterpret_cast<const void*>(smem),
-            static_cast<uint32_t>(copy_bytes));
-        cuda::ptx::cp_async_bulk_commit_group();
-        cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+                                             next_mbar_s,
+                                             static_cast<uint32_t>(next_copy_bytes));
+        issued++;
       }
     }
+
+    // Drain any remaining s2g writes before exiting this chunk.
+    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
   }
 }
 
@@ -3846,7 +3947,12 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
       cuda::ptx::mbarrier_init(smem_buffer_ptr->get_S2G_group_mbar(p), 1);
     }
     if constexpr (ENABLE_TMA_COPY) {
-      cuda::ptx::mbarrier_init(smem_buffer_ptr->get_dispatch_tma_copy_mbar(), 1);
+      // Init NUM_STAGES mbarriers for the multi-stage TMA copy ring buffer.
+      // Each stage's mbarrier tracks one in-flight g2s tx-complete (arrival
+      // count = 1).
+      for (int s = 0; s < HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES; s++) {
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_dispatch_tma_copy_mbar(s), 1);
+      }
     }
     cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
   }
