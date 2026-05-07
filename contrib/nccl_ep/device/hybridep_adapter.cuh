@@ -191,6 +191,38 @@ void dense_to_sparse_prob_combine(
         } \
     } while(0)
 
+// Production NV72 cells: select_ht_nv72_tuning only ever picks (16,64) /
+// (32,128) / (64,128).  The full 3x3 matrix above is only needed for
+// calibration sweeps that env-override every cell.  This macro instantiates
+// just the 3 production cells, cutting dispatch/combine kernel
+// instantiations from 9 to 3 (~3x faster compile) for the default build.
+//
+// Calibration build (rebuild with -DNCCL_EP_HT_NV72_FULL_MATRIX) uses the
+// full 9-cell matrix instead -- only needed when re-running the NV72
+// 3x3 sweep with NCCL_EP_HT_NV72_NUM_SMS / NCCL_EP_HT_NV72_CHUNK overrides.
+#define HYBRIDEP_SWITCH_NV72_CELL(num_blocks_val, chunk_tokens_val, ...) \
+    do { \
+        if ((num_blocks_val) == 16 && (chunk_tokens_val) == 64) { \
+            constexpr int NUM_BLOCKS_TUNED = 16; \
+            constexpr int CHUNK_TOKENS_TUNED = 64; \
+            __VA_ARGS__; \
+        } else if ((num_blocks_val) == 32 && (chunk_tokens_val) == 128) { \
+            constexpr int NUM_BLOCKS_TUNED = 32; \
+            constexpr int CHUNK_TOKENS_TUNED = 128; \
+            __VA_ARGS__; \
+        } else if ((num_blocks_val) == 64 && (chunk_tokens_val) == 128) { \
+            constexpr int NUM_BLOCKS_TUNED = 64; \
+            constexpr int CHUNK_TOKENS_TUNED = 128; \
+            __VA_ARGS__; \
+        } else { \
+            assert(false && \
+                "Unsupported NV72 cell in production build; " \
+                "only (16,64) (32,128) (64,128) are instantiated. " \
+                "For env-override calibration sweeps, rebuild with " \
+                "-DNCCL_EP_HT_NV72_FULL_MATRIX (full 9-cell matrix)."); \
+        } \
+    } while(0)
+
 // ============================================================================
 // Preprocessing wrapper with template parameter resolution
 // ============================================================================

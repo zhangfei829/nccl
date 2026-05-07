@@ -609,21 +609,28 @@ void dispatch_impl(
                 auto kp = build_dispatch_param<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>(params);
 
                 if constexpr (NUM_LSA_TEAMS == 1) {
-                    // NV72 / MNNVL full-coverage tuning path. Single-LSA-domain
-                    // gets the expanded NUM_BLOCKS x CHUNK instantiations;
-                    // RDMA/multi-domain paths keep production constants to
-                    // avoid compile time explosion.
+                    // NV72 / MNNVL single-LSA-domain path. Production build
+                    // only instantiates the 3 cells (16,64) / (32,128) /
+                    // (64,128) that select_ht_nv72_tuning ever picks at
+                    // runtime, cutting dispatch_kernel instantiations from 9
+                    // to 3 (and from 36 to 12 once you fold dtype x forward).
+                    //
+                    // Calibration build (rebuild with
+                    // -DNCCL_EP_HT_NV72_FULL_MATRIX) keeps the full 9-cell
+                    // matrix so env overrides like NCCL_EP_HT_NV72_NUM_SMS
+                    // can pick any (NUM_SMS, CHUNK) pair for sweeps.
                     //
                     // ENABLE_TMA_COPY=true is opt-in via macro and limited to
-                    // BF16 + (32,128) / (64,128) only, so the rest of the
-                    // matrix only gets the ENABLE_TMA_COPY=false instance.
-                    // This keeps default builds untouched and macro-on builds
-                    // bounded to a few extra instantiations.
+                    // BF16 + (32,128) / (64,128) only.  The kAllowTmaCopy
+                    // gate is identical in both build flavours so the
+                    // production cells get the right instances either way.
                     //
-                    // Note: preprocessor directives inside macro arguments are
-                    // undefined behavior (ISO C99 6.10.3p11), so the #ifdef
-                    // must wrap the macro call rather than appear in its body.
-#ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
+                    // Note: preprocessor directives inside macro arguments
+                    // are undefined behavior (ISO C99 6.10.3p11), so the
+                    // overlap and full-matrix #ifdef wrap the macro call
+                    // rather than sit inside the body.
+#ifdef NCCL_EP_HT_NV72_FULL_MATRIX
+#  ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
                             constexpr bool kAllowTmaCopy =
@@ -662,7 +669,7 @@ void dispatch_impl(
                             }
                         });
                     });
-#else
+#  else
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
                             HybridEPType::template dispatch<
@@ -675,6 +682,57 @@ void dispatch_impl(
                                 false>(kp, stream);
                         });
                     });
+#  endif
+#else
+#  ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
+                    HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
+                        constexpr bool kAllowTmaCopy =
+                            std::is_same<TOKEN_DATA_TYPE, uint16_t>::value &&
+                            ((NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
+                             (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128));
+                        if constexpr (kAllowTmaCopy) {
+                            if (params.user_output_token != nullptr) {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    true>(kp, stream);
+                            } else {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    false>(kp, stream);
+                            }
+                        } else {
+                            HybridEPType::template dispatch<
+                                TOKEN_DATA_TYPE,
+                                HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                CHUNK_TOKENS_TUNED,
+                                NUM_BLOCKS_TUNED,
+                                FORWARD_DISPATCH,
+                                false>(kp, stream);
+                        }
+                    });
+#  else
+                    HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
+                        HybridEPType::template dispatch<
+                            TOKEN_DATA_TYPE,
+                            HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                            HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                            CHUNK_TOKENS_TUNED,
+                            NUM_BLOCKS_TUNED,
+                            FORWARD_DISPATCH,
+                            false>(kp, stream);
+                    });
+#  endif
 #endif
                 } else {
                     HybridEPType::template dispatch<
@@ -818,7 +876,11 @@ void combine_impl(
                     : HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_S2G;
 
                 if constexpr (NUM_LSA_TEAMS == 1) {
-                    // NV72 / MNNVL full-coverage tuning path only.
+                    // Production: only the 3 NV72 cells select_ht_nv72_tuning
+                    // ever picks.  Calibration build (full 9-cell matrix)
+                    // is gated by NCCL_EP_HT_NV72_FULL_MATRIX, identical
+                    // intent as dispatch_impl above.
+#ifdef NCCL_EP_HT_NV72_FULL_MATRIX
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
                             HybridEPType::template combine<
@@ -831,6 +893,18 @@ void combine_impl(
                                 BACKWARD_COMBINE>(kp, stream);
                         });
                     });
+#else
+                    HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
+                        HybridEPType::template combine<
+                            num_stages_g2s,
+                            num_stages_s2g,
+                            CHUNK_TOKENS_TUNED,
+                            HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                            NUM_BLOCKS_TUNED,
+                            HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                            BACKWARD_COMBINE>(kp, stream);
+                    });
+#endif
                 } else {
                     HybridEPType::template combine<
                         num_stages_g2s,
