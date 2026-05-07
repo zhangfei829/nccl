@@ -3714,10 +3714,31 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
   const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
   uint32_t phase = 0;
 
+  // Epoch-counter synchronization, per-dispatch copy range:
+  //   - dispatch_copy_ready[chunk_id] and dispatch_copy_expected[chunk_id]
+  //     are CUMULATIVE counters across the bench loop (host never resets
+  //     them per-dispatch; see nccl_ep.cc rationale).  They are used only
+  //     to wait for "this dispatch's S2G writes into chunk_id are done":
+  //     when ready >= expected, the per-dispatch increment that S2G atomic-
+  //     added into ready (one increment per active token written to this
+  //     chunk_id on this receiver) has been observed.
+  //   - The actual copy range is bounded by num_tokens_for_experts (THIS
+  //     dispatch's active recv-token count), so the COPY warp group never
+  //     re-copies stale rows that earlier dispatches left in the internal
+  //     IPC buffer.  Rows written by an earlier dispatch but not by THIS
+  //     dispatch are simply not exposed to the user, since user side reads
+  //     only [0, num_tokens_for_experts).
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     const int chunk_start = chunk_id * dispatch_copy_chunk_tokens;
-    int expected = static_cast<int>(dispatch_copy_expected[chunk_id]);
-    if (expected <= 0) continue;
+    const int chunk_end_unbounded = chunk_start + dispatch_copy_chunk_tokens;
+    const int chunk_end = chunk_end_unbounded < num_tokens_for_experts
+                              ? chunk_end_unbounded
+                              : num_tokens_for_experts;
+    const int chunk_active = chunk_end - chunk_start;
+    if (chunk_active <= 0) continue;
+
+    const uint32_t expected = dispatch_copy_expected[chunk_id];
+    if (expected == 0) continue;
 
     if (lane == 0) {
       uint32_t ready = 0;
@@ -3726,10 +3747,10 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
                      : "=r"(ready)
                      : "l"(__cvta_generic_to_global(dispatch_copy_ready + chunk_id))
                      : "memory");
-      } while (ready < static_cast<uint32_t>(expected));
+      } while (ready < expected);
 
-      for (int off = 0; off < expected; off += kCopyTokensPerStage) {
-        const int cur_tokens = (expected - off) < kCopyTokensPerStage ? (expected - off) : kCopyTokensPerStage;
+      for (int off = 0; off < chunk_active; off += kCopyTokensPerStage) {
+        const int cur_tokens = (chunk_active - off) < kCopyTokensPerStage ? (chunk_active - off) : kCopyTokensPerStage;
         const int copy_bytes = cur_tokens * bytes_per_token;
         const size_t elem_offset = static_cast<size_t>(chunk_start + off) * HIDDEN_DIM;
         void* smem = smem_buffer_ptr->get_dispatch_tma_copy_buffer();

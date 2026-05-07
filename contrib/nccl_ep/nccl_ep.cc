@@ -3419,13 +3419,24 @@ ncclResult_t ncclEpDispatch(
         params.user_output_token = ht_dispatch_tma_copy_enabled ? recv_x->data : nullptr;
         params.user_output_num_tokens = ht_dispatch_tma_copy_enabled ? static_cast<int>(recv_x->sizes[0]) : 0;
         params.dispatch_copy_chunk_tokens = HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
-        if (ht_dispatch_tma_copy_enabled) {
-            const int num_copy_chunks =
-                (params.user_output_num_tokens + HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS - 1) /
-                HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
-            CUDA_CHECK(cudaMemsetAsync(group->ht_buffers.dispatch_copy_ready, 0,
-                                       num_copy_chunks * sizeof(uint32_t), stream));
-        }
+        // Epoch-counter design (do NOT reset dispatch_copy_ready here):
+        //   peer ranks may have in-flight IPC atomicAdd writes to this rank's
+        //   dispatch_copy_ready while host code is preparing this dispatch.
+        //   A per-dispatch host memset would race with those writes and the
+        //   COPY warp group would block forever.
+        //   Instead, dispatch_copy_ready is zeroed once at group-create time
+        //   (create_ipc_mega_buffer) and grows monotonically across the bench
+        //   loop.  dispatch_copy_expected is similarly zeroed once at
+        //   handle-init and incremented every dispatch by
+        //   build_dispatch_copy_expected_counts (atomicAdd).  Both counters
+        //   advance in lockstep (per-dispatch active count is identical on
+        //   the producer/S2G side and the per-dispatch expected accumulator),
+        //   so `ready >= expected` becomes true exactly when the current
+        //   dispatch finished writing its share into ready.
+        //   The COPY warp group uses param.num_tokens_for_experts (this
+        //   dispatch's per-receiver active count, written by metadata
+        //   preprocessing) as the actual copy upper bound, so it never
+        //   re-copies stale rows from previous dispatches.
 
         // Call dispatch kernel
         nccl_ep::hybridep::call_dispatch(
