@@ -579,15 +579,29 @@ void dispatch_impl(
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
 #ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                             if constexpr (std::is_same<TOKEN_DATA_TYPE, uint16_t>::value) {
-                                if (params.user_output_token != nullptr) {
-                                    HybridEPType::template dispatch<
-                                        TOKEN_DATA_TYPE,
-                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                        CHUNK_TOKENS_TUNED,
-                                        NUM_BLOCKS_TUNED,
-                                        FORWARD_DISPATCH,
-                                        true>(kp, stream);
+                                constexpr bool TMA_COPY_CASE =
+                                    ((NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
+                                     (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128));
+                                if constexpr (TMA_COPY_CASE) {
+                                    if (params.user_output_token != nullptr) {
+                                        HybridEPType::template dispatch<
+                                            TOKEN_DATA_TYPE,
+                                            HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                            HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                            CHUNK_TOKENS_TUNED,
+                                            NUM_BLOCKS_TUNED,
+                                            FORWARD_DISPATCH,
+                                            true>(kp, stream);
+                                    } else {
+                                        HybridEPType::template dispatch<
+                                            TOKEN_DATA_TYPE,
+                                            HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                            HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                            CHUNK_TOKENS_TUNED,
+                                            NUM_BLOCKS_TUNED,
+                                            FORWARD_DISPATCH,
+                                            false>(kp, stream);
+                                    }
                                 } else {
                                     HybridEPType::template dispatch<
                                         TOKEN_DATA_TYPE,

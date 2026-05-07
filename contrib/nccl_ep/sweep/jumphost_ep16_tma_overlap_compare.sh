@@ -26,6 +26,7 @@ TRAYS="${TRAYS:-pod4-gb300-2-tray05-f3 pod4-gb300-2-tray06-f3 pod4-gb300-2-tray0
 HEAD_TRAY="${HEAD_TRAY:-$(echo "$TRAYS" | awk '{print $1}')}"
 TOKENS="${TOKENS:-4096 8192}"
 BASELINE_MODES="${BASELINE_MODES:-ht_bf16}"
+OVERLAP_CASES="${OVERLAP_CASES:-32:128 64:128}"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/ep16_tma_overlap_${TS}}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
@@ -43,6 +44,7 @@ Jumphost EP16 TMA-overlap comparison
   TRAYS         : $TRAYS
   TOKENS        : $TOKENS
   BASELINE_MODES: $BASELINE_MODES
+  OVERLAP_CASES : $OVERLAP_CASES
   LOCAL_OUT     : $LOCAL_OUT
 ===========================================================
 EOF
@@ -105,8 +107,8 @@ rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
 
 time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
   NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP" \\
   EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP" \\
+  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP" \\
   MPI_HOME=\$MPI_HOME
 REMOTE
 
@@ -133,6 +135,7 @@ cd /home/fizhang/nccl
 OUT="$REMOTE_BASE/$tag" \\
 TRAYS="$TRAYS" \\
 TOKENS="$TOKENS" \\
+NV72_PAIR_LIST="$OVERLAP_CASES" \\
 BASELINE_MODES="$BASELINE_MODES" \\
 SKIP_NV72_CALIBRATE=1 \\
 NCCL_EP_HT_PROFILE=1 \\
