@@ -33,7 +33,7 @@
 #
 # Env overrides:
 #   EP_SIZE             default 16
-#   TOKENS              default "16 32 64 128 256 4096 8192" (full grid)
+#   TOKENS              default "128 256 4096 8192"
 #   NV72_NUM_SMS_LIST   default "16 32 64"
 #   NV72_CHUNK_LIST     default "64 128 256"
 #   OUT                 default $HOME/fizhang/nccl-sweep-<ts>-nv72cal
@@ -53,7 +53,7 @@ set -u
 # DON'T set -e: single cell fail should not kill the whole 9-cell sweep.
 
 EP_SIZE="${EP_SIZE:-16}"
-TOKENS="${TOKENS:-16 32 64 128 256 4096 8192}"
+TOKENS="${TOKENS:-128 256 4096 8192}"
 NV72_NUM_SMS_LIST="${NV72_NUM_SMS_LIST:-16 32 64}"
 NV72_CHUNK_LIST="${NV72_CHUNK_LIST:-64 128 256}"
 TS="$(date +%Y%m%d_%H%M%S)"

@@ -13,8 +13,8 @@
 #   4. Autobuild stage 1: if libnccl.so missing, run `make src.build`.
 #   5. Autobuild stage 2: if libnccl_ep.so / ep_bench missing OR EP source
 #      newer than binary, run `make -C contrib/nccl_ep`.
-#   6. Run baseline sweep: EP=16, MODES="ht_bf16 ht_fp8" by default,
-#      TOKENS="16 32 64 128 256 4096 8192", into $OUT/baseline.
+#   6. Run baseline sweep: EP=16, MODES="ht_bf16" by default,
+#      TOKENS="128 256 4096 8192", into $OUT/baseline.
 #      FULLMESH is disabled by default because EP16 manual 4-BAY testing
 #      observed a hang at t=16; set INCLUDE_FULLMESH=1 only when explicitly
 #      debugging that path.
@@ -39,6 +39,8 @@
 #   CUDA_HOME            default /usr/local/cuda
 #   NVCC_GENCODE         default "-gencode=arch=compute_103,code=sm_103"
 #   TRAYS                default "pod4-gb300-2-tray01..04-f3"
+#   TOKENS               default "128 256 4096 8192"
+#   BASELINE_MODES       default "ht_bf16" (set "ht_bf16 ht_fp8" for FP8)
 #   OUT                  default /home/fizhang/nccl-sweeps/nccl-sweep-<ts>-ep16-4bay
 #   MASTER_CSV           default /home/fizhang/nccl_ep_master.csv
 #   SKIP_BASELINE        set to 1 to skip the baseline sweep
@@ -50,9 +52,9 @@
 #   INCLUDE_FULLMESH      set to 1 to add fullmesh_bf16 to baseline modes
 #
 # Wall time on a healthy 4-BAY GB300 (assuming repo + libs already built):
-#   - HT-only baseline (2 modes x 7 tokens): ~20-30 min
-#   - NV72 9 cells x 7 tokens:        ~60-90 min
-#   Total ~2h. First-time `make src.build` adds ~15-40 min.
+#   - BF16-only baseline (1 mode x 4 tokens): ~5-10 min
+#   - NV72 9 cells x 4 tokens:          ~35-60 min
+#   Total ~1h after build. First-time `make src.build` adds ~15-40 min.
 # =============================================================================
 set -u
 # DO NOT set -e: per-cell failures should not kill the whole run.
@@ -64,6 +66,8 @@ NVCC_GENCODE="${NVCC_GENCODE:--gencode=arch=compute_103,code=sm_103}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
 NCCL_GIT_BRANCH="${NCCL_GIT_BRANCH:-master}"
 TRAYS="${TRAYS:-pod4-gb300-2-tray01-f3 pod4-gb300-2-tray02-f3 pod4-gb300-2-tray03-f3 pod4-gb300-2-tray04-f3}"
+TOKENS="${TOKENS:-128 256 4096 8192}"
+BASELINE_MODES="${BASELINE_MODES:-ht_bf16}"
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_BASE="${OUT_BASE:-/home/fizhang/nccl-sweeps}"
 OUT="${OUT:-$OUT_BASE/nccl-sweep-${TS}-ep16-4bay}"
@@ -97,6 +101,8 @@ EP16 4-BAY runbook
   NVCC_GENCODE: $NVCC_GENCODE
   TRAYS       : $TRAYS
   EP_SIZE     : $EP_SIZE
+  TOKENS      : $TOKENS
+  BASELINE_MODES : $BASELINE_MODES
   HOSTFILE    : $HOSTFILE
   OUT         : $OUT
   SKIP_BASELINE       : $SKIP_BASELINE
@@ -195,15 +201,15 @@ fi
 # Baseline sweep
 if [[ "$SKIP_BASELINE" != "1" ]]; then
     echo
-    BASELINE_MODES="ht_bf16 ht_fp8"
+    BASELINE_MODES_EFFECTIVE="$BASELINE_MODES"
     if [[ "$INCLUDE_FULLMESH" == "1" ]]; then
-        BASELINE_MODES="$BASELINE_MODES fullmesh_bf16"
+        BASELINE_MODES_EFFECTIVE="$BASELINE_MODES_EFFECTIVE fullmesh_bf16"
     fi
-    echo "===== Baseline sweep ($BASELINE_MODES) ====="
+    echo "===== Baseline sweep ($BASELINE_MODES_EFFECTIVE) ====="
     HOSTFILE_OVERRIDE="$HOSTFILE" \
         EP_SIZE="$EP_SIZE" \
-        TOKENS="16 32 64 128 256 4096 8192" \
-        MODES="$BASELINE_MODES" \
+        TOKENS="$TOKENS" \
+        MODES="$BASELINE_MODES_EFFECTIVE" \
         LOG_DIR="$OUT/baseline" \
         CSV_FILE="$OUT/baseline/results.csv" \
         EXTRA_BENCH_ARGS="$EXTRA_BENCH_ARGS" \
@@ -218,6 +224,7 @@ if [[ "$SKIP_NV72_CALIBRATE" != "1" ]]; then
     echo "===== HT NV72 9-cell calibrate (NUM_SMS x CHUNK) ====="
     HOSTFILE_OVERRIDE="$HOSTFILE" \
         EP_SIZE="$EP_SIZE" \
+        TOKENS="$TOKENS" \
         OUT="$OUT" \
         EXTRA_BENCH_ARGS="$EXTRA_BENCH_ARGS" \
         bash contrib/nccl_ep/sweep/ht_nv72_calibrate.sh
