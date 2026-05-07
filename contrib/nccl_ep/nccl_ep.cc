@@ -2425,6 +2425,7 @@ struct ncclEpHandle {
             size_t preprocessing_s2d_size;
             void* preprocessing_scan_tmp;
             int32_t* per_expert_counts_tmp;
+            uint32_t* dispatch_copy_expected;
         } hybridep;
     };
 
@@ -2632,7 +2633,10 @@ ncclResult_t ncclEpCreateHandle(
             size_t sz_scan_tmp  = align256(nccl_ep::hybridep::get_preprocessing_scan_tmp_size(n_ranks_per_node));
             size_t sz_prob      = !is_internode_available(ep_group) ? align256(static_cast<size_t>(max_tokens) * num_experts * sizeof(float)) : 0;
             size_t sz_per_expert_counts_tmp = align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
-            size_t no_memset_region = sz_rank_mask + sz_scan_tmp + sz_prob + sz_per_expert_counts_tmp;
+            size_t sz_dispatch_copy_expected =
+                align256(((static_cast<size_t>(ep_group->max_recv_tokens) + HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS - 1)
+                          / HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS) * sizeof(uint32_t));
+            size_t no_memset_region = sz_rank_mask + sz_scan_tmp + sz_prob + sz_per_expert_counts_tmp + sz_dispatch_copy_expected;
 
             size_t total_size = zero_region + sz_s2d + no_memset_region;
 
@@ -2677,6 +2681,9 @@ ncclResult_t ncclEpCreateHandle(
 
             handle->hybridep.per_expert_counts_tmp = reinterpret_cast<int32_t*>(ptr + offset);
             offset += sz_per_expert_counts_tmp;
+
+            handle->hybridep.dispatch_copy_expected = reinterpret_cast<uint32_t*>(ptr + offset);
+            offset += sz_dispatch_copy_expected;
         }
 
         // For multi-node: dense_prob_buffer is the group-level GIN-registered buffer
@@ -2712,6 +2719,9 @@ ncclResult_t ncclEpCreateHandle(
             static_cast<size_t>(ep_group->max_recv_tokens) * experts_per_rank * sizeof(bool);
         const size_t sparse_to_dense_bytes =
             static_cast<size_t>(nNodes) * handle->num_tokens * n_ranks_per_node * sizeof(int32_t);
+        const int dispatch_copy_num_chunks =
+            (ep_group->max_recv_tokens + HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS - 1) /
+            HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
 
         // convert_topk_to_routing_map uses bitwise-OR into this buffer, so local send rows must be pre-zeroed.
         uint8_t* local_routing_send_ptr =
@@ -2735,6 +2745,9 @@ ncclResult_t ncclEpCreateHandle(
             CUDA_CHECK(cudaMemsetAsync(
                 handle->hybridep.sparse_to_dense_map, 0xFF, sparse_to_dense_bytes, stream));
         }
+        CUDA_CHECK(cudaMemsetAsync(
+            handle->hybridep.dispatch_copy_expected, 0,
+            static_cast<size_t>(dispatch_copy_num_chunks) * sizeof(uint32_t), stream));
 
         // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
         nccl_ep::hybridep::convert_topk_to_routing_map(
@@ -2806,6 +2819,14 @@ ncclResult_t ncclEpCreateHandle(
             nNodes,
             n_ranks_per_node,
             experts_per_rank,
+            stream);
+
+        nccl_ep::hybridep::build_dispatch_copy_expected_counts(
+            handle->hybridep.local_expert_routing_map,
+            handle->hybridep.dispatch_copy_expected,
+            ep_group->max_recv_tokens,
+            experts_per_rank,
+            HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS,
             stream);
 
         if (copy_per_expert_counts_to_host) {
@@ -3394,6 +3415,7 @@ ncclResult_t ncclEpDispatch(
         const bool ht_dispatch_tma_copy_enabled = false;
 #endif
         params.dispatch_copy_ready_ptrs = group->ht_buffers.dispatch_copy_ready_buffer_ptrs;
+        params.dispatch_copy_expected = handle->hybridep.dispatch_copy_expected;
         params.user_output_token = ht_dispatch_tma_copy_enabled ? recv_x->data : nullptr;
         params.user_output_num_tokens = ht_dispatch_tma_copy_enabled ? static_cast<int>(recv_x->sizes[0]) : 0;
         params.dispatch_copy_chunk_tokens = HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;

@@ -223,6 +223,16 @@ void call_metadata_preprocessing(
 // Caller must allocate at least this many bytes and pass the pointer to call_metadata_preprocessing.
 size_t get_preprocessing_scan_tmp_size(int num_ranks_per_node);
 
+// Build expected per-output-chunk token counts for the dispatch copy-overlap
+// prototype. A token slot is counted once if it is routed to any local expert.
+void build_dispatch_copy_expected_counts(
+    const bool* local_expert_routing_map,
+    uint32_t* dispatch_copy_expected,
+    int max_recv_tokens,
+    int experts_per_rank,
+    int chunk_tokens,
+    cudaStream_t stream);
+
 // ============================================================================
 // Memory region info structs for GIN
 // All buffers are part of a single large gin_base_ptr buffer
@@ -273,6 +283,7 @@ struct DispatchParams {
     float* const* expert_output_prob_ptrs;   // Forward only
     float* const* expert_output_scaling_factor_ptrs; // FP8 only
     uint32_t* const* dispatch_copy_ready_ptrs; // Array[num_ranks_per_node], per-output-chunk ready counters
+    const uint32_t* dispatch_copy_expected;    // Local per-output-chunk expected token counts
     void* user_output_token;                  // Optional caller recv_x buffer for dispatch copy-overlap path
     int user_output_num_tokens;               // recv_x->sizes[0]
     int dispatch_copy_chunk_tokens;           // output chunk size for ready counters/copy

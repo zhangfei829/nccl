@@ -148,6 +148,44 @@ void convert_topk_to_routing_map(
         topk_idx, routing_bitmap, num_tokens, num_topk, num_experts_packed);
 }
 
+__global__ void build_dispatch_copy_expected_counts_kernel(
+    const bool* __restrict__ local_expert_routing_map,
+    uint32_t* __restrict__ dispatch_copy_expected,
+    int max_recv_tokens,
+    int experts_per_rank,
+    int chunk_tokens)
+{
+    int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= max_recv_tokens) return;
+    bool active = false;
+    const bool* row = local_expert_routing_map + static_cast<size_t>(token) * experts_per_rank;
+    for (int e = 0; e < experts_per_rank; e++) {
+        active |= row[e];
+    }
+    if (active) {
+        atomicAdd(dispatch_copy_expected + token / chunk_tokens, 1u);
+    }
+}
+
+void build_dispatch_copy_expected_counts(
+    const bool* local_expert_routing_map,
+    uint32_t* dispatch_copy_expected,
+    int max_recv_tokens,
+    int experts_per_rank,
+    int chunk_tokens,
+    cudaStream_t stream)
+{
+    if (local_expert_routing_map == nullptr || dispatch_copy_expected == nullptr ||
+        max_recv_tokens <= 0 || experts_per_rank <= 0 || chunk_tokens <= 0) {
+        return;
+    }
+    int block = 256;
+    int grid = (max_recv_tokens + block - 1) / block;
+    build_dispatch_copy_expected_counts_kernel<<<grid, block, 0, stream>>>(
+        local_expert_routing_map, dispatch_copy_expected,
+        max_recv_tokens, experts_per_rank, chunk_tokens);
+}
+
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob
 // ============================================================================
@@ -497,6 +535,7 @@ build_dispatch_param(const DispatchParams& params) {
         kp.dispatch_copy_ready[i] = params.dispatch_copy_ready_ptrs ?
             params.dispatch_copy_ready_ptrs[i] : nullptr;
     }
+    kp.dispatch_copy_expected = params.dispatch_copy_expected;
     kp.user_output_token = reinterpret_cast<TOKEN_DATA_TYPE*>(params.user_output_token);
     kp.user_output_num_tokens = params.user_output_num_tokens;
     kp.dispatch_copy_chunk_tokens = params.dispatch_copy_chunk_tokens;

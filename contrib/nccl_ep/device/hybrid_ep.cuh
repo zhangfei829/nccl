@@ -830,6 +830,7 @@ struct dispatch_kernel_param_t{
   float* expert_output_prob[LSA_TEAM_SIZE]; // Only valid in forward dispatch.
   float* expert_output_scaling_factor[LSA_TEAM_SIZE]; // Only valid for FP8 token type.
   uint32_t* dispatch_copy_ready[LSA_TEAM_SIZE]; // Per-output-chunk ready counters for copy-overlap prototype.
+  const uint32_t* dispatch_copy_expected; // Local per-output-chunk expected counts.
   TOKEN_DATA_TYPE* user_output_token; // Local caller recv_x buffer. Only local rank writes this pointer.
   int user_output_num_tokens;
   int dispatch_copy_chunk_tokens;
@@ -3696,10 +3697,12 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
     const TOKEN_DATA_TYPE* internal_output_token,
     TOKEN_DATA_TYPE* user_output_token,
     const uint32_t* dispatch_copy_ready,
+    const uint32_t* dispatch_copy_expected,
     SMEM_TYPE* smem_buffer_ptr)
 {
   if (user_output_token == nullptr || internal_output_token == nullptr ||
-      dispatch_copy_ready == nullptr || dispatch_copy_chunk_tokens <= 0 ||
+      dispatch_copy_ready == nullptr || dispatch_copy_expected == nullptr ||
+      dispatch_copy_chunk_tokens <= 0 ||
       num_tokens_for_experts <= 0) {
     return;
   }
@@ -3713,8 +3716,7 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
 
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
     const int chunk_start = chunk_id * dispatch_copy_chunk_tokens;
-    const int remaining = num_tokens_for_experts - chunk_start;
-    const int expected = remaining < dispatch_copy_chunk_tokens ? remaining : dispatch_copy_chunk_tokens;
+    int expected = static_cast<int>(dispatch_copy_expected[chunk_id]);
     if (expected <= 0) continue;
 
     if (lane == 0) {
@@ -3865,6 +3867,7 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
           param.expert_output_token[param.local_rank],
           param.user_output_token,
           param.dispatch_copy_ready[param.local_rank],
+          param.dispatch_copy_expected,
           smem_buffer_ptr);
     }
   }
