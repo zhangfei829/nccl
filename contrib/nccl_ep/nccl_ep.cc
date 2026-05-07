@@ -3168,6 +3168,23 @@ ncclResult_t ncclEpDispatch(
         assert(x->sizes[0] <= group->config.max_tokens_per_rank);
         assert(x->sizes[1] == group->hidden &&
                "HT dispatch token hidden size must match group configuration");
+        bool use_fp8 = (x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2);
+
+        static const bool ht_prof_d = [](){
+            const char* v = std::getenv("NCCL_EP_HT_PROFILE");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+        cudaEvent_t ev_h0 = nullptr, ev_h1 = nullptr, ev_h2 = nullptr,
+                    ev_h3 = nullptr, ev_h4 = nullptr, ev_h5 = nullptr;
+        if (ht_prof_d) {
+            CUDA_CHECK(cudaEventCreate(&ev_h0));
+            CUDA_CHECK(cudaEventCreate(&ev_h1));
+            CUDA_CHECK(cudaEventCreate(&ev_h2));
+            CUDA_CHECK(cudaEventCreate(&ev_h3));
+            CUDA_CHECK(cudaEventCreate(&ev_h4));
+            CUDA_CHECK(cudaEventCreate(&ev_h5));
+            CUDA_CHECK(cudaEventRecord(ev_h0, stream));
+        }
 
         // For multi-node: copy user buffers to pre-registered staging buffers
         // The staging buffers were allocated and GIN-registered during Group Create
@@ -3179,8 +3196,6 @@ ncclResult_t ncclEpDispatch(
             CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.token_staging_buffer, x->data, token_size, cudaMemcpyDeviceToDevice, stream));
             token_ptr = handle->hybridep.token_staging_buffer;
         }
-        // Detect FP8 mode based on datatype
-        bool use_fp8 = (x->datatype == ncclFloat8e4m3 || x->datatype == ncclFloat8e5m2);
 
         // For FP8: copy user scaling factors to pre-registered staging buffer
         float* scales_ptr = use_fp8 ? static_cast<float*>(scales->data) : nullptr;  // Default: use user buffer directly
@@ -3197,6 +3212,7 @@ ncclResult_t ncclEpDispatch(
             assert(scales->ndim == 2 && tensor_is_contiguous(scales));
             assert(scales->datatype == ncclFloat32);
         }
+        if (ht_prof_d) CUDA_CHECK(cudaEventRecord(ev_h1, stream));
 
         // HT dispatch kernel uses TMA for token/prob/scaling-factor payloads.
         // Keep these constraints at API-entry to fail fast on unsupported shapes.
@@ -3253,6 +3269,7 @@ ncclResult_t ncclEpDispatch(
                 group->config.num_experts,
                 stream);
         }
+        if (ht_prof_d) CUDA_CHECK(cudaEventRecord(ev_h2, stream));
 
         /* ===== Build DispatchParams ===== */
         // DispatchParams encapsulates all buffers and metadata needed by HT dispatch kernel:
@@ -3330,6 +3347,7 @@ ncclResult_t ncclEpDispatch(
             ht_nv72_chunk_tokens,
             stream
         );
+        if (ht_prof_d) CUDA_CHECK(cudaEventRecord(ev_h3, stream));
 
         /* ===== Copy IPC staging → caller outputs ===== */
         // HT kernel writes to IPC-mapped buffers (dispatch_expert_output_*_buffer_ptrs)
@@ -3345,6 +3363,7 @@ ncclResult_t ncclEpDispatch(
                 cudaMemcpyDeviceToDevice,
                 stream));
         }
+        if (ht_prof_d) CUDA_CHECK(cudaEventRecord(ev_h4, stream));
 
         /* ===== Convert dense output → sparse format ===== */
         if (forward_dispatch) {
@@ -3390,6 +3409,31 @@ ncclResult_t ncclEpDispatch(
                     cudaMemcpyDeviceToDevice,
                     stream));
             }
+        }
+        if (ht_prof_d) CUDA_CHECK(cudaEventRecord(ev_h5, stream));
+        if (ht_prof_d) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            float stage_ms = 0, dense_ms = 0, kernel_ms = 0, out_copy_ms = 0, out_sparse_ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&stage_ms,      ev_h0, ev_h1));
+            CUDA_CHECK(cudaEventElapsedTime(&dense_ms,      ev_h1, ev_h2));
+            CUDA_CHECK(cudaEventElapsedTime(&kernel_ms,     ev_h2, ev_h3));
+            CUDA_CHECK(cudaEventElapsedTime(&out_copy_ms,   ev_h3, ev_h4));
+            CUDA_CHECK(cudaEventElapsedTime(&out_sparse_ms, ev_h4, ev_h5));
+            if (group->rank == 0) {
+                fprintf(stderr,
+                        "[HT-PROFILE] dispatch EP=%d t=%d cfg=(%d,%d) "
+                        "stage=%.1f dense_prob=%.1f kernel=%.1f output_copy=%.1f output_sparse=%.1f "
+                        "total_stream=%.1f us\n",
+                        group->nRanks, handle->num_tokens,
+                        ht_nv72_num_sms, ht_nv72_chunk_tokens,
+                        stage_ms * 1000.f, dense_ms * 1000.f,
+                        kernel_ms * 1000.f, out_copy_ms * 1000.f,
+                        out_sparse_ms * 1000.f,
+                        (stage_ms + dense_ms + kernel_ms + out_copy_ms + out_sparse_ms) * 1000.f);
+                fflush(stderr);
+            }
+            cudaEventDestroy(ev_h0); cudaEventDestroy(ev_h1); cudaEventDestroy(ev_h2);
+            cudaEventDestroy(ev_h3); cudaEventDestroy(ev_h4); cudaEventDestroy(ev_h5);
         }
     }
     return ncclSuccess;
@@ -3814,6 +3858,21 @@ ncclResult_t ncclEpCombine(
         assert(x->ndim == 2 && tensor_is_contiguous(x));
         assert(x->datatype == ncclBfloat16); // HT combine only supports BF16
 
+        static const bool ht_prof_c = [](){
+            const char* v = std::getenv("NCCL_EP_HT_PROFILE");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+        cudaEvent_t ev_c0 = nullptr, ev_c1 = nullptr, ev_c2 = nullptr,
+                    ev_c3 = nullptr, ev_c4 = nullptr;
+        if (ht_prof_c) {
+            CUDA_CHECK(cudaEventCreate(&ev_c0));
+            CUDA_CHECK(cudaEventCreate(&ev_c1));
+            CUDA_CHECK(cudaEventCreate(&ev_c2));
+            CUDA_CHECK(cudaEventCreate(&ev_c3));
+            CUDA_CHECK(cudaEventCreate(&ev_c4));
+            CUDA_CHECK(cudaEventRecord(ev_c0, stream));
+        }
+
         // Get dimensions from input tensor
         auto num_tokens = static_cast<int>(x->sizes[0]);
         auto hidden = static_cast<int>(x->sizes[1]);
@@ -3861,6 +3920,7 @@ ncclResult_t ncclEpCombine(
             token_copy_size,
             cudaMemcpyDeviceToDevice,
             stream));
+        if (ht_prof_c) CUDA_CHECK(cudaEventRecord(ev_c1, stream));
 
         /* ===== Convert sparse topk_weights to dense prob for backward combine ===== */
         // For backward combine, convert sparse input weights to dense format for HT kernel
@@ -3893,6 +3953,7 @@ ncclResult_t ncclEpCombine(
             size_t dense_output_prob_size = static_cast<size_t>(num_combined_tokens) * group->config.num_experts * sizeof(float);
             CUDA_CHECK(cudaMemsetAsync(dense_output_prob, 0, dense_output_prob_size, stream));
         }
+        if (ht_prof_c) CUDA_CHECK(cudaEventRecord(ev_c2, stream));
 
         /* ===== Build CombineParams ===== */
         // CombineParams encapsulates all buffers and metadata needed by HT combine kernel:
@@ -3959,6 +4020,7 @@ ncclResult_t ncclEpCombine(
             ht_nv72_chunk_tokens,
             stream
         );
+        if (ht_prof_c) CUDA_CHECK(cudaEventRecord(ev_c3, stream));
 
         /* ===== Convert dense output prob to sparse format ===== */
         // For backward combine, convert kernel's dense output to sparse format
@@ -3973,6 +4035,29 @@ ncclResult_t ncclEpCombine(
                 num_topk,
                 group->config.num_experts,
                 stream);
+        }
+        if (ht_prof_c) CUDA_CHECK(cudaEventRecord(ev_c4, stream));
+        if (ht_prof_c) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            float input_copy_ms = 0, dense_prob_ms = 0, kernel_ms = 0, output_sparse_ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&input_copy_ms,   ev_c0, ev_c1));
+            CUDA_CHECK(cudaEventElapsedTime(&dense_prob_ms,   ev_c1, ev_c2));
+            CUDA_CHECK(cudaEventElapsedTime(&kernel_ms,       ev_c2, ev_c3));
+            CUDA_CHECK(cudaEventElapsedTime(&output_sparse_ms, ev_c3, ev_c4));
+            if (group->rank == 0) {
+                fprintf(stderr,
+                        "[HT-PROFILE] combine EP=%d t=%d cfg=(%d,%d) "
+                        "input_copy=%.1f dense_prob=%.1f kernel=%.1f output_sparse=%.1f "
+                        "total_stream=%.1f us\n",
+                        group->nRanks, handle->num_tokens,
+                        ht_nv72_num_sms, ht_nv72_chunk_tokens,
+                        input_copy_ms * 1000.f, dense_prob_ms * 1000.f,
+                        kernel_ms * 1000.f, output_sparse_ms * 1000.f,
+                        (input_copy_ms + dense_prob_ms + kernel_ms + output_sparse_ms) * 1000.f);
+                fflush(stderr);
+            }
+            cudaEventDestroy(ev_c0); cudaEventDestroy(ev_c1); cudaEventDestroy(ev_c2);
+            cudaEventDestroy(ev_c3); cudaEventDestroy(ev_c4);
         }
 
         handle->cached_mode = true;
