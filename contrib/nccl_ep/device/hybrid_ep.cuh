@@ -3709,7 +3709,6 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
                          dispatch_copy_chunk_tokens;
   constexpr int kCopyTokensPerStage = HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE;
   const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
-  const int stage_bytes = kCopyTokensPerStage * bytes_per_token;
   uint32_t phase = 0;
 
   for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {

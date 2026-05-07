@@ -577,16 +577,30 @@ void dispatch_impl(
                     // time explosion and behavior drift.
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
-                            if (params.user_output_token != nullptr) {
-                                HybridEPType::template dispatch<
-                                    TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                    CHUNK_TOKENS_TUNED,
-                                    NUM_BLOCKS_TUNED,
-                                    FORWARD_DISPATCH,
-                                    true>(kp, stream);
+                            if constexpr (std::is_same<TOKEN_DATA_TYPE, uint16_t>::value) {
+                                if (params.user_output_token != nullptr) {
+                                    HybridEPType::template dispatch<
+                                        TOKEN_DATA_TYPE,
+                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                        CHUNK_TOKENS_TUNED,
+                                        NUM_BLOCKS_TUNED,
+                                        FORWARD_DISPATCH,
+                                        true>(kp, stream);
+                                } else {
+                                    HybridEPType::template dispatch<
+                                        TOKEN_DATA_TYPE,
+                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                        CHUNK_TOKENS_TUNED,
+                                        NUM_BLOCKS_TUNED,
+                                        FORWARD_DISPATCH,
+                                        false>(kp, stream);
+                                }
                             } else {
+                                // TMA copy prototype is BF16-only. Avoid
+                                // instantiating the much heavier
+                                // ENABLE_TMA_COPY=true FP8 dispatch kernels.
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
                                     HYBRIDEP_DISPATCH_NUM_OF_STAGES,
