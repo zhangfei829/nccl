@@ -300,6 +300,7 @@ struct ncclEpGroup {
         void **dispatch_expert_output_token_buffer_ptrs;
         float **dispatch_expert_output_prob_buffer_ptrs;
         float **dispatch_expert_output_scaling_factor_buffer_ptrs;
+        uint32_t **dispatch_copy_ready_buffer_ptrs;
         uint16_t **combine_expert_input_token_buffer_ptrs;
         float **combine_expert_input_prob_buffer_ptrs;
 
@@ -307,6 +308,7 @@ struct ncclEpGroup {
         void *expert_output_token;
         float *expert_output_prob;
         float *expert_output_scaling_factor;
+        uint32_t *dispatch_copy_ready;
         uint16_t *expert_input_token;
         float *expert_input_prob;
 
@@ -340,6 +342,7 @@ struct ncclEpGroup {
         size_t ipc_mega_buffer_size = 0;
         size_t ipc_dispatch_token_offset = 0;
         size_t ipc_dispatch_prob_offset = 0;
+        size_t ipc_dispatch_copy_ready_offset = 0;
         size_t ipc_combine_token_offset = 0;
         size_t ipc_combine_prob_offset = 0;
 
@@ -583,13 +586,18 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     size_t expert_output_prob_sz = static_cast<size_t>(max_recv_tokens) * num_local_experts * gpus_per_node * sizeof(float);
     size_t expert_input_token_sz = static_cast<size_t>(max_recv_tokens) * hidden * sizeof(uint16_t);
     size_t expert_input_prob_sz = static_cast<size_t>(max_recv_tokens) * num_local_experts * gpus_per_node * sizeof(float);
+    size_t dispatch_copy_chunks = (static_cast<size_t>(max_recv_tokens) + HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS - 1)
+                                / HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
+    size_t dispatch_copy_ready_sz = dispatch_copy_chunks * sizeof(uint32_t);
 
     size_t dispatch_token_aligned = align_ipc(expert_output_token_sz);
     size_t dispatch_prob_aligned  = align_ipc(expert_output_prob_sz);
+    size_t dispatch_copy_ready_aligned = align_ipc(dispatch_copy_ready_sz);
     size_t combine_token_aligned  = align_ipc(expert_input_token_sz);
     size_t combine_prob_aligned   = align_ipc(expert_input_prob_sz);
 
     size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned
+                   + dispatch_copy_ready_aligned
                    + combine_token_aligned + combine_prob_aligned;
     CUDA_CHECK(cudaMalloc(&ep_group->ht_buffers.ipc_mega_buffer, mega_sz));
     ep_group->ht_buffers.ipc_mega_buffer_size = mega_sz;
@@ -601,17 +609,25 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     ep_group->ht_buffers.ipc_dispatch_prob_offset = dispatch_token_aligned;
     ep_group->ht_buffers.expert_output_prob = reinterpret_cast<float*>(mega_base + dispatch_token_aligned);
 
-    ep_group->ht_buffers.ipc_combine_token_offset = dispatch_token_aligned + dispatch_prob_aligned;
-    ep_group->ht_buffers.expert_input_token = reinterpret_cast<uint16_t*>(
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned);
+    ep_group->ht_buffers.ipc_dispatch_copy_ready_offset = dispatch_token_aligned + dispatch_prob_aligned;
+    ep_group->ht_buffers.dispatch_copy_ready = reinterpret_cast<uint32_t*>(
+        mega_base + ep_group->ht_buffers.ipc_dispatch_copy_ready_offset);
 
-    ep_group->ht_buffers.ipc_combine_prob_offset = dispatch_token_aligned + dispatch_prob_aligned + combine_token_aligned;
+    ep_group->ht_buffers.ipc_combine_token_offset = dispatch_token_aligned + dispatch_prob_aligned + dispatch_copy_ready_aligned;
+    ep_group->ht_buffers.expert_input_token = reinterpret_cast<uint16_t*>(
+        mega_base + ep_group->ht_buffers.ipc_combine_token_offset);
+
+    ep_group->ht_buffers.ipc_combine_prob_offset =
+        ep_group->ht_buffers.ipc_combine_token_offset + combine_token_aligned;
     ep_group->ht_buffers.expert_input_prob = reinterpret_cast<float*>(
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned + combine_token_aligned);
+        mega_base + ep_group->ht_buffers.ipc_combine_prob_offset);
+    CUDA_CHECK(cudaMemsetAsync(ep_group->ht_buffers.dispatch_copy_ready, 0,
+                               dispatch_copy_ready_sz, stream));
 
     // Host pointer arrays indexed by per-node position (one entry per node peer).
     size_t host_block_sz = sizeof(void*) * gpus_per_node
                          + sizeof(float*) * gpus_per_node
+                         + sizeof(uint32_t*) * gpus_per_node
                          + sizeof(uint16_t*) * gpus_per_node
                          + sizeof(float*) * gpus_per_node;
     CUDA_CHECK(cudaHostAlloc(&ep_group->ht_buffers.host_ptr_block, host_block_sz, cudaHostAllocMapped));
@@ -621,6 +637,8 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
     hptr += sizeof(void*) * gpus_per_node;
     ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
     hptr += sizeof(float*) * gpus_per_node;
+    ep_group->ht_buffers.dispatch_copy_ready_buffer_ptrs = reinterpret_cast<uint32_t**>(hptr);
+    hptr += sizeof(uint32_t*) * gpus_per_node;
     ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs = reinterpret_cast<uint16_t**>(hptr);
     hptr += sizeof(uint16_t*) * gpus_per_node;
     ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
@@ -687,6 +705,8 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
                 ep_group->ht_buffers.expert_output_token;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
                 ep_group->ht_buffers.expert_output_prob;
+            ep_group->ht_buffers.dispatch_copy_ready_buffer_ptrs[i] =
+                ep_group->ht_buffers.dispatch_copy_ready;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
                 ep_group->ht_buffers.expert_input_token;
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
@@ -705,6 +725,8 @@ static ncclResult_t init_hybridep_intranode(ncclEpGroup_t ep_group,
                 pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
                 reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_prob_offset);
+            ep_group->ht_buffers.dispatch_copy_ready_buffer_ptrs[i] =
+                reinterpret_cast<uint32_t*>(pb + ep_group->ht_buffers.ipc_dispatch_copy_ready_offset);
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
                 reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
@@ -761,6 +783,7 @@ static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.ipc_mega_buffer = nullptr;
         ep_group->ht_buffers.expert_output_token = nullptr;
         ep_group->ht_buffers.expert_output_prob = nullptr;
+        ep_group->ht_buffers.dispatch_copy_ready = nullptr;
         ep_group->ht_buffers.expert_input_token = nullptr;
         ep_group->ht_buffers.expert_input_prob = nullptr;
     }
@@ -845,13 +868,18 @@ static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group,
     size_t expert_output_prob_sz  = static_cast<size_t>(max_recv_tokens) * num_local_experts * n_fabric_ranks * sizeof(float);
     size_t expert_input_token_sz  = static_cast<size_t>(max_recv_tokens) * hidden * sizeof(uint16_t);
     size_t expert_input_prob_sz   = static_cast<size_t>(max_recv_tokens) * num_local_experts * n_fabric_ranks * sizeof(float);
+    size_t dispatch_copy_chunks = (static_cast<size_t>(max_recv_tokens) + HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS - 1)
+                                / HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
+    size_t dispatch_copy_ready_sz = dispatch_copy_chunks * sizeof(uint32_t);
 
     size_t dispatch_token_aligned = align_ipc(expert_output_token_sz);
     size_t dispatch_prob_aligned  = align_ipc(expert_output_prob_sz);
+    size_t dispatch_copy_ready_aligned = align_ipc(dispatch_copy_ready_sz);
     size_t combine_token_aligned  = align_ipc(expert_input_token_sz);
     size_t combine_prob_aligned   = align_ipc(expert_input_prob_sz);
 
     size_t mega_sz = dispatch_token_aligned + dispatch_prob_aligned
+                   + dispatch_copy_ready_aligned
                    + combine_token_aligned + combine_prob_aligned;
 
     // Setup fabric allocation prop and compute granularity.
@@ -889,16 +917,24 @@ static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group,
     ep_group->ht_buffers.expert_output_token = mega_base;
     ep_group->ht_buffers.ipc_dispatch_prob_offset = dispatch_token_aligned;
     ep_group->ht_buffers.expert_output_prob = reinterpret_cast<float*>(mega_base + dispatch_token_aligned);
-    ep_group->ht_buffers.ipc_combine_token_offset = dispatch_token_aligned + dispatch_prob_aligned;
+    ep_group->ht_buffers.ipc_dispatch_copy_ready_offset = dispatch_token_aligned + dispatch_prob_aligned;
+    ep_group->ht_buffers.dispatch_copy_ready = reinterpret_cast<uint32_t*>(
+        mega_base + ep_group->ht_buffers.ipc_dispatch_copy_ready_offset);
+    ep_group->ht_buffers.ipc_combine_token_offset =
+        ep_group->ht_buffers.ipc_dispatch_copy_ready_offset + dispatch_copy_ready_aligned;
     ep_group->ht_buffers.expert_input_token = reinterpret_cast<uint16_t*>(
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned);
-    ep_group->ht_buffers.ipc_combine_prob_offset = dispatch_token_aligned + dispatch_prob_aligned + combine_token_aligned;
+        mega_base + ep_group->ht_buffers.ipc_combine_token_offset);
+    ep_group->ht_buffers.ipc_combine_prob_offset =
+        ep_group->ht_buffers.ipc_combine_token_offset + combine_token_aligned;
     ep_group->ht_buffers.expert_input_prob = reinterpret_cast<float*>(
-        mega_base + dispatch_token_aligned + dispatch_prob_aligned + combine_token_aligned);
+        mega_base + ep_group->ht_buffers.ipc_combine_prob_offset);
+    CUDACHECK_RET(cudaMemsetAsync(ep_group->ht_buffers.dispatch_copy_ready, 0,
+                                  dispatch_copy_ready_sz, stream));
 
     // Host peer-pointer block (sized by n_fabric_ranks == nRanks).
     size_t host_block_sz = sizeof(void*) * n_fabric_ranks
                          + sizeof(float*) * n_fabric_ranks
+                         + sizeof(uint32_t*) * n_fabric_ranks
                          + sizeof(uint16_t*) * n_fabric_ranks
                          + sizeof(float*) * n_fabric_ranks;
     CUDACHECK_RET(cudaHostAlloc(&ep_group->ht_buffers.host_ptr_block, host_block_sz, cudaHostAllocMapped));
@@ -907,6 +943,8 @@ static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group,
     hptr += sizeof(void*) * n_fabric_ranks;
     ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
     hptr += sizeof(float*) * n_fabric_ranks;
+    ep_group->ht_buffers.dispatch_copy_ready_buffer_ptrs = reinterpret_cast<uint32_t**>(hptr);
+    hptr += sizeof(uint32_t*) * n_fabric_ranks;
     ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs = reinterpret_cast<uint16_t**>(hptr);
     hptr += sizeof(uint16_t*) * n_fabric_ranks;
     ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs = reinterpret_cast<float**>(hptr);
@@ -982,6 +1020,7 @@ static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group,
             ep_group->ht_buffers.peer_ipc_base_ptrs[i] = reinterpret_cast<void*>(local_va);
             ep_group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[i] = ep_group->ht_buffers.expert_output_token;
             ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i]  = ep_group->ht_buffers.expert_output_prob;
+            ep_group->ht_buffers.dispatch_copy_ready_buffer_ptrs[i] = ep_group->ht_buffers.dispatch_copy_ready;
             ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i]   = ep_group->ht_buffers.expert_input_token;
             ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i]    = ep_group->ht_buffers.expert_input_prob;
             continue;
@@ -1005,6 +1044,8 @@ static ncclResult_t init_hybridep_intranode_fabric(ncclEpGroup_t ep_group,
             pb + ep_group->ht_buffers.ipc_dispatch_token_offset;
         ep_group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[i] =
             reinterpret_cast<float*>(pb + ep_group->ht_buffers.ipc_dispatch_prob_offset);
+        ep_group->ht_buffers.dispatch_copy_ready_buffer_ptrs[i] =
+            reinterpret_cast<uint32_t*>(pb + ep_group->ht_buffers.ipc_dispatch_copy_ready_offset);
         ep_group->ht_buffers.combine_expert_input_token_buffer_ptrs[i] =
             reinterpret_cast<uint16_t*>(pb + ep_group->ht_buffers.ipc_combine_token_offset);
         ep_group->ht_buffers.combine_expert_input_prob_buffer_ptrs[i] =
@@ -3299,6 +3340,7 @@ ncclResult_t ncclEpDispatch(
         params.expected_intra_node_flag_value = group->ht_buffers.host_dispatch_expected_intra;
         params.intra_node_write_completion_flags = group->ht_buffers.intra_node_write_completion_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
+        params.num_tokens_for_experts = handle->hybridep.num_tokens_for_experts;
         // Pass device communicators and windows
         params.dcomms = is_single_node ? nullptr : group->gin_config.d_dcomms;
         params.nccl_window = is_single_node ? ncclWindow_t{} : group->gin_config.nccl_window;
@@ -3330,11 +3372,34 @@ ncclResult_t ncclEpDispatch(
         params.local_rank = group->rank_in_node;
         params.node_rank = group->node_id;
         params.num_tokens_per_rank = handle->num_tokens;
+        ncclNDTensor_t recv_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
 
         int ht_nv72_num_sms = 0;
         int ht_nv72_chunk_tokens = 0;
         select_ht_nv72_tuning(group, handle->num_tokens, use_fp8,
                               &ht_nv72_num_sms, &ht_nv72_chunk_tokens);
+        static const bool ht_dispatch_tma_copy = [](){
+            const char* v = std::getenv("NCCL_EP_HT_DISPATCH_TMA_COPY");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+        const bool recv_x_tma_aligned =
+            recv_x != nullptr &&
+            ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
+        const bool ht_dispatch_tma_copy_enabled =
+            ht_dispatch_tma_copy && !use_fp8 && recv_x != nullptr &&
+            recv_x->datatype == ncclBfloat16 && recv_x_tma_aligned &&
+            group->ht_buffers.use_fabric_memory;
+        params.dispatch_copy_ready_ptrs = group->ht_buffers.dispatch_copy_ready_buffer_ptrs;
+        params.user_output_token = ht_dispatch_tma_copy_enabled ? recv_x->data : nullptr;
+        params.user_output_num_tokens = ht_dispatch_tma_copy_enabled ? static_cast<int>(recv_x->sizes[0]) : 0;
+        params.dispatch_copy_chunk_tokens = HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
+        if (ht_dispatch_tma_copy_enabled) {
+            const int num_copy_chunks =
+                (params.user_output_num_tokens + HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS - 1) /
+                HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS;
+            CUDA_CHECK(cudaMemsetAsync(group->ht_buffers.dispatch_copy_ready, 0,
+                                       num_copy_chunks * sizeof(uint32_t), stream));
+        }
 
         // Call dispatch kernel
         nccl_ep::hybridep::call_dispatch(
@@ -3352,26 +3417,13 @@ ncclResult_t ncclEpDispatch(
         /* ===== Copy IPC staging → caller outputs ===== */
         // HT kernel writes to IPC-mapped buffers (dispatch_expert_output_*_buffer_ptrs)
         // Copy results to user-provided output tensors
-        ncclNDTensor_t recv_x = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_TOKENS);
         if (recv_x != nullptr) {
             assert(recv_x->ndim == 2 && tensor_is_contiguous(recv_x));
             size_t copy_size = static_cast<size_t>(recv_x->sizes[0]) * recv_x->sizes[1] * ncclTypeSize(recv_x->datatype);
 
-            static const bool ht_dispatch_tma_copy = [](){
-                const char* v = std::getenv("NCCL_EP_HT_DISPATCH_TMA_COPY");
-                return v != nullptr && v[0] != '0' && v[0] != '\0';
-            }();
-            const bool recv_x_tma_aligned =
-                ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
-            if (ht_dispatch_tma_copy && !use_fp8 &&
-                recv_x->datatype == ncclBfloat16 && recv_x_tma_aligned) {
-                nccl_ep::hybridep::launch_dispatch_output_tma_copy_bf16(
-                    group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],
-                    recv_x->data,
-                    static_cast<int>(recv_x->sizes[0]),
-                    static_cast<int>(recv_x->sizes[1]),
-                    ht_nv72_num_sms,
-                    stream);
+            if (ht_dispatch_tma_copy_enabled) {
+                // Internal dispatch kernel copied local internal output chunks
+                // to recv_x; skip the legacy copy-engine path.
             } else {
                 CUDA_CHECK(cudaMemcpyAsync(recv_x->data,
                     group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],

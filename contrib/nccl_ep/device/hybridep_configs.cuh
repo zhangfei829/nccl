@@ -27,6 +27,15 @@
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE 4
 
+// Experimental dispatch output copy-overlap path.  Peer ranks still write this
+// rank's internal HT output buffer; a local copy warp copies ready output
+// chunks from internal buffer to the user recv_x buffer inside dispatch kernel.
+// Keep small: this is meant to test overlap, not to steal many warps from the
+// main G2S/S2G pipeline.
+#define HYBRIDEP_DISPATCH_TMA_COPY_WARPS 1
+#define HYBRIDEP_DISPATCH_TMA_COPY_TOKENS_PER_STAGE 1
+#define HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS 32
+
 
 // ============================================================================
 // Combine configuration constants

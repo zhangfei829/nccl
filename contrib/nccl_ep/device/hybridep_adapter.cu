@@ -494,7 +494,12 @@ build_dispatch_param(const DispatchParams& params) {
             params.expert_output_prob_ptrs[i] : nullptr;
         kp.expert_output_scaling_factor[i] = params.expert_output_scaling_factor_ptrs ?
             params.expert_output_scaling_factor_ptrs[i] : nullptr;
+        kp.dispatch_copy_ready[i] = params.dispatch_copy_ready_ptrs ?
+            params.dispatch_copy_ready_ptrs[i] : nullptr;
     }
+    kp.user_output_token = reinterpret_cast<TOKEN_DATA_TYPE*>(params.user_output_token);
+    kp.user_output_num_tokens = params.user_output_num_tokens;
+    kp.dispatch_copy_chunk_tokens = params.dispatch_copy_chunk_tokens;
 
     // Metadata and sync flags
     kp.rdma_to_attn_map = params.rdma_to_attn_map;
@@ -505,6 +510,7 @@ build_dispatch_param(const DispatchParams& params) {
     kp.rdma_inter_node_group_flags = params.rdma_inter_node_group_flags;
     kp.intra_node_write_completion_flags = params.intra_node_write_completion_flags;
     kp.dispatch_grid_barrier_counter = params.dispatch_grid_barrier_counter;
+    kp.num_tokens_for_experts = params.num_tokens_for_experts;
 
     // Runtime config
     kp.local_rank = params.local_rank;
@@ -571,13 +577,25 @@ void dispatch_impl(
                     // time explosion and behavior drift.
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
-                            HybridEPType::template dispatch<
-                                TOKEN_DATA_TYPE,
-                                HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
-                                CHUNK_TOKENS_TUNED,
-                                NUM_BLOCKS_TUNED,
-                                FORWARD_DISPATCH>(kp, stream);
+                            if (params.user_output_token != nullptr) {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    true>(kp, stream);
+                            } else {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    false>(kp, stream);
+                            }
                         });
                     });
                 } else {
@@ -587,7 +605,8 @@ void dispatch_impl(
                         HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
                         HT_OF_NUM_TOKENS_PER_CHUNK,
                         HYBRIDEP_DISPATCH_NUM_OF_BLOCKS,
-                        FORWARD_DISPATCH>(kp, stream);
+                        FORWARD_DISPATCH,
+                        false>(kp, stream);
                 }
             });
         });

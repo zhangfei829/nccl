@@ -272,6 +272,10 @@ struct DispatchParams {
     void* const* expert_output_token_ptrs;   // Array[num_ranks_per_node]
     float* const* expert_output_prob_ptrs;   // Forward only
     float* const* expert_output_scaling_factor_ptrs; // FP8 only
+    uint32_t* const* dispatch_copy_ready_ptrs; // Array[num_ranks_per_node], per-output-chunk ready counters
+    void* user_output_token;                  // Optional caller recv_x buffer for dispatch copy-overlap path
+    int user_output_num_tokens;               // recv_x->sizes[0]
+    int dispatch_copy_chunk_tokens;           // output chunk size for ready counters/copy
 
     // Metadata (from handle->hybridep preprocessing outputs)
     const bool* rdma_to_attn_map;
@@ -285,6 +289,7 @@ struct DispatchParams {
     uint32_t* intra_node_write_completion_flags;
     // Grid barrier counter for fused device_sync in dispatch tail
     uint32_t* dispatch_grid_barrier_counter;
+    int32_t* num_tokens_for_experts; // Local actual dispatch recv token count from preprocessing
 
     // GIN context (from ep_group, multi-node only)
     ncclDevComm_t* dcomms;           // Device communicators array
