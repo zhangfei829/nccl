@@ -45,9 +45,21 @@
 //   smem buffer: TOKENS_PER_STAGE * hidden_dim * sizeof(token_dtype)
 //   mbarrier:    8 bytes
 //
-// For BF16, hidden=7168, TOKENS_PER_STAGE=1, NUM_STAGES=4: ~57 KiB total
-// (well within the SM dynamic smem budget on sm_103).
-#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES 4
+// Depth=2 keeps the pipeline simple (one in-flight g2s while s2g is reading
+// the other slot's smem).  Larger depths were tried but blow the sm_103 max
+// dynamic smem budget (~228 KiB) when stacked on top of the main G2S/S2G
+// pipeline's ~212 KiB token+prob+s2d buffers.  Depth=2 + reduced main
+// NUM_OF_STAGES_OVERLAP fits within budget; see hybridep_adapter.cu where
+// ENABLE_TMA_COPY=true instances are launched with NUM_OF_STAGES_OVERLAP.
+#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES 2
+
+// Reduced main G2S/S2G pipeline depth used only by the ENABLE_TMA_COPY=true
+// dispatch_kernel instance.  Saves (12 - 10) * hidden * sizeof(token) bytes
+// of smem to make room for the TMA copy ring buffer.  Must be divisible by
+// HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK (2) and yield a
+// stages_per_pipeline > HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G (4); 10 / 2
+// = 5 stages_per_pipeline > 4 satisfies that.
+#define HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP 10
 
 
 // ============================================================================

@@ -641,7 +641,7 @@ void dispatch_impl(
                                 if (params.user_output_token != nullptr) {
                                     HybridEPType::template dispatch<
                                         TOKEN_DATA_TYPE,
-                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
                                         HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
                                         CHUNK_TOKENS_TUNED,
                                         NUM_BLOCKS_TUNED,
@@ -692,9 +692,16 @@ void dispatch_impl(
                              (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128));
                         if constexpr (kAllowTmaCopy) {
                             if (params.user_output_token != nullptr) {
+                                // ENABLE_TMA_COPY=true instance uses the
+                                // reduced NUM_OF_STAGES_OVERLAP (10 vs 12)
+                                // to free smem room for the TMA copy ring
+                                // buffer.  Without this reduction
+                                // cudaFuncSetAttribute returns 'invalid
+                                // argument' on sm_103 because total smem
+                                // exceeds the per-block max.
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
                                     HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
