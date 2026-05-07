@@ -1,0 +1,47 @@
+---
+description: Cluster benchmark requests must be automated end-to-end with setup, run, collection, and summary
+alwaysApply: true
+---
+
+# Cluster benchmark: auto-run and auto-collect by default
+
+This rule was added after repeated manual-command loops during the GB300 EP16 tests. When the user asks to continue/start a cluster benchmark, do not give separate setup/run/collect snippets unless debugging a known failure.
+
+## Required default
+
+Provide or create a **single jumphost-side automation** that:
+
+1. Sets up head-node -> worker-node passwordless ssh.
+2. Verifies node reachability before launching `mpirun`.
+3. Pulls or clones the repo on a shared filesystem.
+4. Builds all required stages (`make src.build` before `make -C contrib/nccl_ep` for NCCL EP).
+5. Runs the benchmark with the requested reduced scope.
+6. Collects remote logs and CSVs back to a stable local/jumphost directory.
+7. Prints summary tables directly, including best config and speedup.
+
+For NCCL EP manual 4-BAY GB300 testing, the canonical script is:
+
+```bash
+contrib/nccl_ep/sweep/jumphost_ep16_4bay_auto.sh
+```
+
+## Scope discipline
+
+- If the user says “only BF16”, default `BASELINE_MODES=ht_bf16`.
+- If the user says tokens 128..8192, default `TOKENS="128 256 4096 8192"` unless they explicitly request a denser grid.
+- If FULLMESH has hung in the current environment, do not include it in default runs. Make it opt-in only (`INCLUDE_FULLMESH=1`).
+- Do not rerun broad sweeps when the needed answer can be computed from existing CSVs.
+
+## Anti-patterns
+
+- Do not hand the user one command for setup, then another for run, then another for collection when a single script can do all of it.
+- Do not ask the user to manually copy paths out of logs when the script can discover the latest output directory.
+- Do not make the user paste raw CSVs if the automation can print the pivot/summary table.
+
+## Checklist before responding
+
+- [ ] Is there a one-command path from jumphost?
+- [ ] Does it collect `baseline/results.csv`, `ht_nv72_calibrate.csv`, and the run log?
+- [ ] Does it print phase-specific best and single-config D+C best?
+- [ ] Are FULLMESH and FP8 excluded unless explicitly requested?
+- [ ] Are tokens and dtype defaults aligned with the latest user constraint?
