@@ -116,9 +116,12 @@ REMOTE
 echo
 echo "===== [5/5] Collect remote results ====="
 REMOTE_INFO="$("${SSH_BASE[@]}" "$USER_NAME@$HEAD_TRAY" bash -l <<'REMOTE'
-set -euo pipefail
-OUT=$(ls -td /home/fizhang/nccl-sweeps/*-ep16-4bay | head -1)
-LOG=$(ls -t /home/fizhang/run_ep16_auto_*.log /home/fizhang/run_ep16_tray*_bf16_*.log /home/fizhang/run_ep16_htonly_*.log /home/fizhang/run_ep16_*.log 2>/dev/null | head -1)
+set -u
+OUT=$(ls -td /home/fizhang/nccl-sweeps/*-ep16-4bay 2>/dev/null | head -1 || true)
+LOG=$(ls -t /home/fizhang/run_ep16_auto_*.log \
+            /home/fizhang/run_ep16_tray*_bf16_*.log \
+            /home/fizhang/run_ep16_htonly_*.log \
+            /home/fizhang/run_ep16_*.log 2>/dev/null | head -1 || true)
 echo "OUT=$OUT"
 echo "LOG=$LOG"
 REMOTE

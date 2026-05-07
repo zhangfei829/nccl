@@ -70,7 +70,6 @@ fi
 
 COMBINED_CSV="$OUT/ht_nv72_calibrate.csv"
 : > "$COMBINED_CSV"
-HEADER_WRITTEN=0
 
 echo "==========================================================="
 echo "HT NV72 calibrate sweep"
@@ -105,66 +104,86 @@ for sms in $NV72_NUM_SMS_LIST; do
             echo "[ht_nv72_calibrate] WARN: cell sms=$sms chunk=$chunk exited rc=$rc; continuing"
         fi
 
-        # Append cell csv to combined csv with two extra cols.
         if [[ ! -f "$cell_csv" ]]; then
-            echo "[ht_nv72_calibrate] WARN: $cell_csv missing; skip merge"
+            echo "[ht_nv72_calibrate] WARN: $cell_csv missing; skip"
             continue
         fi
-        awk -v sms="$sms" -v chunk="$chunk" -v hw="$HEADER_WRITTEN" '
-            NR==1 {
-                if (hw == 0) { print $0",nv72_num_sms,nv72_chunk" }
-                next
-            }
-            { print $0","sms","chunk }
-        ' "$cell_csv" >> "$COMBINED_CSV"
-        HEADER_WRITTEN=1
     done
 done
 
 echo
 echo "==========================================================="
-echo "All $total_cells cells done. Combined CSV: $COMBINED_CSV"
+echo "All $total_cells cells done. Rebuilding combined CSV: $COMBINED_CSV"
 echo "==========================================================="
 
-# Find best (NUM_SMS, CHUNK) per token count, ranked by dispatch_kernel_us.
-if command -v python3 >/dev/null 2>&1 && [[ -s "$COMBINED_CSV" ]]; then
-    python3 - "$COMBINED_CSV" <<'PY'
-import csv, sys
-path = sys.argv[1]
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$OUT" "$COMBINED_CSV" <<'PY'
+import csv, glob, os, re, sys
+
+out, combined_path = sys.argv[1], sys.argv[2]
+
+rows = []
+fieldnames = None
+for path in sorted(glob.glob(os.path.join(out, "ht_nv72_sms*_chunk*", "results.csv"))):
+    m = re.search(r"ht_nv72_sms(\d+)_chunk(\d+)", path)
+    if not m:
+        continue
+    sms, ch = m.group(1), m.group(2)
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            continue
+        if fieldnames is None:
+            fieldnames = list(reader.fieldnames) + ["nv72_num_sms", "nv72_chunk"]
+        for row in reader:
+            row["nv72_num_sms"] = sms
+            row["nv72_chunk"] = ch
+            rows.append(row)
+
+if fieldnames is None:
+    print(f"[ht_nv72_calibrate] WARN: no per-cell results.csv found under {out}", file=sys.stderr)
+    sys.exit(0)
+
+with open(combined_path, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"[ht_nv72_calibrate] wrote {len(rows)} rows -> {combined_path}")
+
 # (tokens, dtype) -> (best_dispatch_us, best_combine_us, sms, chunk)
 best_d = {}
 best_c = {}
 all_d = {}
 all_c = {}
-with open(path) as f:
-    r = csv.DictReader(f)
-    for row in r:
-        try:
-            tk = int(row.get("tokens", "0"))
-            dt = row.get("dispatch_dtype_tag") or row.get("dispatch_dtype") or "?"
-            sms = row.get("nv72_num_sms", "?")
-            ch = row.get("nv72_chunk", "?")
-        except Exception:
-            continue
-        try:
-            dus = float(row.get("dispatch_kernel_us") or "nan")
-        except ValueError:
-            dus = float("nan")
-        try:
-            cus = float(row.get("combine_kernel_us") or "nan")
-        except ValueError:
-            cus = float("nan")
-        key = (tk, dt)
-        all_d.setdefault(key, []).append((dus, sms, ch))
-        all_c.setdefault(key, []).append((cus, sms, ch))
-        if dus == dus:  # not nan
-            cur = best_d.get(key)
-            if (cur is None) or (dus < cur[0]):
-                best_d[key] = (dus, sms, ch)
-        if cus == cus:
-            cur = best_c.get(key)
-            if (cur is None) or (cus < cur[0]):
-                best_c[key] = (cus, sms, ch)
+
+for row in rows:
+    try:
+        tk = int(row.get("tokens", "0"))
+        dt = row.get("dispatch_dtype_tag") or row.get("dispatch_dtype") or "?"
+        sms = row.get("nv72_num_sms", "?")
+        ch = row.get("nv72_chunk", "?")
+    except Exception:
+        continue
+    try:
+        dus = float(row.get("dispatch_kernel_us") or "nan")
+    except ValueError:
+        dus = float("nan")
+    try:
+        cus = float(row.get("combine_kernel_us") or "nan")
+    except ValueError:
+        cus = float("nan")
+    key = (tk, dt)
+    all_d.setdefault(key, []).append((dus, sms, ch))
+    all_c.setdefault(key, []).append((cus, sms, ch))
+    if dus == dus:  # not nan
+        cur = best_d.get(key)
+        if (cur is None) or (dus < cur[0]):
+            best_d[key] = (dus, sms, ch)
+    if cus == cus:
+        cur = best_c.get(key)
+        if (cur is None) or (cus < cur[0]):
+            best_c[key] = (cus, sms, ch)
 
 print()
 print("=== Best (NUM_SMS, CHUNK) per (tokens, dtype) ===")
