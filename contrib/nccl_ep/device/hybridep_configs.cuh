@@ -51,9 +51,22 @@
 #define HYBRIDEP_DISPATCH_TMA_COPY_CHUNK_TOKENS 32
 
 // Per-warp ring depth.  1 means single-stage within each warp (g2s and
-// s2g serialise inside the warp), but 4 warps in parallel give 4 total
-// in-flight transfers, hiding the per-warp wait_group_read<0> cost.
-#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES 1
+// s2g serialise inside the warp), but kNumWarps warps in parallel give
+// kNumWarps total in-flight transfers, hiding the per-warp
+// wait_group_read<0> cost.
+#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES_PER_WARP 1
+
+// Total number of ring slots in the TMA copy SMEM region.  Each warp's
+// lane 0 owns slots [warp_id * NUM_STAGES_PER_WARP ... (warp_id+1) *
+// NUM_STAGES_PER_WARP).  The dispatch_smem_layout allocator and
+// mbarrier-init loop both use this as the total slot count.
+//
+// CRITICAL: this MUST equal NUM_WARPS * NUM_STAGES_PER_WARP.  An earlier
+// commit accidentally set this to 1 (per-warp depth) while the device
+// function still indexed slots by warp_id 0..NUM_WARPS-1, causing OOB
+// SMEM access on warps 1..3.  This computed form keeps the two in sync.
+#define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES \
+    (HYBRIDEP_DISPATCH_TMA_COPY_WARPS * HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES_PER_WARP)
 
 // Reduced main G2S/S2G pipeline depth used only by ENABLE_TMA_COPY=true
 // dispatch_kernel instances.  Frees smem for the 4-slot TMA copy ring
