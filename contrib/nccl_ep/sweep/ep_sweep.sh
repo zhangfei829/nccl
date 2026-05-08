@@ -276,7 +276,14 @@ for mode in $MODES; do
         if [[ -z "${HOSTFILE_OVERRIDE:-}" ]]; then
             mpi_launcher_args=("--mca" "plm" "slurm")
         fi
-        mpirun "${mpi_launcher_args[@]}" -np "$EP_SIZE" --hostfile "$HOSTFILE" \
+        # Hard wall-clock timeout: hang protection.  Default 120s per (mode,
+        # tokens) cell -- baseline t=8192 ep16 finishes in ~12s on GB300, so
+        # 120s is a 10x safety margin.  SIGTERM first (mpirun propagates to
+        # orted / ep_bench), SIGKILL after 15s if the SIGTERM didn't take.
+        # Override via NCCL_EP_BENCH_TIMEOUT_S env var.
+        bench_timeout="${NCCL_EP_BENCH_TIMEOUT_S:-120}"
+        timeout --kill-after=15 --signal=TERM "$bench_timeout" \
+            mpirun "${mpi_launcher_args[@]}" -np "$EP_SIZE" --hostfile "$HOSTFILE" \
                --oversubscribe --bind-to none \
                "${mpi_x_args[@]}" \
             "$EP_BENCH" --algorithm "$ALGO" \
@@ -285,6 +292,10 @@ for mode in $MODES; do
                         --warmup "$WARMUP" --iters "$ITERS" $EXTRA_ARGS $EXTRA_BENCH_ARGS \
             > "$logf" 2>&1
         rc=$?
+        # rc=124 is GNU coreutils 'timeout' exit on SIGTERM; rc=137 (128+9) on SIGKILL.
+        if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+            echo "TIMEOUT after ${bench_timeout}s (mpirun killed by 'timeout' wrapper)" >> "$logf"
+        fi
         wall=$(( $(date +%s) - start ))
         if [[ $rc -eq 0 ]]; then
             echo "OK (${wall}s)" | tee -a "$LOG_DIR/sweep.log"
