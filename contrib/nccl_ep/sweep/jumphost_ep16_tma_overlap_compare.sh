@@ -32,6 +32,12 @@ LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/ep16_tma_overlap_${TS}}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
 
 SSH_BASE=(ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+# Variant for non-stdin ssh (cat / grep collection in step 5).  Critical:
+# under `curl ... | bash` invocation the parent bash reads the script body
+# from stdin; an interactive ssh without -n would consume that stdin and
+# eat the rest of the script (esp. step 6 python heredoc).  Steps using
+# heredoc (bash -l <<REMOTE) MUST stay on the no-`-n` form.
+SSH_BASE_N=(ssh -n -i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 
 mkdir -p "$LOCAL_OUT"
 
@@ -150,9 +156,12 @@ echo
 echo "===== [5/6] Collect remote outputs ====="
 for tag in baseline tma_overlap; do
   mkdir -p "$LOCAL_OUT/$tag"
-  "${SSH_BASE[@]}" "$USER_NAME@$HEAD_TRAY" "cat '$REMOTE_BASE/$tag/baseline/results.csv'" > "$LOCAL_OUT/$tag/results.csv" || true
-  "${SSH_BASE[@]}" "$USER_NAME@$HEAD_TRAY" "cat '/home/fizhang/run_ep16_${tag}_${TS}.log'" > "$LOCAL_OUT/$tag/run.log" || true
-  "${SSH_BASE[@]}" "$USER_NAME@$HEAD_TRAY" "grep -h '\\[HT-PROFILE\\]' '$REMOTE_BASE/$tag'/baseline/*.log 2>/dev/null || true" > "$LOCAL_OUT/$tag/ht_profile.txt" || true
+  # Use SSH_BASE_N (with -n) here: under `curl|bash` the parent bash reads
+  # the rest of this script from stdin; an interactive ssh would eat that
+  # stdin and silently drop the python heredoc in step 6 below.
+  "${SSH_BASE_N[@]}" "$USER_NAME@$HEAD_TRAY" "cat '$REMOTE_BASE/$tag/baseline/results.csv'" > "$LOCAL_OUT/$tag/results.csv" || true
+  "${SSH_BASE_N[@]}" "$USER_NAME@$HEAD_TRAY" "cat '/home/fizhang/run_ep16_${tag}_${TS}.log'" > "$LOCAL_OUT/$tag/run.log" || true
+  "${SSH_BASE_N[@]}" "$USER_NAME@$HEAD_TRAY" "grep -h '\\[HT-PROFILE\\]' '$REMOTE_BASE/$tag'/baseline/*.log 2>/dev/null || true" > "$LOCAL_OUT/$tag/ht_profile.txt" || true
 done
 
 echo
