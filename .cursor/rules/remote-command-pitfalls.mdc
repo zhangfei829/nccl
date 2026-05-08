@@ -59,6 +59,121 @@ long_running_command 2>&1 | tail -80
 - 想限制最终输出量: 用 `awk '{lines[NR]=$0} END{for (i=NR-79; i<=NR; i++) print lines[i]}'` (流式) 或 `tail -n 80 -f` 跟踪文件
 - 自检: 这条 pipeline 的最后一段 (tail/head/awk END) 会不会等 stdin EOF? 如果是, 中间过程用户看不到, 后台跑 + 结束后 cat 文件比较安全
 
+## 陷阱 6: $HOME / 仓库路径假设没核实就用了
+
+我给的命令里 `cd ~/fizhang/nccl` 假设仓库在 `$HOME/fizhang/nccl`. 这个假设来源:
+
+- 之前会话 user 在 *tray 上* 跑 `cd ~/fizhang/nccl` 成功过, 因为 tray $HOME 是 `/home/fizhang` 或 `/mnt/local/home/fizhang`
+- *jumphost* 的 $HOME 实际是 `/opt/forge/home/fizhang`, 仓库直接在 `/opt/forge/home/fizhang/nccl`, 不是 `$HOME/fizhang/nccl`
+- 我**机械迁移** tray 上的 path 到 jumphost, 没核实
+
+结果: `cd ~/fizhang/nccl` 报 `No such file or directory`, sweep 没跑, 整条聚合命令的关键步骤全空跑, 用户得粘第二次. 而且 `run_all_from_jumphost.sh` 自己的 default `NCCL_REPO="${NCCL_REPO:-$HOME/fizhang/nccl}"` 同样错, 跑出来也找不到 `ep_sweep.sh`.
+
+正确做法 (按优先级):
+
+1. **首次给命令前先探测路径**: 让用户跑 `pwd; ls $HOME; find $HOME -maxdepth 3 -name nccl -type d` 一次, 拿到真路径再用. 一行小命令换准确, 比错命令重粘强.
+
+2. **让聚合命令自带探测**, 用 `find` 找 sentinel 文件 (e.g. `run_all_from_jumphost.sh` / `Makefile`), 算出仓库根, 再 cd:
+
+   ```bash
+   NCCL_REPO=$(find $HOME -maxdepth 4 -name "run_all_from_jumphost.sh" -path "*nccl_ep/sweep*" 2>/dev/null | head -1 | xargs -I{} dirname {} | xargs -I{} dirname {} | xargs -I{} dirname {} | xargs -I{} dirname {})
+   if [ -z "$NCCL_REPO" ]; then echo "not found, tell me the path"; exit 1; fi
+   cd "$NCCL_REPO" && ...
+   ```
+
+3. **`$HOME` 因 host 不同而不同**: jumphost = `/opt/forge/home/fizhang`, tray = `/home/fizhang` 或 `/mnt/local/home/fizhang`. 同一个 NFS 上 *相对 `$HOME`* 的 path 在不同 host 上可能展开成不同绝对路径. 所以**不要假设 jumphost 和 tray 的 `$HOME` 相同**.
+
+4. **脚本自己的 default 也可能错**: `run_all_from_jumphost.sh` 写 `NCCL_REPO="${NCCL_REPO:-$HOME/fizhang/nccl}"` —— 这个 default 是基于 *作者的开发机 $HOME*, 在别的机器上可能错. 复用脚本时**显式 export** `NCCL_REPO=...` 覆盖 default, 不依赖.
+
+自检清单:
+
+- [ ] 我命令里有 `~`, `$HOME`, `cd <path>` 吗?
+- [ ] 这条 path 在 *目标机器* 上是否存在? (jumphost? tray? 不同 host $HOME 不同!)
+- [ ] 我有没有让用户先 `pwd; ls $HOME` 一次确认?
+- [ ] 用脚本时, 脚本自己的 default path 是否也基于错误假设?
+
+## 陷阱 5: 给命令不标注 "在哪台机器上粘贴", 用户在错位置粘了
+
+我给用户一条命令, 假定它在 *jumphost* 上跑 (因为命令里有 `ssh -i ~/id_ed25519 fizhang@$tray ...`, key `id_ed25519` 只在 jumphost). 但用户上一条会话刚 `ssh -i id_ed25519 fizhang@pod4-gb300-2-tray01-f3` 进了 tray01, prompt 是 `fizhang@pod4-gb300-2-tray01-f3:~$`. 我没在命令前标注 "请退回 jumphost 后再粘", 用户直接在 tray01 prompt 粘贴, 结果:
+
+```
+Warning: Identity file /mnt/local/home/fizhang/id_ed25519 not accessible: No such file or directory.
+fizhang@pod4-gb300-2-tray01-f3: Permission denied (publickey).
+```
+
+tray01 上没有 `~/id_ed25519` (key 只在 jumphost), 且 tray01 默认不能 ssh 到 tray02/03/04. 一次粘贴废, 用户得退回 jumphost 重粘.
+
+正确做法 (硬性):
+
+1. **每条远程命令的代码块前必须标注一行 "Run from: <hostname>"**, 例如:
+
+   ```
+   Run from: jumphost (fizhang@hungry-hippo-fin-03-jumphost)
+   ```
+
+   或
+
+   ```
+   Run from: tray01 inside salloc shell (fizhang@pod4-gb300-2-tray01-f3)
+   ```
+
+2. **当对话历史显示用户当前在远端 shell** (prompt 是 `fizhang@pod4-gb300-2-tray01-f3:~$` 而不是 `fizhang@hungry-hippo-fin-03-jumphost:~$`), 而我要给一条 *为 jumphost 设计* 的命令, **必须**在命令前先写一句 "请先 `exit` 退回 jumphost (prompt 应回到 `fizhang@hungry-hippo-fin-03-jumphost:~$`), 然后再粘贴下面这条:".
+
+3. **看用户最近一次粘贴的 prompt 行判断当前 shell**. user message 里如果有 `fizhang@<host>:~$ <cmd>` 这种, `<host>` 就是当前 shell. 不是 jumphost 就要提醒 exit.
+
+4. **一致性**: 命令的 working directory 假设 (`cd ~/fizhang/nccl`) 和 key 路径假设 (`~/id_ed25519`) 都跟 "Run from" 行的 host 必须一致. 如果命令里出现 `~/id_ed25519` 但 "Run from" 是 tray, 那就是矛盾, 命令本身写错了.
+
+自检清单:
+
+- [ ] 我给的命令里有路径 (`~/id_ed25519`, `~/fizhang/nccl`, `id_ed25519`) 假设吗?
+- [ ] 这些路径在哪台机器上存在? (jumphost? tray? tray 上 NFS 挂载?)
+- [ ] 命令前面有 "Run from: <host>" 标注吗?
+- [ ] 用户最近一次 prompt 是什么 host? 跟我的 "Run from" 一致吗?
+- [ ] 不一致就在命令前加 "请先 `exit` 回 jumphost" 提醒.
+
+## 陷阱 4: 二段 ssh chain (jumphost -> tray_X -> tray_Y) 假设 tray-to-tray key 已配对
+
+```bash
+ssh -i id_ed25519 fizhang@pod4-gb300-2-tray06-f3 'for t in tray06 tray07 tray08 tray09; do ssh -n $t "..."; done'
+```
+
+外层 `ssh -i id_ed25519` 成功, 是因为 jumphost 的 `id_ed25519` pub key 已经在每个 tray 的 `~/.ssh/authorized_keys`. 但**内层 ssh** 是从 *tray06* 出去到 tray07/08/09, 走的是 *tray06 自己的* `~/.ssh/id_*` —— 这把 key 不一定在 tray07/08/09 的 authorized_keys 里. 多发生在:
+
+- 新申请 (重新分配) 的 trays, 还没做 tray-to-tray key trust 配置
+- 不同 tray pool (pod4-tray01..04 vs pod4-tray06..09), 之前有人手工配过 06->其他, 但 01->其他没配
+- tray 重装系统后 `~/.ssh/` 重置
+
+症状: 外层 ssh 通了, 进入远端 bash 看似没问题, 但 for 循环的每次内层 ssh 全报 `Permission denied (publickey)`. 用户粘贴一次发现, 还得手工去配 key 或换路线.
+
+正确做法 (按优先级):
+
+1. **直接从 jumphost 循环, 不 chain**: 既然 jumphost `id_ed25519` 能登每个 tray, 把 for 循环放在 *jumphost*, 每次 ssh 都从 jumphost 出去:
+
+   ```bash
+   for tray in tray01 tray02 tray03 tray04; do
+     ssh -i ~/id_ed25519 -n -o StrictHostKeyChecking=no fizhang@$tray '...'
+   done
+   ```
+
+   注意 `~/id_ed25519` 用绝对路径, 防 `cd` 后相对路径失效.
+
+2. 如果非用 jumpbox 模式 (e.g. jumphost 没配到目标 tray 的 key, 但已知某 tray X 配了到其他 tray 的 key), **必须先 verify** jumpbox key 是否在目标 trays:
+
+   ```bash
+   ssh -i id_ed25519 fizhang@$JUMPBOX 'ssh -n -o BatchMode=yes -o ConnectTimeout=5 fizhang@$TARGET "echo OK"'
+   ```
+
+   `BatchMode=yes` 让 ssh 在 key auth 失败时立刻报错而非问 password. 通了再用这台 jumpbox.
+
+3. **永远不要假设新 trays 之间 key 已配对**: 新分到的 trays 默认只接 *jumphost 的 key*, tray-to-tray 是默认拒绝的. 假设了就掉坑.
+
+自检:
+
+- 这条命令里有 *两层* ssh 吗 (外层 jumphost->X, 内层 X->Y)?
+- 内层 ssh 用的 key 是 X 自己生成的, 还是我从 jumphost 挂带过去的?
+- X 上有没有验证过到 Y 的 BatchMode 通?
+- 能不能改成 jumphost 直接 for 循环出去, 跳过 X 这层?
+
 ## 通用自检清单 (生成远程命令前必过)
 
 每条 `ssh / pkill / for-loop with ssh / pipe with tail or head` 命令发出去之前:
@@ -67,6 +182,9 @@ long_running_command 2>&1 | tail -80
 - [ ] 我有 `for ... do ... ssh ...; done` 循环吗? ssh 是否加 `-n`?
 - [ ] 我有 `... | tail -N` / `| head -N` 在最后吗? 中间过程会等 stdin EOF 吗? 如果用户需要看实时进度, 改 tee + 后续 cat.
 - [ ] 我让用户 *后台跑* + 后续 cat 文件了吗? 这是最稳的长命令模式.
+- [ ] 我有二段 ssh chain (jumphost -> X -> Y) 吗? X->Y 的 key 是不是已配对? 不确定就改成 jumphost 直接循环.
+- [ ] 我的命令前有 "Run from: <host>" 标注吗? 用户当前 prompt 跟这台 host 一致吗? 不一致是否提醒先 `exit`?
+- [ ] 命令里的 `~/`, `$HOME`, `cd <path>` 在目标 host 上是否存在? jumphost vs tray 的 $HOME 是否不同?
 
 任一答 No, **重写命令** 再发, 不要让用户发现命令吃了输出 / 自爆 / hang 才浪费 round-trip 来 debug 我的命令设计.
 
@@ -75,6 +193,9 @@ long_running_command 2>&1 | tail -80
 - ❌ `pkill -9 -f ep_bench` 让 ssh 远端 bash 自杀, sleep / ps 没跑, 用户重新粘贴命令两次.
 - ❌ `for tray in ...; do ssh ... 'cmd'; done` 没加 `-n`, 第一个 tray 跑了, 后续 tray 被吞 stdin 跳过. (这次没正面踩, 但容易踩)
 - ❌ `command 2>&1 | tail -80` 在 build 命令外面, 用户看不到 build 进度, 误以为卡 ~10 分钟.
+- ❌ 给 trays 01-04 用 `ssh tray01 'for t in 01..04; do ssh -n $t ...; done'` 的 jumpbox 模式, 因为之前 trays 06-09 上 tray06 配过到其他 tray 的 key 就**记忆迁移**到 trays 01-04, 假设 tray01 也配了. 实际 tray01 没配, 全部内层 ssh `Permission denied (publickey)`. 用户重粘命令 1 次浪费往返.
+- ❌ 用户上一条 prompt 是 `fizhang@pod4-gb300-2-tray01-f3:~$`, 我给一条 *为 jumphost 设计* 的命令 (含 `~/id_ed25519`), 没在前面写 "请先 exit 回 jumphost". 用户在 tray01 直接粘, 报 `id_ed25519: No such file or directory`. 又浪费一轮.
+- ❌ 给 `cd ~/fizhang/nccl` 假设 jumphost 上 $HOME 是 `/home/fizhang` 或与 tray 一致, 实际 jumphost $HOME=`/opt/forge/home/fizhang`, 仓库直接在 `~/nccl` (即 `/opt/forge/home/fizhang/nccl`). path 错, sweep 没跑, 用户重粘.
 
 ## 与现有规则的关系
 
