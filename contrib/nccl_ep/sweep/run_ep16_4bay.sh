@@ -148,8 +148,25 @@ git fetch origin "$NCCL_GIT_BRANCH" && git reset --hard "origin/$NCCL_GIT_BRANCH
 echo "[run_ep16_4bay] HEAD = $(git rev-parse --short HEAD) ($(git log -1 --format=%s))"
 
 export NCCL_HOME CUDA_HOME NVCC_GENCODE
-which mpirun >/dev/null || { echo "[run_ep16_4bay] ERROR: mpirun not in PATH"; exit 2; }
-export MPI_HOME="$(dirname $(dirname $(readlink -f $(which mpirun))))"
+# Auto-locate OpenMPI on cluster trays.  The standard install path is
+# /usr/mpi/gcc/openmpi-4.1.9a1 but trays can ship different builds; pick
+# the first one that has mpirun + mpi.h, falling back to whatever is
+# already in PATH.  This keeps the script self-contained so callers (e.g.
+# `ssh tray01 'bash run_ep16_4bay.sh'`) don't need to remember to export
+# MPI_HOME / PATH first.
+if ! command -v mpirun >/dev/null 2>&1; then
+    for cand in /usr/mpi/gcc/openmpi-4.1.9a1 /usr/mpi/gcc/openmpi-4.* /opt/openmpi /usr/local/openmpi; do
+        if [[ -x "$cand/bin/mpirun" && -f "$cand/include/mpi.h" ]]; then
+            export MPI_HOME="$cand"
+            export PATH="$MPI_HOME/bin:$PATH"
+            export LD_LIBRARY_PATH="$MPI_HOME/lib:${LD_LIBRARY_PATH:-}"
+            echo "[run_ep16_4bay] auto-located MPI_HOME=$MPI_HOME"
+            break
+        fi
+    done
+fi
+which mpirun >/dev/null || { echo "[run_ep16_4bay] ERROR: mpirun not in PATH (tried /usr/mpi/gcc/openmpi-* /opt/openmpi /usr/local/openmpi). Run 'export MPI_HOME=<your-openmpi-prefix>; export PATH=\$MPI_HOME/bin:\$PATH' first."; exit 2; }
+export MPI_HOME="${MPI_HOME:-$(dirname $(dirname $(readlink -f $(which mpirun))))}"
 [[ -f "$MPI_HOME/include/mpi.h" ]] || { echo "[run_ep16_4bay] ERROR: mpi.h not at $MPI_HOME/include/mpi.h"; exit 2; }
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/extras/CUPTI/lib64:$NCCL_HOME/lib:${LD_LIBRARY_PATH:-}"
 
