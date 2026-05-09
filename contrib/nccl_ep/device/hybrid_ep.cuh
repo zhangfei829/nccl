@@ -3950,14 +3950,27 @@ __forceinline__ __device__ void dispatch_ldst_copy_warp_group_device_function(
     // Wait for this chunk's S2G writes from peer ranks to land.  Lane 0
     // spins on the global counter, then __syncwarp broadcasts completion
     // to the other 31 lanes.
+    //
+    // [BENCH-DEBUG 2026-05-09] bounded-spin variant: gives up after 5M
+    // iterations and prints (block, chunk, ready, expected) so we can
+    // diagnose where the LDST copy stalls.  Once the deadlock root cause
+    // is fixed, switch back to plain `do { } while (ready < expected);`.
     if (lane == 0) {
       uint32_t ready = 0;
+      int spin_count = 0;
       do {
         asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
                      : "=r"(ready)
                      : "l"(__cvta_generic_to_global(dispatch_copy_ready + chunk_id))
                      : "memory");
-      } while (ready < expected);
+        spin_count++;
+      } while (ready < expected && spin_count < 5000000);
+      if (spin_count >= 5000000) {
+        printf("[LDST-DEBUG] block=%d chunk=%d ready=%u expected=%u "
+               "num_chunks=%d num_tokens_for_experts=%d -- giving up\n",
+               (int)blockIdx.x, chunk_id, ready, expected,
+               num_chunks, num_tokens_for_experts);
+      }
     }
     __syncwarp();
 
