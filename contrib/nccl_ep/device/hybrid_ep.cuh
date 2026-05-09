@@ -2753,6 +2753,9 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
                 // INPUT_COPY warp to finish chunk_id = s2d_val/chunk_tokens
                 // before we issue the cp.async.bulk read.  Cumulative epoch
                 // counter exactly mirrors dispatch_copy_ready/expected pair.
+                //
+                // [BENCH-DEBUG 2026-05-09] bounded spin + printf to diagnose
+                // the rc=134 unspecified-launch-failure during bring-up.
                 if constexpr (ENABLE_INPUT_COPY) {
                   if (remote_combine_input_ready != nullptr &&
                       combine_input_chunk_tokens > 0) {
@@ -2760,12 +2763,23 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
                     uint32_t* peer_ready_ptr =
                         remote_combine_input_ready[rank_id] + peer_chunk_id;
                     uint32_t ready = 0;
+                    int spin_count = 0;
                     do {
                       asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
                                    : "=r"(ready)
                                    : "l"(__cvta_generic_to_global(peer_ready_ptr))
                                    : "memory");
-                    } while (ready < combine_input_expected);
+                      spin_count++;
+                    } while (ready < combine_input_expected && spin_count < 5000000);
+                    if (spin_count >= 5000000) {
+                      printf("[G2S-WAIT-TIMEOUT] block=%d rank_id=%d s2d_val=%d "
+                             "peer_chunk=%d ready=%u expected=%u peer_ready_ptr=%p -- gave up\n",
+                             (int)blockIdx.x, rank_id, s2d_val,
+                             peer_chunk_id, ready, combine_input_expected, peer_ready_ptr);
+                    }
+                  } else if (lane_id == 0 && blockIdx.x == 0) {
+                    printf("[G2S-WAIT-NULLGUARD] remote_combine_input_ready=%p chunk_tokens=%d\n",
+                           remote_combine_input_ready, combine_input_chunk_tokens);
                   }
                 }
 
@@ -4189,11 +4203,27 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
   if (user_input_token == nullptr || expert_input_token == nullptr ||
       combine_input_ready == nullptr || input_copy_chunk_tokens <= 0 ||
       num_input_tokens <= 0) {
+    // [BENCH-DEBUG 2026-05-09] Surface why INPUT_COPY exited early.
+    if (COPY_GROUP::thread_rank() == 0 && blockIdx.x == 0) {
+      printf("[INPUT-COPY-EARLY-EXIT] user=%p expert=%p ready=%p chunk_tokens=%d num_tokens=%d\n",
+             user_input_token, expert_input_token, combine_input_ready,
+             input_copy_chunk_tokens, num_input_tokens);
+    }
     return;
   }
 
   const int lane = COPY_GROUP::thread_rank() & 31;
   if (lane != 0) return;  // single-lane issuer (TMA is async, lane 0 saturates)
+
+  // [BENCH-DEBUG 2026-05-09] Confirm INPUT_COPY warp_group entered properly.
+  if (blockIdx.x == 0) {
+    printf("[INPUT-COPY-ENTRY] block=0 num_chunks_total=%d num_tokens=%d hidden=%d "
+           "user_input=%p expert_input=%p ready=%p chunk_tokens=%d\n",
+           (num_input_tokens + input_copy_chunk_tokens - 1) / input_copy_chunk_tokens,
+           num_input_tokens, HIDDEN_DIM,
+           user_input_token, expert_input_token, combine_input_ready,
+           input_copy_chunk_tokens);
+  }
 
   const int num_chunks = (num_input_tokens + input_copy_chunk_tokens - 1) /
                          input_copy_chunk_tokens;
