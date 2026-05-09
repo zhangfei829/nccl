@@ -3883,6 +3883,91 @@ __forceinline__ __device__ void dispatch_tma_copy_warp_group_device_function(
   }
 }
 
+// =================== Path C: simple LDST in-kernel copy ===================
+// Variant of the dispatch copy-overlap path that uses plain vectorized
+// ld.global.v4 / st.global.v4 instead of cp.async.bulk (TMA).  Used only
+// for the small-token (16,64) cell where TMA's ~150 us per-chunk pipeline
+// overhead dwarfs the actual D2D physical transfer (sub-microsecond).
+//
+// Design (per docs/EP16_HT_NV72_TUNING_20260506.md "Path C"):
+//   - 1 warp (HYBRIDEP_DISPATCH_LDST_COPY_WARPS=1), 32 threads.
+//   - No mbarrier, no SMEM ring buffer, no TMA.  Just spin on
+//     dispatch_copy_ready[chunk_id] then 32 threads cooperatively copy
+//     chunk_active * (HIDDEN_DIM * sizeof(token)) bytes via 16-byte uint4
+//     loads/stores (compiler emits ld.global.v4.u32 / st.global.v4.u32).
+//   - Caller must guarantee internal_output_token and user_output_token
+//     are 16-byte aligned (the host gate already requires recv_x to have
+//     `(hidden * sizeof(uint16_t)) & 15 == 0`).
+//
+// Per-chunk cost (t=128, chunk_active=8, hidden=7168 BF16):
+//   - cross-rank dispatch_copy_ready spin (lane 0): ~5 us
+//   - vec ld/st: chunk_active * hidden * sizeof(BF16) / (32 thr * 16 B/thr)
+//     = 8 * 14336 / 512 = 224 transactions ≈ 0.9 us @ ~1 GHz SM clock
+//   - __syncwarp + entry barrier: ~3 us
+//   total ~10 us per chunk vs TMA's ~150 us.
+template<typename COPY_GROUP,
+         typename TOKEN_DATA_TYPE,
+         typename SMEM_TYPE>
+__forceinline__ __device__ void dispatch_ldst_copy_warp_group_device_function(
+    const int HIDDEN_DIM,
+    const int num_tokens_for_experts,
+    const int dispatch_copy_chunk_tokens,
+    const TOKEN_DATA_TYPE* internal_output_token,
+    TOKEN_DATA_TYPE* user_output_token,
+    const uint32_t* dispatch_copy_ready,
+    const uint32_t* dispatch_copy_expected,
+    SMEM_TYPE* /*smem_buffer_ptr unused*/)
+{
+  if (user_output_token == nullptr || internal_output_token == nullptr ||
+      dispatch_copy_ready == nullptr || dispatch_copy_expected == nullptr ||
+      dispatch_copy_chunk_tokens <= 0 ||
+      num_tokens_for_experts <= 0) {
+    return;
+  }
+
+  const int lane = COPY_GROUP::thread_rank() & 31;
+  const int num_chunks = (num_tokens_for_experts + dispatch_copy_chunk_tokens - 1) /
+                         dispatch_copy_chunk_tokens;
+  const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
+
+  for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+    const int chunk_start = chunk_id * dispatch_copy_chunk_tokens;
+    const int chunk_end_unbounded = chunk_start + dispatch_copy_chunk_tokens;
+    const int chunk_end = chunk_end_unbounded < num_tokens_for_experts
+                              ? chunk_end_unbounded
+                              : num_tokens_for_experts;
+    const int chunk_active = chunk_end - chunk_start;
+    if (chunk_active <= 0) continue;
+
+    const uint32_t expected = dispatch_copy_expected[chunk_id];
+    if (expected == 0) continue;
+
+    // Wait for this chunk's S2G writes from peer ranks to land.  Lane 0
+    // spins on the global counter, then __syncwarp broadcasts completion
+    // to the other 31 lanes.
+    if (lane == 0) {
+      uint32_t ready = 0;
+      do {
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                     : "=r"(ready)
+                     : "l"(__cvta_generic_to_global(dispatch_copy_ready + chunk_id))
+                     : "memory");
+      } while (ready < expected);
+    }
+    __syncwarp();
+
+    // 32 threads cooperatively copy chunk_active * bytes_per_token bytes
+    // via the existing warp_copy_int4 helper (uses int4 ldg + st, with
+    // unroll 4).  Caller guarantees both pointers are 16-B aligned.
+    const size_t total_bytes = static_cast<size_t>(chunk_active) * bytes_per_token;
+    const void* src = static_cast<const void*>(
+        internal_output_token + static_cast<size_t>(chunk_start) * HIDDEN_DIM);
+    void* dst = static_cast<void*>(
+        user_output_token + static_cast<size_t>(chunk_start) * HIDDEN_DIM);
+    warp_copy_int4<32>(dst, src, total_bytes, lane);
+  }
+}
+
 template<typename TOKEN_DATA_TYPE,
          typename INTER_NODE_GROUP,
          typename INTRA_NODE_G2S_GROUP,
@@ -3897,10 +3982,13 @@ template<typename TOKEN_DATA_TYPE,
          bool FORWARD_DISPATCH,
          bool ENABLE_TMA_COPY,
          int NUM_PIPELINES,
-         int LSA_TEAM_SIZE>
+         int LSA_TEAM_SIZE,
+         bool ENABLE_LDST_COPY = false>
 __launch_bounds__(INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size() + COPY_GROUP::size(), 1)
 __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SIZE> param)
 {
+  static_assert(!(ENABLE_TMA_COPY && ENABLE_LDST_COPY),
+                "ENABLE_TMA_COPY and ENABLE_LDST_COPY are mutually exclusive.");
   if constexpr (NUM_LSA_TEAMS != 1) {
     static_assert(INTER_NODE_GROUP::size() % 32 == 0 && INTER_NODE_GROUP::size() <= 64,
                   "Dispatch kernel supports 1 or 2 N2N warps.");
@@ -3986,6 +4074,16 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size() + COPY_GROUP::size()){
     if constexpr (ENABLE_TMA_COPY) {
       dispatch_tma_copy_warp_group_device_function<COPY_GROUP, TOKEN_DATA_TYPE, cur_smem_t>(
+          param.hidden_dim,
+          *param.num_tokens_for_experts,
+          param.dispatch_copy_chunk_tokens,
+          param.expert_output_token[param.local_rank],
+          param.user_output_token,
+          param.dispatch_copy_ready[param.local_rank],
+          param.dispatch_copy_expected,
+          smem_buffer_ptr);
+    } else if constexpr (ENABLE_LDST_COPY) {
+      dispatch_ldst_copy_warp_group_device_function<COPY_GROUP, TOKEN_DATA_TYPE, cur_smem_t>(
           param.hidden_dim,
           *param.num_tokens_for_experts,
           param.dispatch_copy_chunk_tokens,
@@ -4738,9 +4836,12 @@ public:
            int NUM_OF_BLOCKS,
            // Whether the dispatch kernel is used in forward process.
            bool FORWARD_DISPATCH,
-           bool ENABLE_TMA_COPY = false>
+           bool ENABLE_TMA_COPY = false,
+           bool ENABLE_LDST_COPY = false>
   static void dispatch(dispatch_kernel_param_t<TOKEN_DATA_TYPE, LSA_TEAM_SIZE> param, cudaStream_t stream)
   {
+    static_assert(!(ENABLE_TMA_COPY && ENABLE_LDST_COPY),
+                  "ENABLE_TMA_COPY and ENABLE_LDST_COPY are mutually exclusive.");
     constexpr bool multinode_layout = (NUM_LSA_TEAMS != 1);
     constexpr int NUM_PIPELINES = HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK;
     constexpr int INTER_NODE_GROUP_WARPS = multinode_layout ? HYBRIDEP_DISPATCH_N2N_WARPS : 0;
@@ -4749,7 +4850,9 @@ public:
     constexpr int INTRA_NODE_G2S_GROUP_START = multinode_layout ? 2 : 0;
     constexpr int INTRA_NODE_S2G_GROUP_WARPS = NUM_PIPELINES;
     constexpr int INTRA_NODE_S2G_GROUP_START = multinode_layout ? (2 + NUM_PIPELINES) : NUM_PIPELINES;
-    constexpr int COPY_GROUP_WARPS = ENABLE_TMA_COPY ? HYBRIDEP_DISPATCH_TMA_COPY_WARPS : 0;
+    constexpr int COPY_GROUP_WARPS = ENABLE_TMA_COPY  ? HYBRIDEP_DISPATCH_TMA_COPY_WARPS  :
+                                     ENABLE_LDST_COPY ? HYBRIDEP_DISPATCH_LDST_COPY_WARPS :
+                                                        0;
     constexpr int COPY_GROUP_START = multinode_layout ? (2 + 2 * NUM_PIPELINES) : (2 * NUM_PIPELINES);
     using INTER_NODE_GROUP = warp_group<INTER_NODE_GROUP_WARPS, INTER_NODE_GROUP_START>;
     using INTRA_NODE_G2S_GROUP = warp_group<INTRA_NODE_G2S_GROUP_WARPS, INTRA_NODE_G2S_GROUP_START>;
@@ -4770,7 +4873,8 @@ public:
                                                      FORWARD_DISPATCH,
                                                      ENABLE_TMA_COPY,
                                                      NUM_PIPELINES,
-                                                     LSA_TEAM_SIZE>;
+                                                     LSA_TEAM_SIZE,
+                                                     ENABLE_LDST_COPY>;
 
     dispatch_config_t config;
     model_config_t model;

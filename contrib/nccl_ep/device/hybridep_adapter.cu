@@ -686,21 +686,23 @@ void dispatch_impl(
 #else
 #  ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                     HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
+                        // Production gate:
+                        //   - BF16 + (32,128) or (64,128) -> ENABLE_TMA_COPY=true
+                        //   - BF16 + (16,64)              -> ENABLE_LDST_COPY=true (Path C, 2026-05-09)
+                        //   - everything else             -> baseline (no overlap)
                         constexpr bool kAllowTmaCopy =
                             std::is_same<TOKEN_DATA_TYPE, uint16_t>::value &&
                             ((NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
                              (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128));
+                        constexpr bool kAllowLdstCopy =
+                            std::is_same<TOKEN_DATA_TYPE, uint16_t>::value &&
+                            (NUM_BLOCKS_TUNED == 16 && CHUNK_TOKENS_TUNED == 64);
                         if constexpr (kAllowTmaCopy) {
                             if (params.user_output_token != nullptr) {
-                                // ENABLE_TMA_COPY=true instance uses the
-                                // reduced NUM_OF_STAGES_OVERLAP (8 vs 12)
-                                // and NUM_OF_IN_FLIGHT_S2G_OVERLAP (3 vs 4)
-                                // to free smem room for the 4-warp TMA
-                                // copy ring buffer (4 slots * 14 KiB =
-                                // 56 KiB).  Without these reductions
-                                // cudaFuncSetAttribute returns 'invalid
-                                // argument' on sm_103 because total smem
-                                // exceeds the per-block max ~228 KiB.
+                                // ENABLE_TMA_COPY=true uses reduced
+                                // NUM_OF_STAGES_OVERLAP (8 vs 12) /
+                                // NUM_OF_IN_FLIGHT_S2G_OVERLAP (3 vs 4)
+                                // to free smem for the TMA ring buffer.
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
                                     HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
@@ -708,7 +710,8 @@ void dispatch_impl(
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
                                     FORWARD_DISPATCH,
-                                    true>(kp, stream);
+                                    /*ENABLE_TMA_COPY=*/true,
+                                    /*ENABLE_LDST_COPY=*/false>(kp, stream);
                             } else {
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
@@ -717,7 +720,35 @@ void dispatch_impl(
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
                                     FORWARD_DISPATCH,
-                                    false>(kp, stream);
+                                    /*ENABLE_TMA_COPY=*/false,
+                                    /*ENABLE_LDST_COPY=*/false>(kp, stream);
+                            }
+                        } else if constexpr (kAllowLdstCopy) {
+                            // Path C: in-kernel ld.v4/st.v4 copy for the
+                            // small-token (16,64) cell.  No ring buffer,
+                            // no mbarrier, so we keep default
+                            // NUM_OF_STAGES / NUM_OF_IN_FLIGHT_S2G (no
+                            // smem squeeze).
+                            if (params.user_output_token != nullptr) {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    /*ENABLE_TMA_COPY=*/false,
+                                    /*ENABLE_LDST_COPY=*/true>(kp, stream);
+                            } else {
+                                HybridEPType::template dispatch<
+                                    TOKEN_DATA_TYPE,
+                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
+                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    CHUNK_TOKENS_TUNED,
+                                    NUM_BLOCKS_TUNED,
+                                    FORWARD_DISPATCH,
+                                    /*ENABLE_TMA_COPY=*/false,
+                                    /*ENABLE_LDST_COPY=*/false>(kp, stream);
                             }
                         } else {
                             HybridEPType::template dispatch<
@@ -727,7 +758,8 @@ void dispatch_impl(
                                 CHUNK_TOKENS_TUNED,
                                 NUM_BLOCKS_TUNED,
                                 FORWARD_DISPATCH,
-                                false>(kp, stream);
+                                /*ENABLE_TMA_COPY=*/false,
+                                /*ENABLE_LDST_COPY=*/false>(kp, stream);
                         }
                     });
 #  else
