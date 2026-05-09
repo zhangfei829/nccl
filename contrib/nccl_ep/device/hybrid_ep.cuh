@@ -985,6 +985,12 @@ struct combine_kernel_param_t{
   uint32_t* combine_input_ready[LSA_TEAM_SIZE];
   int combine_input_chunk_tokens;
   int num_recv_tokens;
+  // Host-side cumulative counter incremented by 1 per combine call.  When
+  // ENABLE_INPUT_COPY=true, this rank's INPUT_COPY warp atomicAdd's
+  // combine_input_ready[chunk_id]+=1 per chunk per call, so consumers
+  // (peer ranks' inter_node_G2S) spin until peer's
+  // combine_input_ready[chunk_id] >= combine_input_expected.
+  uint32_t combine_input_expected;
 };
 
 // Each CUDA block has sixteen named barriers numbered 0..15.
@@ -2578,7 +2584,13 @@ template<typename SMEM_TYPE,
          int NUM_LSA_TEAMS,
          int NUM_OF_BLOCKS,
          int NUM_OF_TOKENS_PER_GROUP,
-         bool BACKWARD_COMBINE>
+         bool BACKWARD_COMBINE,
+         // [Combine input-copy overlap, 2026-05-09] When true, this G2S warp
+         // spin-waits remote_combine_input_ready[r][s2d_val/chunk_tokens]
+         // before issuing each cp.async.bulk read of peer's
+         // expert_input_token, so peers' INPUT_COPY warps can write the
+         // chunked staging buffer in parallel with this rank's read.
+         bool ENABLE_INPUT_COPY = false>
 __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const int local_rank,
                                                                  const int node_rank,
                                                                  const int num_of_tokens_per_rank,
@@ -2599,7 +2611,18 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
                                                                  uint64_t* rdma_inter_node_group_flags,
                                                                  SMEM_TYPE* smem_buffer_ptr,
                                                                  const int HIDDEN_DIM,
-                                                                 const int experts_per_rank)
+                                                                 const int experts_per_rank,
+                                                                 // [Combine input-copy overlap, 2026-05-09]
+                                                                 // remote_combine_input_ready[r] = peer r's
+                                                                 //   per-chunk fabric-memory ready counter,
+                                                                 //   incremented by peer's INPUT_COPY warp;
+                                                                 // combine_input_expected = host-side cumulative
+                                                                 //   counter (1 per past combine call) that this
+                                                                 //   warp must observe before consuming peer's
+                                                                 //   expert_input_token at a given chunk.
+                                                                 uint32_t* const* remote_combine_input_ready = nullptr,
+                                                                 uint32_t combine_input_expected = 0,
+                                                                 int combine_input_chunk_tokens = 0)
 {
   // The warps from inter-node G2S warp group will be divided into multiple independent pipeline.
   // Each pipeline can only have 1 warp, so INTER_NODE_G2S_GROUP::warp_size() == NUM_OF_DATA_PIPELINE_PER_BLOCK and warp has the same meaning as pipeline in inter-node G2S warp group.
@@ -2725,6 +2748,26 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
                 const uint32_t parity = 1u ^ ((uint32_t)(my_abs_offset / ring_len) & 1u);
 
                 while (!cuda::ptx::mbarrier_try_wait_parity(smem_buffer_ptr->get_inter_node_mbarrier_G2S_consumer(stage_idx), parity)){}
+
+                // [Combine input-copy overlap, 2026-05-09] Spin-wait peer R's
+                // INPUT_COPY warp to finish chunk_id = s2d_val/chunk_tokens
+                // before we issue the cp.async.bulk read.  Cumulative epoch
+                // counter exactly mirrors dispatch_copy_ready/expected pair.
+                if constexpr (ENABLE_INPUT_COPY) {
+                  if (remote_combine_input_ready != nullptr &&
+                      combine_input_chunk_tokens > 0) {
+                    const int peer_chunk_id = s2d_val / combine_input_chunk_tokens;
+                    uint32_t* peer_ready_ptr =
+                        remote_combine_input_ready[rank_id] + peer_chunk_id;
+                    uint32_t ready = 0;
+                    do {
+                      asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                                   : "=r"(ready)
+                                   : "l"(__cvta_generic_to_global(peer_ready_ptr))
+                                   : "memory");
+                    } while (ready < combine_input_expected);
+                  }
+                }
 
                 const uint16_t* rank_token_ptr = remote_expert_input_token[rank_id];
                 uint32_t total_tx_size = 0;
@@ -4397,9 +4440,10 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
     // Inter-node G2S warp group.
     inter_node_G2S_warp_group_device_function
     <cur_smem_t, INTER_NODE_G2S_GROUP, NUM_OF_STAGES_G2S, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK, NUM_LSA_TEAMS, NUM_OF_BLOCKS,
-    NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE>
+    NUM_OF_TOKENS_PER_GROUP, BACKWARD_COMBINE, ENABLE_INPUT_COPY>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.expected_rdma_flag_value, param.rdma_to_attn_map, param.attn_to_rdma_map, param.sparse_to_dense_map, param.expert_input_token, param.expert_input_prob,
-    param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, param.dcomms, param.signals_base, param.combine_signal_offset, param.num_gin_comms, param.num_ctx_per_comm, param.rdma_inter_node_group_flags, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+    param.rdma_inter_node_group_token, param.rdma_inter_node_group_prob, param.dcomms, param.signals_base, param.combine_signal_offset, param.num_gin_comms, param.num_ctx_per_comm, param.rdma_inter_node_group_flags, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank,
+    param.combine_input_ready, param.combine_input_expected, param.combine_input_chunk_tokens);
   }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()){
     // Inter-node rdma warp group.
     if constexpr(NUM_LSA_TEAMS != 1){
