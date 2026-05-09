@@ -145,9 +145,14 @@
 //   - 1 SMEM ring slot per warp (single-stage), 2 mbarriers (g2s + s2g).
 //   - chunk_tokens = 32 (matches dispatch_copy_chunk_tokens for symmetric
 //     fabric memory layout / counter array sizing).
-#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 1
+// V3 cross-warp pattern: warp 0 = producer (cp.async.bulk LOAD HBM->SMEM),
+// warp 1 = consumer (cp.async.bulk STORE SMEM->fabric memory).
+// Mimics dispatch S2G's cross-warp pattern that's known to work for
+// fabric-memory targets.  Same-warp LOAD+STORE was crashing with rc=134
+// in V1 when the destination was local fabric memory.
+#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 2
 #define HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS 32
-#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 2  // ping-pong G→S and S→G stages
+#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 4  // 4-stage ring for pipelining
 
 // ============================================================================
 // Preprocessing kernel configuration

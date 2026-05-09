@@ -244,20 +244,29 @@ struct combine_smem_layout_t {
     return inter_node_mbarrier_G2S_buffer + stage * 2 + 1;
   }
 
-  // [Combine input-copy overlap, 2026-05-09] Optional INPUT_COPY SMEM ring
-  // buffer used by the in-kernel COPY warp_group to stage user x → fabric
-  // expert_input_token via G→S→G (cp.async.bulk doesn't support G→G).
+  // [Combine input-copy overlap V3, 2026-05-09] Cross-warp INPUT_COPY ring:
+  // - input_copy_buffer: SMEM data ring (NUM_STAGES slots)
+  // - input_copy_producer_mbar: per-stage mbar for "data ready" signal
+  //     (producer warp issues cp.async.bulk LOAD then mbarrier_arrive_expect_tx;
+  //      consumer warp waits this mbar before issuing STORE)
+  // - input_copy_consumer_mbar: per-stage mbar for "slot free" signal
+  //     (consumer warp issues mbarrier_arrive after STORE drain;
+  //      producer warp waits this mbar before reusing the slot)
   // Allocated only when ENABLE_INPUT_COPY=true at kernel template time.
   void* input_copy_buffer;                     // SMEM ring slot base
-  uint64_t* input_copy_mbarrier_buffer;        // 1 mbarrier per ring stage
+  uint64_t* input_copy_producer_mbar;          // NUM_STAGES mbarriers
+  uint64_t* input_copy_consumer_mbar;          // NUM_STAGES mbarriers
   int input_copy_stage_stride;                 // bytes per ring stage
 
   __device__ __forceinline__ void* get_input_copy_buffer(int stage) const {
     return reinterpret_cast<void*>(
         reinterpret_cast<uint8_t*>(input_copy_buffer) + stage * input_copy_stage_stride);
   }
-  __device__ __forceinline__ uint64_t* get_input_copy_mbar(int stage) const {
-    return input_copy_mbarrier_buffer + stage;
+  __device__ __forceinline__ uint64_t* get_input_copy_prod_mbar(int stage) const {
+    return input_copy_producer_mbar + stage;
+  }
+  __device__ __forceinline__ uint64_t* get_input_copy_cons_mbar(int stage) const {
+    return input_copy_consumer_mbar + stage;
   }
 };
 
@@ -722,11 +731,12 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.rdma_streaming_counter = nullptr;
   }
 
-  // [Combine input-copy overlap, 2026-05-09] INPUT_COPY ring buffer:
-  // 2 stages × hidden × sizeof(BF16) ~= 28 KiB at hidden=7168 BF16, plus
-  // 2 mbarriers (16 B). Caller passes enable_input_copy=true only when the
-  // kernel template parameter ENABLE_INPUT_COPY is true (mirrors dispatch's
-  // dispatch_tma_copy gate).
+  // [Combine input-copy overlap V3, 2026-05-09] INPUT_COPY ring buffer:
+  // - NUM_STAGES slots × hidden × sizeof(BF16) (~14 KiB each at hidden=7168)
+  // - NUM_STAGES producer mbarriers (8 B each, "data ready")
+  // - NUM_STAGES consumer mbarriers (8 B each, "slot free")
+  // Caller passes enable_input_copy=true only when ENABLE_INPUT_COPY=true.
+  // Total at NUM_STAGES=4 + h=7168: 4*14336 + 4*8 + 4*8 = ~57 KiB.
   if (enable_input_copy) {
     align_offset(128);
     layout.input_copy_buffer = reinterpret_cast<void*>(
@@ -736,12 +746,17 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     offset += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES *
               layout.input_copy_stage_stride;
     align_offset(8);
-    layout.input_copy_mbarrier_buffer = reinterpret_cast<uint64_t*>(
+    layout.input_copy_producer_mbar = reinterpret_cast<uint64_t*>(
+        reinterpret_cast<uint8_t*>(smem_base) + offset);
+    offset += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);
+    align_offset(8);
+    layout.input_copy_consumer_mbar = reinterpret_cast<uint64_t*>(
         reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);
   } else {
     layout.input_copy_buffer = nullptr;
-    layout.input_copy_mbarrier_buffer = nullptr;
+    layout.input_copy_producer_mbar = nullptr;
+    layout.input_copy_consumer_mbar = nullptr;
     layout.input_copy_stage_stride = 0;
   }
 
@@ -867,12 +882,15 @@ static size_t calculate_combine_smem_layout_size(
     total_size += sizeof(uint32_t);  // rdma_streaming_counter
   }
 
-  // [Combine input-copy overlap, 2026-05-09] INPUT_COPY ring buffer
+  // [Combine input-copy overlap V3, 2026-05-09] INPUT_COPY ring buffer +
+  // 2 mbarrier arrays (producer + consumer for cross-warp pattern).
   if constexpr (ENABLE_INPUT_COPY) {
     total_size = (total_size + 127) & ~127;
     total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * hidden_dim * sizeof(uint16_t);
     total_size = (total_size + 7) & ~7;
-    total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);
+    total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);  // producer
+    total_size = (total_size + 7) & ~7;
+    total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);  // consumer
   }
 
   return total_size;
@@ -4212,131 +4230,168 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     return;
   }
 
-  const int lane = COPY_GROUP::thread_rank() & 31;
-  if (lane != 0) return;  // single-lane issuer (TMA is async, lane 0 saturates)
+  // V3 design: cross-warp producer-consumer pattern (mimics dispatch S2G).
+  //
+  // V1 (same-warp LOAD+STORE writing fabric) crashed with rc=134 / unspecified
+  // launch failure on the cp.async.bulk(SMEM->fabric) instruction.  The
+  // dispatch S2G warp_group writes peer fabric via cp.async.bulk and works
+  // because LOAD (G2S warp) and STORE (S2G warp) are in DIFFERENT warps with
+  // mbarrier producer/consumer handoff.  Replicate that here.
+  //
+  // Layout:
+  //   warp 0 (PRODUCER): wait consumer-mbar[stage] (slot free)
+  //                       cp.async.bulk LOAD user_x -> SMEM[stage]
+  //                       mbarrier_arrive_expect_tx(producer-mbar[stage])
+  //   warp 1 (CONSUMER): wait producer-mbar[stage] (data ready)
+  //                       fence_proxy_async
+  //                       cp.async.bulk STORE SMEM[stage] -> fabric
+  //                       wait_group_read drain
+  //                       mbarrier_arrive(consumer-mbar[stage]) (slot free)
+  //   stage = (stage + 1) % NUM_STAGES per token in each warp.
+  //
+  // After consumer drains all tokens of a chunk:
+  //   __threadfence_system + red.release.sys.global to combine_input_ready[chunk_id].
+  const int warp_id = COPY_GROUP::warp_rank();   // 0=producer, 1=consumer
+  const int lane    = COPY_GROUP::thread_rank() & 31;
 
-  // [BENCH-DEBUG 2026-05-09] Confirm INPUT_COPY warp_group entered properly.
-  if (blockIdx.x == 0) {
-    printf("[INPUT-COPY-ENTRY] block=0 num_chunks_total=%d num_tokens=%d hidden=%d "
-           "user_input=%p expert_input=%p ready=%p chunk_tokens=%d\n",
+  if (lane != 0) return;  // each warp's lane 0 does work, others idle
+
+  constexpr int kNumStages = HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES;
+
+  if (blockIdx.x == 0 && warp_id == 0) {
+    printf("[INPUT-COPY-V3-ENTRY] block=0 warp=PRODUCER num_chunks=%d num_tokens=%d hidden=%d kNumStages=%d\n",
            (num_input_tokens + input_copy_chunk_tokens - 1) / input_copy_chunk_tokens,
-           num_input_tokens, HIDDEN_DIM,
-           user_input_token, expert_input_token, combine_input_ready,
-           input_copy_chunk_tokens);
+           num_input_tokens, HIDDEN_DIM, kNumStages);
   }
 
   const int num_chunks = (num_input_tokens + input_copy_chunk_tokens - 1) /
                          input_copy_chunk_tokens;
   const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
 
-  // Ping-pong SMEM ring (NUM_STAGES=2): stage 0 / 1 alternated per token.
-  uint32_t phase = 0;
-  int stage = 0;
+  if (warp_id == 0) {
+    // ====== PRODUCER warp ======
+    int      stage = 0;
+    uint32_t consumer_phase = 1;  // wait_parity(1) immediately satisfies on init parity 0
+    int      tokens_issued = 0;
 
-  for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
-    const int chunk_start = chunk_id * input_copy_chunk_tokens;
-    const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
-    const int chunk_end = chunk_end_unbounded < num_input_tokens
-                              ? chunk_end_unbounded
-                              : num_input_tokens;
-    const int chunk_active = chunk_end - chunk_start;
-    if (chunk_active <= 0) continue;
+    for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+      const int chunk_start = chunk_id * input_copy_chunk_tokens;
+      const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
+      const int chunk_end = chunk_end_unbounded < num_input_tokens
+                                ? chunk_end_unbounded
+                                : num_input_tokens;
+      const int chunk_active = chunk_end - chunk_start;
+      if (chunk_active <= 0) continue;
 
-    // [BENCH-DEBUG 2026-05-09] Print first chunk's setup before any cp.async.bulk.
-    if (blockIdx.x == 0 && chunk_id == 0) {
-      printf("[INPUT-COPY-CHUNK0] chunk_active=%d chunk_start=%d g_src_first=%p g_dst_first=%p smem0=%p mbar0=%p stride=%d\n",
-             chunk_active, chunk_start,
-             user_input_token + 0 * HIDDEN_DIM,
-             expert_input_token + 0 * HIDDEN_DIM,
-             smem_buffer_ptr->get_input_copy_buffer(0),
-             smem_buffer_ptr->get_input_copy_mbar(0),
-             smem_buffer_ptr->input_copy_stage_stride);
+      for (int t = 0; t < chunk_active; t++) {
+        const int token_id = chunk_start + t;
+        const TOKEN_DATA_TYPE* g_src = user_input_token + token_id * HIDDEN_DIM;
+        void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
+        uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
+        uint64_t* cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(stage);
+
+        // Wait for consumer to free this slot (skip first NUM_STAGES iters
+        // since slots start free with parity 0).
+        if (tokens_issued >= kNumStages) {
+          while (!cuda::ptx::mbarrier_try_wait_parity(cons_m, consumer_phase)) {}
+        }
+
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_shared,
+            cuda::ptx::space_global,
+            smem_s,
+            reinterpret_cast<const void*>(g_src),
+            static_cast<uint32_t>(bytes_per_token),
+            prod_m);
+        cuda::ptx::mbarrier_arrive_expect_tx(
+            cuda::ptx::sem_release,
+            cuda::ptx::scope_cta,
+            cuda::ptx::space_shared,
+            prod_m,
+            static_cast<uint32_t>(bytes_per_token));
+
+        tokens_issued += 1;
+        stage += 1;
+        if (stage == kNumStages) {
+          stage = 0;
+          consumer_phase ^= 1;
+        }
+      }
     }
 
-    for (int t = 0; t < chunk_active; t++) {
-      const int token_id = chunk_start + t;
-      const TOKEN_DATA_TYPE* g_src = user_input_token + token_id * HIDDEN_DIM;
-      TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
-      void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
-      uint64_t* mbar_s = smem_buffer_ptr->get_input_copy_mbar(stage);
-
-      // [BENCH-DEBUG 2026-05-09] Print first token's pointers and bytes.
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-TOK0] token_id=%d bytes=%d g_src=%p g_dst=%p smem_s=%p mbar_s=%p stage=%d\n",
-               token_id, bytes_per_token, g_src, g_dst, smem_s, mbar_s, stage);
-      }
-
-      // Step 1: G->S (TMA load user x token into SMEM ring slot)
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S1A] before cp.async.bulk G->S\n");
-      }
-      cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          smem_s,
-          reinterpret_cast<const void*>(g_src),
-          static_cast<uint32_t>(bytes_per_token),
-          mbar_s);
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S1B] after cp.async.bulk G->S, before mbar arrive\n");
-      }
-      cuda::ptx::mbarrier_arrive_expect_tx(
-          cuda::ptx::sem_release,
-          cuda::ptx::scope_cta,
-          cuda::ptx::space_shared,
-          mbar_s,
-          static_cast<uint32_t>(bytes_per_token));
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S1C] after mbar arrive, before try_wait\n");
-      }
-
-      // Wait g2s tx-complete.
-      while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase)) {}
-      phase ^= 1;
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S1D] after try_wait OK, before fence\n");
-      }
-      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S2A] after fence, before cp.async.bulk S->G(fabric)\n");
-      }
-
-      // Step 2: S->G (TMA store SMEM ring slot to fabric expert_input_token)
-      cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_global,
-          cuda::ptx::space_shared,
-          reinterpret_cast<void*>(g_dst),
-          reinterpret_cast<const void*>(smem_s),
-          static_cast<uint32_t>(bytes_per_token));
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S2B] after cp.async.bulk S->G, before commit\n");
-      }
-      cuda::ptx::cp_async_bulk_commit_group();
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S2C] after commit, before wait_group_read\n");
-      }
-      // Wait s2g read-of-SMEM done before reusing the ring slot.
-      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
-      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-        printf("[INPUT-COPY-S2D] after wait_group_read OK, token done\n");
-      }
-
-      // Rotate ring slot index (NUM_STAGES=2 ping-pong).
-      stage ^= 1;
+    if (blockIdx.x == 0) {
+      printf("[INPUT-COPY-V3-PROD-DONE] tokens_issued=%d\n", tokens_issued);
     }
+  } else if (warp_id == 1) {
+    // ====== CONSUMER warp ======
+    int      stage = 0;
+    uint32_t producer_phase = 0;  // wait_parity(0) waits until parity flips to 1
 
-    // Drain any in-flight bulk-async-group ops issued by this thread before
-    // signalling chunk-ready so peers don't race ahead of partially-written
-    // expert_input_token.
-    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+      const int chunk_start = chunk_id * input_copy_chunk_tokens;
+      const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
+      const int chunk_end = chunk_end_unbounded < num_input_tokens
+                                ? chunk_end_unbounded
+                                : num_input_tokens;
+      const int chunk_active = chunk_end - chunk_start;
+      if (chunk_active <= 0) continue;
 
-    // Cumulative epoch counter: peer ranks' G2S warps spin until
-    // combine_input_ready[chunk_id] >= host_combine_input_expected.
-    asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
-                 :
-                 : "l"(__cvta_generic_to_global(combine_input_ready + chunk_id)),
-                   "n"(1)
-                 : "memory");
+      if (blockIdx.x == 0 && chunk_id == 0) {
+        printf("[INPUT-COPY-V3-CONS-CHUNK0] chunk_active=%d\n", chunk_active);
+      }
+
+      for (int t = 0; t < chunk_active; t++) {
+        const int token_id = chunk_start + t;
+        TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
+        void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
+        uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
+        uint64_t* cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(stage);
+
+        // Wait for producer to fill this slot.
+        while (!cuda::ptx::mbarrier_try_wait_parity(prod_m, producer_phase)) {}
+        cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+
+        if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+          printf("[INPUT-COPY-V3-CONS-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n",
+                 g_dst, smem_s);
+        }
+
+        // STORE SMEM -> fabric memory (same instruction that crashed in V1
+        // when issued from same warp; here issued from CONSUMER warp).
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_global,
+            cuda::ptx::space_shared,
+            reinterpret_cast<void*>(g_dst),
+            reinterpret_cast<const void*>(smem_s),
+            static_cast<uint32_t>(bytes_per_token));
+        cuda::ptx::cp_async_bulk_commit_group();
+        cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+
+        if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+          printf("[INPUT-COPY-V3-CONS-T0-AFTER-STORE] STORE drain OK\n");
+        }
+
+        // Signal slot free for producer.
+        cuda::ptx::mbarrier_arrive(cons_m);
+
+        stage += 1;
+        if (stage == kNumStages) {
+          stage = 0;
+          producer_phase ^= 1;
+        }
+      }
+
+      // After all tokens in this chunk are stored: ensure visibility to peer
+      // GPUs (which read via cp.async.bulk in inter_node_G2S) before
+      // signalling combine_input_ready[chunk_id].
+      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+      __threadfence_system();
+      asm volatile("red.release.sys.global.add.u32 [%0], %1;"
+                   :
+                   : "l"(__cvta_generic_to_global(combine_input_ready + chunk_id)),
+                     "n"(1)
+                   : "memory");
+    }
   }
 }
 
@@ -4469,10 +4524,13 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
     if constexpr(NUM_LSA_TEAMS != 1) {
       *(smem_buffer_ptr->rdma_streaming_counter) = 0u;
     }
-    // [Combine input-copy overlap, 2026-05-09] Init INPUT_COPY ring mbarriers.
+    // [Combine input-copy overlap V3, 2026-05-09] Init INPUT_COPY ring mbarriers.
+    // Producer mbar: count=1 (producer warp arrives once after issuing LOAD).
+    // Consumer mbar: count=1 (consumer warp arrives once after STORE drain).
     if constexpr (ENABLE_INPUT_COPY) {
       for (int s = 0; s < HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES; s++) {
-        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_input_copy_mbar(s), 1);
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_input_copy_prod_mbar(s), 1);
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_input_copy_cons_mbar(s), 1);
       }
     }
     // Make mbarriers initialization visible to async proxy(TMA).
