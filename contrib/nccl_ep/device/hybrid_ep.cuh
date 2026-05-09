@@ -4266,13 +4266,10 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
                token_id, bytes_per_token, g_src, g_dst, smem_s, mbar_s, stage);
       }
 
-      // [BENCH-DEBUG 2026-05-09] Skip the actual cp.async.bulk to verify
-      // it's the PTX call that aborts (not host setup or kernel-head sync).
-      // If sweep now passes (no abort), the issue is in cp.async.bulk
-      // touching fabric memory.  If it still aborts, look elsewhere.
-      return;
-
       // Step 1: G->S (TMA load user x token into SMEM ring slot)
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S1A] before cp.async.bulk G->S\n");
+      }
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_shared,
           cuda::ptx::space_global,
@@ -4280,17 +4277,29 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
           reinterpret_cast<const void*>(g_src),
           static_cast<uint32_t>(bytes_per_token),
           mbar_s);
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S1B] after cp.async.bulk G->S, before mbar arrive\n");
+      }
       cuda::ptx::mbarrier_arrive_expect_tx(
           cuda::ptx::sem_release,
           cuda::ptx::scope_cta,
           cuda::ptx::space_shared,
           mbar_s,
           static_cast<uint32_t>(bytes_per_token));
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S1C] after mbar arrive, before try_wait\n");
+      }
 
       // Wait g2s tx-complete.
       while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase)) {}
       phase ^= 1;
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S1D] after try_wait OK, before fence\n");
+      }
       cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S2A] after fence, before cp.async.bulk S->G(fabric)\n");
+      }
 
       // Step 2: S->G (TMA store SMEM ring slot to fabric expert_input_token)
       cuda::ptx::cp_async_bulk(
@@ -4299,9 +4308,18 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
           reinterpret_cast<void*>(g_dst),
           reinterpret_cast<const void*>(smem_s),
           static_cast<uint32_t>(bytes_per_token));
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S2B] after cp.async.bulk S->G, before commit\n");
+      }
       cuda::ptx::cp_async_bulk_commit_group();
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S2C] after commit, before wait_group_read\n");
+      }
       // Wait s2g read-of-SMEM done before reusing the ring slot.
       cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-S2D] after wait_group_read OK, token done\n");
+      }
 
       // Rotate ring slot index (NUM_STAGES=2 ping-pong).
       stage ^= 1;
