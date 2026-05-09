@@ -933,8 +933,12 @@ void combine_impl(
                             (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128);
                         if constexpr (kAllowInputCopy) {
                             if (kp.user_input_token != nullptr) {
+                                // ENABLE_INPUT_COPY=true uses reduced
+                                // NUM_OF_STAGES_G2S (8 vs 12) to fit the
+                                // INPUT_COPY ring within sm_103's 228 KiB
+                                // dynamic-SMEM cap (see configs comment).
                                 HybridEPType::template combine<
-                                    num_stages_g2s,
+                                    HYBRIDEP_COMBINE_INPUT_COPY_NUM_OF_STAGES_G2S,
                                     num_stages_s2g,
                                     CHUNK_TOKENS_TUNED,
                                     HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,

@@ -56,6 +56,22 @@
 // wait_group_read<0> cost.
 #define HYBRIDEP_DISPATCH_TMA_COPY_NUM_STAGES_PER_WARP 1
 
+// Reduced combine NUM_OF_STAGES_G2S used only by ENABLE_INPUT_COPY=true
+// instances to free SMEM for the INPUT_COPY ring buffer.
+//
+// SMEM budget (single-node, BF16, hidden=7168, NUM_OF_STAGES_S2G=2):
+//   inter_node_token_G2S  : 8 stages * 14 KiB    = 112 KiB  (vs 168 at 12)
+//   inter_node_token_S2G  : 2 stages * 14 KiB    =  28 KiB
+//   inter_node_token_tail :                       ~24 KiB
+//   INPUT_COPY ring       : 2 stages * 14 KiB    =  28 KiB
+//   mbar/flag/misc        :                        <1 KiB
+//   total                 :                       ~193 KiB  fits sm_103 max ~228 KiB
+//
+// (At default NUM_OF_STAGES_G2S=12 the total is ~248 KiB which trips
+// cudaFuncSetAttribute(...,MaxDynamicSharedMemorySize) -> invalid argument
+// at hybrid_ep.cuh:5173.)
+#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_OF_STAGES_G2S 8
+
 // Total number of ring slots in the TMA copy SMEM region.  Each warp's
 // lane 0 owns slots [warp_id * NUM_STAGES_PER_WARP ... (warp_id+1) *
 // NUM_STAGES_PER_WARP).  The dispatch_smem_layout allocator and
