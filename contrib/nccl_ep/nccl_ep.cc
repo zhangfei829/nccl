@@ -3407,13 +3407,11 @@ ncclResult_t ncclEpDispatch(
         const bool recv_x_tma_aligned =
             recv_x != nullptr &&
             ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
-        // [BENCH-EXPLORE 2026-05-09] also enable (16,64) cell to measure
-        // Δ_kernel scaling on small tokens t=128/256.  REVERT after the
-        // measurement run; the production gate is the original (32,128) /
-        // (64,128) only because Δ_kernel was empirically ~138 us at large
-        // tokens and small tokens have D2D copy time << that.
+        // The in-kernel TMA-copy variant is only instantiated for the two
+        // large-token NV72 cells (32,128) and (64,128); smaller tokens still
+        // pick (16,64) at runtime and must fall back to the host
+        // cudaMemcpyAsync path, otherwise user recv_x receives no data.
         const bool ht_tma_cell_supported =
-            (ht_nv72_num_sms == 16 && ht_nv72_chunk_tokens == 64) ||
             (ht_nv72_num_sms == 32 && ht_nv72_chunk_tokens == 128) ||
             (ht_nv72_num_sms == 64 && ht_nv72_chunk_tokens == 128);
         const bool ht_dispatch_tma_copy_enabled =

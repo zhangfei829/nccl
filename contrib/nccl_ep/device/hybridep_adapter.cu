@@ -686,13 +686,9 @@ void dispatch_impl(
 #else
 #  ifdef NCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP
                     HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
-                        // [BENCH-EXPLORE 2026-05-09] also instantiate (16,64)
-                        // for measuring Δ_kernel scaling on t=128/256.
-                        // REVERT after the measurement run.
                         constexpr bool kAllowTmaCopy =
                             std::is_same<TOKEN_DATA_TYPE, uint16_t>::value &&
-                            ((NUM_BLOCKS_TUNED == 16 && CHUNK_TOKENS_TUNED == 64)  ||
-                             (NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
+                            ((NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
                              (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128));
                         if constexpr (kAllowTmaCopy) {
                             if (params.user_output_token != nullptr) {
