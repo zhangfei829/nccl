@@ -243,6 +243,22 @@ struct combine_smem_layout_t {
   __device__ __forceinline__ uint64_t* get_inter_node_mbarrier_G2S_consumer(int stage) const {
     return inter_node_mbarrier_G2S_buffer + stage * 2 + 1;
   }
+
+  // [Combine input-copy overlap, 2026-05-09] Optional INPUT_COPY SMEM ring
+  // buffer used by the in-kernel COPY warp_group to stage user x → fabric
+  // expert_input_token via G→S→G (cp.async.bulk doesn't support G→G).
+  // Allocated only when ENABLE_INPUT_COPY=true at kernel template time.
+  void* input_copy_buffer;                     // SMEM ring slot base
+  uint64_t* input_copy_mbarrier_buffer;        // 1 mbarrier per ring stage
+  int input_copy_stage_stride;                 // bytes per ring stage
+
+  __device__ __forceinline__ void* get_input_copy_buffer(int stage) const {
+    return reinterpret_cast<void*>(
+        reinterpret_cast<uint8_t*>(input_copy_buffer) + stage * input_copy_stage_stride);
+  }
+  __device__ __forceinline__ uint64_t* get_input_copy_mbar(int stage) const {
+    return input_copy_mbarrier_buffer + stage;
+  }
 };
 
 struct dispatch_smem_layout_t {
@@ -521,7 +537,8 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
   int num_of_stages_s2g,
   int num_of_tokens_per_chunk,
   bool backward_combine,
-  const model_config_t& model)
+  const model_config_t& model,
+  bool enable_input_copy = false)
 {
   size_t offset = 0;
   const uintptr_t smem_base_addr = reinterpret_cast<uintptr_t>(smem_base);
@@ -705,6 +722,29 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.rdma_streaming_counter = nullptr;
   }
 
+  // [Combine input-copy overlap, 2026-05-09] INPUT_COPY ring buffer:
+  // 2 stages × hidden × sizeof(BF16) ~= 28 KiB at hidden=7168 BF16, plus
+  // 2 mbarriers (16 B). Caller passes enable_input_copy=true only when the
+  // kernel template parameter ENABLE_INPUT_COPY is true (mirrors dispatch's
+  // dispatch_tma_copy gate).
+  if (enable_input_copy) {
+    align_offset(128);
+    layout.input_copy_buffer = reinterpret_cast<void*>(
+        reinterpret_cast<uint8_t*>(smem_base) + offset);
+    layout.input_copy_stage_stride =
+        model.hidden_dim * sizeof(uint16_t);  // BF16 only (gated host-side)
+    offset += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES *
+              layout.input_copy_stage_stride;
+    align_offset(8);
+    layout.input_copy_mbarrier_buffer = reinterpret_cast<uint64_t*>(
+        reinterpret_cast<uint8_t*>(smem_base) + offset);
+    offset += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);
+  } else {
+    layout.input_copy_buffer = nullptr;
+    layout.input_copy_mbarrier_buffer = nullptr;
+    layout.input_copy_stage_stride = 0;
+  }
+
   return layout;
 
 }
@@ -714,7 +754,8 @@ template<int NUM_OF_STAGES_G2S,
          int NUM_OF_TOKENS_PER_CHUNK,
          int MAX_NUM_OF_TOKENS_PER_RANK,
          int NUM_LSA_TEAMS,
-         bool BACKWARD_COMBINE>
+         bool BACKWARD_COMBINE,
+         bool ENABLE_INPUT_COPY = false>
 static size_t calculate_combine_smem_layout_size(
   const model_config_t& model)
 {
@@ -824,6 +865,14 @@ static size_t calculate_combine_smem_layout_size(
   if constexpr (multinode) {
     total_size = (total_size + 3) & ~3;
     total_size += sizeof(uint32_t);  // rdma_streaming_counter
+  }
+
+  // [Combine input-copy overlap, 2026-05-09] INPUT_COPY ring buffer
+  if constexpr (ENABLE_INPUT_COPY) {
+    total_size = (total_size + 127) & ~127;
+    total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * hidden_dim * sizeof(uint16_t);
+    total_size = (total_size + 7) & ~7;
+    total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);
   }
 
   return total_size;
@@ -4039,6 +4088,128 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
       if (arrived == NUM_OF_BLOCKS - 1) {
           atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
       }
+  }
+}
+
+// =================== Combine input-copy overlap (2026-05-09) ===================
+// Mirror of dispatch_tma_copy_warp_group_device_function but for combine's
+// pre-kernel input D2D copy.  Where dispatch's TMA-copy moves
+// (kernel-internal) -> (user) AFTER the kernel writes, this function moves
+// (user) -> (fabric IPC) IN THE KERNEL HEAD so peers can read it.
+//
+// Design (chunk-level pipelined; matches dispatch overlap pattern):
+//   - 1 warp/block (HYBRIDEP_COMBINE_INPUT_COPY_WARPS=1), lane 0 issues
+//     all PTX (rest of warp idles after the lane gate).
+//   - Per chunk: NUM_STAGES (=2) ping-pong SMEM ring slots used as the
+//     intermediate hop for cp.async.bulk(G->S->G); cp.async.bulk doesn't
+//     support a direct G->G variant per PTX ISA 9.7.9.25.4.1.
+//   - After each chunk's tokens land in expert_input_token, atomicAdd
+//     combine_input_ready[chunk_id] += 1 (cumulative epoch counter,
+//     mirrors dispatch_copy_ready exactly so consumers spin in the same
+//     ld.acquire.sys.global.u32 do/while loop).
+//   - chunk_id = blockIdx.x rotates by gridDim.x for full grid coverage.
+//
+// Per-chunk cost estimate (t=8192 = 512 tokens/rank, chunk=32 tokens, 16
+// CTAs active, 1 chunk/CTA in steady state at NUM_OF_BLOCKS=64):
+//   - 32 tokens × ~6 us per G->S->G round (lane-0 serial)
+//     = ~190 us per chunk in COPY warp
+//   - main combine_kernel body 1100us at t=8192, with NUM_OF_BLOCKS=64
+//     processing 4 chunks/CTA on average -> kernel ~280us critical path
+//     per chunk
+//   - With chunked pipeline: max(190, 280) = ~280us per chunk × 4 chunks
+//     ~= 1120us, vs baseline 555+1114 = 1669us -> ~1.4x combine speedup.
+template<typename COPY_GROUP,
+         typename TOKEN_DATA_TYPE,
+         typename SMEM_TYPE>
+__forceinline__ __device__ void combine_input_copy_warp_group_device_function(
+    const int HIDDEN_DIM,
+    const int num_input_tokens,
+    const int input_copy_chunk_tokens,
+    const TOKEN_DATA_TYPE* user_input_token,
+    TOKEN_DATA_TYPE* expert_input_token,
+    uint32_t* combine_input_ready,
+    SMEM_TYPE* smem_buffer_ptr)
+{
+  if (user_input_token == nullptr || expert_input_token == nullptr ||
+      combine_input_ready == nullptr || input_copy_chunk_tokens <= 0 ||
+      num_input_tokens <= 0) {
+    return;
+  }
+
+  const int lane = COPY_GROUP::thread_rank() & 31;
+  if (lane != 0) return;  // single-lane issuer (TMA is async, lane 0 saturates)
+
+  const int num_chunks = (num_input_tokens + input_copy_chunk_tokens - 1) /
+                         input_copy_chunk_tokens;
+  const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
+
+  // Ping-pong SMEM ring (NUM_STAGES=2): stage 0 / 1 alternated per token.
+  uint32_t phase = 0;
+  int stage = 0;
+
+  for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+    const int chunk_start = chunk_id * input_copy_chunk_tokens;
+    const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
+    const int chunk_end = chunk_end_unbounded < num_input_tokens
+                              ? chunk_end_unbounded
+                              : num_input_tokens;
+    const int chunk_active = chunk_end - chunk_start;
+    if (chunk_active <= 0) continue;
+
+    for (int t = 0; t < chunk_active; t++) {
+      const int token_id = chunk_start + t;
+      const TOKEN_DATA_TYPE* g_src = user_input_token + token_id * HIDDEN_DIM;
+      TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
+      void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
+      uint64_t* mbar_s = smem_buffer_ptr->get_input_copy_mbar(stage);
+
+      // Step 1: G->S (TMA load user x token into SMEM ring slot)
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          smem_s,
+          reinterpret_cast<const void*>(g_src),
+          static_cast<uint32_t>(bytes_per_token),
+          mbar_s);
+      cuda::ptx::mbarrier_arrive_expect_tx(
+          cuda::ptx::sem_release,
+          cuda::ptx::scope_cta,
+          cuda::ptx::space_shared,
+          mbar_s,
+          static_cast<uint32_t>(bytes_per_token));
+
+      // Wait g2s tx-complete.
+      while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase)) {}
+      phase ^= 1;
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+
+      // Step 2: S->G (TMA store SMEM ring slot to fabric expert_input_token)
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_global,
+          cuda::ptx::space_shared,
+          reinterpret_cast<void*>(g_dst),
+          reinterpret_cast<const void*>(smem_s),
+          static_cast<uint32_t>(bytes_per_token));
+      cuda::ptx::cp_async_bulk_commit_group();
+      // Wait s2g read-of-SMEM done before reusing the ring slot.
+      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+
+      // Rotate ring slot index (NUM_STAGES=2 ping-pong).
+      stage ^= 1;
+    }
+
+    // Drain any in-flight bulk-async-group ops issued by this thread before
+    // signalling chunk-ready so peers don't race ahead of partially-written
+    // expert_input_token.
+    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+
+    // Cumulative epoch counter: peer ranks' G2S warps spin until
+    // combine_input_ready[chunk_id] >= host_combine_input_expected.
+    asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;"
+                 :
+                 : "l"(__cvta_generic_to_global(combine_input_ready + chunk_id)),
+                   "n"(1)
+                 : "memory");
   }
 }
 
