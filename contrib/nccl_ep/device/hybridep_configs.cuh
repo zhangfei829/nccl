@@ -111,6 +111,28 @@
 // 0 = disable streaming (fall back to chunk-level mbarrier only).
 #define HYBRIDEP_COMBINE_RDMA_STREAMING_BATCH 8
 
+// ============== Combine input-copy overlap (2026-05-09) ==================
+// Mirror of dispatch TMA copy overlap (commit 9cfbfce) but for combine's
+// pre-kernel input D2D copy:
+//   baseline: host cudaMemcpyAsync(expert_input_token, x->data, ...) ~555us
+//             at t=8192 EP=16 (33% of combine total_stream).
+//   overlap:  in-kernel COPY warp_group does chunk-by-chunk
+//             cp.async.bulk(x->data → SMEM → expert_input_token) and
+//             atomicAdd combine_input_ready[chunk_id]; the G2S/RED warps
+//             on peer ranks spin-wait combine_input_ready[chunk_id] before
+//             reading peer's expert_input_token chunk_id.  This pipelines
+//             input copy with main combine reduce (chunked dependency).
+//
+// Sizing:
+//   - 1 warp/block (32 lanes) -- input copy is throughput-bound (bytes/cycle),
+//     not latency-bound, so 1 warp per CTA already saturates the DMA path.
+//   - 1 SMEM ring slot per warp (single-stage), 2 mbarriers (g2s + s2g).
+//   - chunk_tokens = 32 (matches dispatch_copy_chunk_tokens for symmetric
+//     fabric memory layout / counter array sizing).
+#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 1
+#define HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS 32
+#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 2  // ping-pong G→S and S→G stages
+
 // ============================================================================
 // Preprocessing kernel configuration
 // ============================================================================
