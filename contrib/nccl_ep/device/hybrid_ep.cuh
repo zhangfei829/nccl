@@ -4242,12 +4242,29 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     const int chunk_active = chunk_end - chunk_start;
     if (chunk_active <= 0) continue;
 
+    // [BENCH-DEBUG 2026-05-09] Print first chunk's setup before any cp.async.bulk.
+    if (blockIdx.x == 0 && chunk_id == 0) {
+      printf("[INPUT-COPY-CHUNK0] chunk_active=%d chunk_start=%d g_src_first=%p g_dst_first=%p smem0=%p mbar0=%p stride=%d\n",
+             chunk_active, chunk_start,
+             user_input_token + 0 * HIDDEN_DIM,
+             expert_input_token + 0 * HIDDEN_DIM,
+             smem_buffer_ptr->get_input_copy_buffer(0),
+             smem_buffer_ptr->get_input_copy_mbar(0),
+             smem_buffer_ptr->input_copy_stage_stride);
+    }
+
     for (int t = 0; t < chunk_active; t++) {
       const int token_id = chunk_start + t;
       const TOKEN_DATA_TYPE* g_src = user_input_token + token_id * HIDDEN_DIM;
       TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
       void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
       uint64_t* mbar_s = smem_buffer_ptr->get_input_copy_mbar(stage);
+
+      // [BENCH-DEBUG 2026-05-09] Print first token's pointers and bytes.
+      if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+        printf("[INPUT-COPY-TOK0] token_id=%d bytes=%d g_src=%p g_dst=%p smem_s=%p mbar_s=%p stage=%d\n",
+               token_id, bytes_per_token, g_src, g_dst, smem_s, mbar_s, stage);
+      }
 
       // Step 1: G->S (TMA load user x token into SMEM ring slot)
       cuda::ptx::cp_async_bulk(
