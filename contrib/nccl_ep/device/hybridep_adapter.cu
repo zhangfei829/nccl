@@ -846,6 +846,25 @@ build_combine_param(const CombineParams& params) {
                .combine_rdma_inter_node_group_prob_offset = params.mr_info.combine_rdma_inter_node_group_prob_offset
     };
 
+    // [Combine input-copy overlap, 2026-05-09] Pass user_input_token + per-peer
+    // ready ptrs + chunk size + cumulative expected counter.  Only used by
+    // the kernel template instance compiled with ENABLE_INPUT_COPY=true; for
+    // the baseline path these stay nullptr/0 and the gate in adapter.cu
+    // selects ENABLE_INPUT_COPY=false.
+    kp.user_input_token = params.user_input_token;
+    kp.combine_input_chunk_tokens = params.combine_input_chunk_tokens;
+    kp.combine_input_expected = params.combine_input_expected;
+    if (params.combine_input_ready_ptrs != nullptr) {
+        for (int r = 0; r < LSA_TEAM_SIZE; r++) {
+            kp.combine_input_ready[r] = params.combine_input_ready_ptrs[r];
+        }
+    } else {
+        for (int r = 0; r < LSA_TEAM_SIZE; r++) {
+            kp.combine_input_ready[r] = nullptr;
+        }
+    }
+    kp.num_recv_tokens = params.num_recv_tokens;
+
     return kp;
 }
 
@@ -903,6 +922,50 @@ void combine_impl(
                         });
                     });
 #else
+#  ifdef NCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY
+                    HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
+                        // [Combine input-copy overlap, 2026-05-09] Allow
+                        // ENABLE_INPUT_COPY only on the production NV72
+                        // cells (32,128) and (64,128) where chunked
+                        // pipelining beats baseline cudaMemcpyAsync.
+                        constexpr bool kAllowInputCopy =
+                            (NUM_BLOCKS_TUNED == 32 && CHUNK_TOKENS_TUNED == 128) ||
+                            (NUM_BLOCKS_TUNED == 64 && CHUNK_TOKENS_TUNED == 128);
+                        if constexpr (kAllowInputCopy) {
+                            if (kp.user_input_token != nullptr) {
+                                HybridEPType::template combine<
+                                    num_stages_g2s,
+                                    num_stages_s2g,
+                                    CHUNK_TOKENS_TUNED,
+                                    HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                                    NUM_BLOCKS_TUNED,
+                                    HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                                    BACKWARD_COMBINE,
+                                    /*ENABLE_INPUT_COPY=*/true>(kp, stream);
+                            } else {
+                                HybridEPType::template combine<
+                                    num_stages_g2s,
+                                    num_stages_s2g,
+                                    CHUNK_TOKENS_TUNED,
+                                    HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                                    NUM_BLOCKS_TUNED,
+                                    HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                                    BACKWARD_COMBINE,
+                                    /*ENABLE_INPUT_COPY=*/false>(kp, stream);
+                            }
+                        } else {
+                            HybridEPType::template combine<
+                                num_stages_g2s,
+                                num_stages_s2g,
+                                CHUNK_TOKENS_TUNED,
+                                HYBRIDEP_COMBINE_NUM_OF_TOKENS_PER_GROUP,
+                                NUM_BLOCKS_TUNED,
+                                HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
+                                BACKWARD_COMBINE,
+                                /*ENABLE_INPUT_COPY=*/false>(kp, stream);
+                        }
+                    });
+#  else
                     HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
                         HybridEPType::template combine<
                             num_stages_g2s,
@@ -913,6 +976,7 @@ void combine_impl(
                             HYBRIDEP_COMBINE_NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
                             BACKWARD_COMBINE>(kp, stream);
                     });
+#  endif
 #endif
                 } else {
                     HybridEPType::template combine<

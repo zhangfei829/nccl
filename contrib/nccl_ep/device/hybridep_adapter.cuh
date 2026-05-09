@@ -342,7 +342,7 @@ struct DispatchParams {
     void* gin_base_ptr;              // Base pointer for offset calculations
     unsigned signals_base;           // Base signal ID
     dispatch_memory_region_info_t mr_info;
-
+ 
     // Runtime config
     int local_rank;
     int node_rank;
@@ -424,6 +424,15 @@ struct CombineParams {
     int node_rank;
     int num_tokens_per_rank;    // Original token count from dispatch
     int num_recv_tokens;        // Actual received tokens this rank
+
+    // [Combine input-copy overlap, 2026-05-09] When set non-null, kernel
+    // runs in-kernel chunked G->S->G (user x -> fabric expert_input_token)
+    // and skips the host cudaMemcpyAsync.  expected counter advances by 1
+    // per combine call on each rank.
+    const uint16_t* user_input_token;
+    uint32_t* const* combine_input_ready_ptrs;
+    int combine_input_chunk_tokens;
+    uint32_t combine_input_expected;
 };
 
 // Call combine kernel with runtime template parameter resolution

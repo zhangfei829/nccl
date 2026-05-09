@@ -330,6 +330,11 @@ struct ncclEpGroup {
         uint32_t host_dispatch_expected_intra = 0;
         uint64_t host_combine_expected_rdma = 0;
         uint32_t host_combine_expected_intra = 0;
+        // [Combine input-copy overlap, 2026-05-09] Cumulative counter
+        // incremented by 1 per ncclEpCombine call.  Lockstep with each
+        // rank's INPUT_COPY warp atomicAdd combine_input_ready[chunk_id]+=1
+        // so peer consumers know "this rank has finished input copy".
+        uint32_t host_combine_input_expected = 0;
 
         // RDMA buffers (multi-node only)
         uint64_t *rdma_inter_node_group_flags;
@@ -4076,14 +4081,48 @@ ncclResult_t ncclEpCombine(
         assert(combined_x->sizes[1] == hidden);              // Should match input hidden dimension
 
         /* ===== Copy input to IPC staging buffers ===== */
-        // Expert MLP output needs to be in IPC buffer so other ranks can read it
+        // Expert MLP output needs to be in IPC buffer so other ranks can read it.
+        //
+        // [Combine input-copy overlap, 2026-05-09] When NCCL_EP_HT_COMBINE_INPUT_COPY
+        // is enabled (env + macro + cell match), the in-kernel INPUT_COPY warp_group
+        // takes over: it does chunked G->S->G into expert_input_token and signals
+        // combine_input_ready[chunk_id]+=1, allowing the consumer-side G2S warp on
+        // peer ranks to start reading chunk_id as soon as our INPUT_COPY finishes
+        // that chunk (instead of waiting for the entire host cudaMemcpyAsync).
+#ifdef NCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY
+        static const bool ht_combine_input_copy = [](){
+            const char* v = std::getenv("NCCL_EP_HT_COMBINE_INPUT_COPY");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+        // Validate input alignment (cp.async.bulk requires 16B alignment) + dtype.
+        const bool input_x_tma_aligned =
+            ((static_cast<int>(x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
+        // Cell gating mirrors dispatch overlap: only the production NV72 cells
+        // (32,128) and (64,128) get the ENABLE_INPUT_COPY=true template instance
+        // per adapter.cu (lower cells are template-instantiated as false).
+        const bool ht_combine_input_cell_supported =
+            (ht_nv72_num_sms == 32 && ht_nv72_chunk_tokens == 128) ||
+            (ht_nv72_num_sms == 64 && ht_nv72_chunk_tokens == 128);
+        const bool ht_combine_input_copy_enabled =
+            ht_combine_input_copy && x->datatype == ncclBfloat16 &&
+            input_x_tma_aligned && group->ht_buffers.use_fabric_memory &&
+            ht_combine_input_cell_supported;
+#else
+        const bool ht_combine_input_copy_enabled = false;
+#endif
         size_t token_copy_size = static_cast<size_t>(num_tokens) * hidden * sizeof(uint16_t); // BF16 = uint16_t
-        CUDA_CHECK(cudaMemcpyAsync(
-            group->ht_buffers.expert_input_token,
-            x->data,
-            token_copy_size,
-            cudaMemcpyDeviceToDevice,
-            stream));
+        if (!ht_combine_input_copy_enabled) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                group->ht_buffers.expert_input_token,
+                x->data,
+                token_copy_size,
+                cudaMemcpyDeviceToDevice,
+                stream));
+        }
+        // Advance the cumulative expected counter unconditionally so consumers'
+        // spin condition (peer's combine_input_ready[chunk] >= expected) stays
+        // monotone whether or not THIS call uses overlap (epoch counter design).
+        group->ht_buffers.host_combine_input_expected += 1;
         if (ht_prof_c) CUDA_CHECK(cudaEventRecord(ev_c1, stream));
 
         /* ===== Convert sparse topk_weights to dense prob for backward combine ===== */
@@ -4168,6 +4207,16 @@ ncclResult_t ncclEpCombine(
         params.node_rank = group->node_id;
         params.num_tokens_per_rank = num_combined_tokens;
         params.num_recv_tokens = num_tokens;
+
+        // [Combine input-copy overlap, 2026-05-09]
+        params.user_input_token = ht_combine_input_copy_enabled
+                                      ? static_cast<const uint16_t*>(x->data)
+                                      : nullptr;
+        params.combine_input_ready_ptrs = ht_combine_input_copy_enabled
+                                              ? group->ht_buffers.combine_input_ready_buffer_ptrs
+                                              : nullptr;
+        params.combine_input_chunk_tokens = HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS;
+        params.combine_input_expected = group->ht_buffers.host_combine_input_expected;
 
         int ht_nv72_num_sms = 0;
         int ht_nv72_chunk_tokens = 0;
