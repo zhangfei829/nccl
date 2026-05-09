@@ -59,6 +59,52 @@ long_running_command 2>&1 | tail -80
 - 想限制最终输出量: 用 `awk '{lines[NR]=$0} END{for (i=NR-79; i<=NR; i++) print lines[i]}'` (流式) 或 `tail -n 80 -f` 跟踪文件
 - 自检: 这条 pipeline 的最后一段 (tail/head/awk END) 会不会等 stdin EOF? 如果是, 中间过程用户看不到, 后台跑 + 结束后 cat 文件比较安全
 
+## 陷阱 7: 路径探测失败时用 `exit 1` 杀掉用户的 jumphost shell
+
+我给一条聚合命令探测仓库路径时这样写:
+
+```bash
+NCCL_REPO=""
+for c in ~/nccl /opt/forge/home/fizhang/nccl ~/fizhang/nccl ~/work/nccl; do
+  [ -f "$c/contrib/.../jumphost_X.sh" ] && NCCL_REPO="$c" && break
+done
+[ -z "$NCCL_REPO" ] && { echo "ERROR: ..."; exit 1; } || ...
+```
+
+四个 candidate 全错 -> `exit 1` 触发. 但用户当时是**直接坐在 jumphost 的 interactive shell** (用 `ssh -t fizhang@jumphost` 或本地终端连进去), `exit 1` 让当前 bash 退出 -> **SSH session 断开**, 用户被踢回上一级 (本地终端 / 跳板机), 整个 session 状态 (cwd, 环境变量, 在跑的进程上下文) 全没. 用户得重新 ssh 进去再跑.
+
+更糟: 我设计这条命令时把它定位为"探测 + 跑 sweep"两步合一. 探测失败 -> 跑 sweep 那步压根没执行, 但**已经付出了让 user 重连 session 的代价**.
+
+正确做法:
+
+1. **interactive shell 里用 `return` / `:` / 写错误然后让 chain 自然短路**, 不要 `exit`:
+
+   ```bash
+   # 用 || true + chain && && 控制流, 避免 exit
+   NCCL_REPO=""
+   for c in ...; do [ -f "$c/path" ] && NCCL_REPO="$c" && break; done
+   [ -n "$NCCL_REPO" ] && cd "$NCCL_REPO" && (do_real_work) || echo "SKIP: repo not found, please tell me the path"
+   ```
+
+   `[ -n "$NCCL_REPO" ] && ... || echo SKIP` 失败时只 echo, 不退 shell.
+
+2. **能用 `curl|bash` 直接拉 github raw 就用**, 完全跳过本地路径探测:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/.../sweep/jumphost_X.sh | TRAYS=... bash
+   ```
+
+   脚本作者已经把 `jumphost_*compare.sh` 设计为 `curl|bash` 友好 (heredoc 用 `bash -l <<'REMOTE'` 不依赖 stdin), 所以这是 intended invocation method. 不需要本地仓库.
+
+3. **如果必须用本地仓库**, 先发**只探测**的小命令 (一行 find), 拿到路径后再发"用真路径"的真命令. 不要"探测 + 跑"合一然后 exit 1.
+
+自检清单:
+
+- [ ] 命令里有 `exit 1` / `exit N` 吗?
+- [ ] 这条命令是 user 直接粘进 interactive shell 跑, 还是脚本文件?
+- [ ] 如果是 interactive shell, `exit` 会杀掉用户当前 ssh session 吗? -> 改 `|| echo SKIP` / `return` / 不 exit
+- [ ] 能用 `curl|bash` 完全跳过本地路径吗? 优先用之.
+
 ## 陷阱 6: $HOME / 仓库路径假设没核实就用了
 
 我给的命令里 `cd ~/fizhang/nccl` 假设仓库在 `$HOME/fizhang/nccl`. 这个假设来源:
