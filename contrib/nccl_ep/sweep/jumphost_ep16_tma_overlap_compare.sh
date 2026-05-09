@@ -113,8 +113,8 @@ rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
 
 time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
   NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP" \\
-  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP" \\
+  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY" \\
+  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY" \\
   MPI_HOME=\$MPI_HOME
 REMOTE
 
@@ -134,8 +134,10 @@ export CUDA_HOME=/usr/local/cuda
 export NCCL_EP_HT_PROFILE=1
 if [[ "$enable_copy" == "1" ]]; then
   export NCCL_EP_HT_DISPATCH_TMA_COPY=1
+  export NCCL_EP_HT_COMBINE_INPUT_COPY=1
 else
   unset NCCL_EP_HT_DISPATCH_TMA_COPY || true
+  unset NCCL_EP_HT_COMBINE_INPUT_COPY || true
 fi
 cd /home/fizhang/nccl
 OUT="$REMOTE_BASE/$tag" \\
@@ -208,6 +210,24 @@ for t in sorted({k[1] for k in data}):
         b = data[("baseline", t)]
         x = data[("tma_overlap", t)]
         print(f"{t:>6} | {b[0]:>8.1f}/{b[1]:>8.1f} | {x[0]:>8.1f}/{x[1]:>8.1f} | {b[0]/x[0]:>6.2f}x")
+
+print()
+print("tokens | baseline combine_avg/kernel  | overlap combine_avg/kernel  | combine_avg speedup")
+for t in sorted({k[1] for k in data}):
+    if ("baseline", t) in data and ("tma_overlap", t) in data:
+        b = data[("baseline", t)]
+        x = data[("tma_overlap", t)]
+        print(f"{t:>6} | {b[2]:>8.1f}/{b[3]:>8.1f} | {x[2]:>8.1f}/{x[3]:>8.1f} | {b[2]/x[2]:>6.2f}x")
+
+print()
+print("tokens | baseline (D+C avg) | overlap (D+C avg) | total speedup")
+for t in sorted({k[1] for k in data}):
+    if ("baseline", t) in data and ("tma_overlap", t) in data:
+        b = data[("baseline", t)]
+        x = data[("tma_overlap", t)]
+        b_dc = b[0] + b[2]
+        x_dc = x[0] + x[2]
+        print(f"{t:>6} | {b_dc:>14.1f}us  | {x_dc:>14.1f}us  | {b_dc/x_dc:>6.2f}x")
 PY
 
 echo
