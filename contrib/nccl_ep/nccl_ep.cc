@@ -3407,15 +3407,11 @@ ncclResult_t ncclEpDispatch(
         const bool recv_x_tma_aligned =
             recv_x != nullptr &&
             ((static_cast<int>(recv_x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
-        // In-kernel copy variants (let kernel write user_recv_x directly,
-        // skip host cudaMemcpyAsync):
-        //   - (32,128) / (64,128) -> ENABLE_TMA_COPY=true
-        //   - (16,64)             -> ENABLE_LDST_COPY=true (Path C)
-        // The kernel-side template selector picks between TMA and LDST
-        // based on (NUM_BLOCKS_TUNED, CHUNK_TOKENS_TUNED).  Host only
-        // needs to know "is this cell handled by some in-kernel copy?"
+        // The in-kernel TMA-copy variant is only instantiated for the two
+        // large-token NV72 cells (32,128) and (64,128); smaller tokens still
+        // pick (16,64) at runtime and must fall back to the host
+        // cudaMemcpyAsync path, otherwise user recv_x receives no data.
         const bool ht_tma_cell_supported =
-            (ht_nv72_num_sms == 16 && ht_nv72_chunk_tokens == 64)  ||
             (ht_nv72_num_sms == 32 && ht_nv72_chunk_tokens == 128) ||
             (ht_nv72_num_sms == 64 && ht_nv72_chunk_tokens == 128);
         const bool ht_dispatch_tma_copy_enabled =

@@ -91,31 +91,6 @@
 // = 4 stages_per_pipeline, and the assertion is < (strict).
 #define HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP 3
 
-// =============== Path C: small-token LDST copy (2026-05-09) ================
-// For the (16,64) cell at small tokens (t<4096), TMA pipeline overhead
-// (~150 us per chunk: mbarrier_init + cross-rank wait + multi-stage
-// commit/wait_group) dwarfs the actual D2D physical transfer time
-// (12-24 MB total / 1.2 TB/s HBM ~0 us).  baseline cudaMemcpyAsync stream
-// tail is ~27 us for these tokens; an in-kernel copy can beat that only
-// if its overhead is much smaller than 27 us.
-//
-// Path C uses simple vectorized ld.global.v4 + st.global.v4 (16-byte
-// load/store per thread) to do the copy in-kernel.  No mbarrier, no SMEM
-// ring buffer, no commit_group/wait_group.  Single warp is enough because
-// the per-chunk physical transfer is sub-microsecond and adding warps
-// only adds entry-barrier overhead.
-//
-// Cost breakdown estimate (t=128, chunk_active=8, hidden=7168 BF16):
-//   - warp_group entry barrier:               ~3 us
-//   - cross-rank dispatch_copy_ready spin:    ~5 us  (same physical floor as TMA)
-//   - vec ld+st 8 tokens * 14336 B / 512 B per warp transaction = 224 ops:
-//                                             ~0.9 us @ 1 GHz SM clock
-//   - exit drain + sync:                      ~3 us
-//   total Δ_kernel ≈ 12 us  (vs TMA's ~150 us, vs cudaMemcpyAsync stream tail 27 us)
-//
-// Net win on t=128 ≈ 27 - 12 = +15 us  ~10% improvement on dispatch_avg.
-#define HYBRIDEP_DISPATCH_LDST_COPY_WARPS 1
-
 
 // ============================================================================
 // Combine configuration constants
