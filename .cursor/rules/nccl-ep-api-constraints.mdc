@@ -1,0 +1,61 @@
+---
+description: NCCL EP optimization scope hard constraints — never propose options that require user/framework code changes
+alwaysApply: true
+---
+
+# NCCL EP 优化方向硬性边界
+
+NCCL EP 是给上层 user / 深度学习框架 (如 PyTorch / 自研训练框架) 用的 library。
+**user 不可能为了 NCCL 性能去改自己的 model code 或 tensor allocation 方式**。
+任何要求 user 配合改 API 调用方式 / tensor 来源的优化方案, 框架不会接受, 提了等于浪费用户时间, 还显得我没理解约束。
+
+## 硬性禁区 (永远不要提的优化方向)
+
+1. **Zero-copy by exposing fabric memory pointer to user**:
+   - 例如要求 user 用 `ncclEpAllocOutput()` 而不是自己 `cudaMalloc()`
+   - 或要求 user 把 `recv_x` / `combined_x` 改成 fabric memory
+   - 框架 (e.g. PyTorch tensor) 不可能为了 NCCL 改 alloc 路径
+   - 对应已知失败例子: combine input_copy 555us 想省, 提议让 user 直接传 fabric memory pointer
+
+2. **要求 user 改 stream 用法**:
+   - 例如要求 user 把 dispatch / combine 放到不同 stream 让 NCCL 内部 overlap
+   - user 的 model forward 是确定的 sync 模式, 不会改
+
+3. **要求 user 改 expert MLP 实现**:
+   - 例如把 expert MLP 跟 dispatch / combine 在 NCCL 内部 fuse
+   - user 的 expert MLP 是 PyTorch / TF kernel, 跟 NCCL 没关系
+
+4. **要求 user 改 tensor dtype / shape / layout**:
+   - 例如 require BF16 必须先 cast, 或 hidden 必须 4096 倍数
+   - 已有的 alignment / dtype gate 是 *软* 限制 (不满足走 fallback), 不能加 *硬* 限制
+
+5. **任何 NCCL EP API 签名改动**:
+   - 不加新 input/output 参数
+   - 不改 tensor 语义 (input → output ownership)
+   - 不改 ncclEpDispatch / ncclEpCombine 调用顺序
+
+## 允许的优化空间 (在 NCCL EP 内部做)
+
+- 改 `nccl_ep.cc` host 端的 kernel launch / cudaMemcpyAsync 顺序 / stream 用法
+- 改 `hybrid_ep.cuh` / `hybridep_adapter.cu` 的 device kernel 实现
+- 改 `Makefile` / build flags (e.g. default-on macro)
+- 改 fabric memory alloc flags (cuMem*, 框架不感知)
+- 加新 micro-bench 验证物理 floor (HBM / NVLink BW)
+- 探索 PTX 新指令 (cp.async.bulk variants, multicast, cluster shared memory)
+- 改 NV72 tuning policy (select_ht_nv72_tuning), env override 模式
+
+## 自检清单 (提优化方案前必过)
+
+- [ ] 我的方案要 user 改 `cudaMalloc → ncclEpAlloc` 这种 alloc 路径吗? 是 → 禁止
+- [ ] 我的方案要 user 改 stream 用法吗? 是 → 禁止
+- [ ] 我的方案要改 ncclEpDispatch / ncclEpCombine 的 API 签名吗? 是 → 禁止
+- [ ] 我的方案是 *NCCL EP 内部* 实现改动吗? 是 → 允许提
+- [ ] 不确定时, 假设答案是 "禁止"
+
+## 反模式 (这次实际踩的)
+
+- ❌ 提议 "zero-copy: 改 NCCL EP API 让 user 直接传 fabric memory pointer" 来省 combine input_copy 555us
+- ❌ 提议 "改 stream 让 input_copy 跟 dispatch tail overlap" 跨 iter
+- ❌ 提议 "把 expert MLP fuse 进 dispatch / combine kernel"
+
+这些方向**框架不会配合**, 提了浪费时间, 显得不懂约束。
