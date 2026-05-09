@@ -972,6 +972,19 @@ struct combine_kernel_param_t{
   unsigned combine_signal_offset;  // Signal offset for combine operations
   // qp info and mr info
   struct combine_memory_region_info_t mr_info;
+
+  // [Combine input-copy overlap, 2026-05-09] In-kernel input D2D copy:
+  //   user_input_token: pointer to user-provided x (BF16, num_recv_tokens x hidden)
+  //   combine_input_ready[r]: peer r's per-chunk ready counter (fabric IPC)
+  //   combine_input_chunk_tokens: matches host HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS
+  //   num_recv_tokens: this rank's expert MLP token count (= input rows of x)
+  // Set non-null only when ENABLE_INPUT_COPY=true template is selected;
+  // otherwise host runs cudaMemcpyAsync(expert_input_token, x, ...) and
+  // these fields stay nullptr/0.
+  const uint16_t* user_input_token;
+  uint32_t* combine_input_ready[LSA_TEAM_SIZE];
+  int combine_input_chunk_tokens;
+  int num_recv_tokens;
 };
 
 // Each CUDA block has sixteen named barriers numbered 0..15.
@@ -4242,12 +4255,22 @@ template<// This type represent intra-node reduction warp group.
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
          // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
          bool BACKWARD_COMBINE,
-         int LSA_TEAM_SIZE>
+         int LSA_TEAM_SIZE,
+         // [Combine input-copy overlap, 2026-05-09] If true, an INPUT_COPY
+         // warp_group runs in the kernel head doing chunked G->S->G copy
+         // (user x -> fabric expert_input_token) and signals
+         // combine_input_ready[chunk_id] per chunk, replacing the host
+         // cudaMemcpyAsync(expert_input_token, x, ...) and overlapping the
+         // physical D2D with the main combine reduce work.
+         bool ENABLE_INPUT_COPY = false,
+         // INPUT_COPY warp_group type (size = 0 when disabled).
+         typename INPUT_COPY_GROUP = warp_group<0, 0>>
 // Each CUDA block of combine kernel has 5 warp groups and has the following layout:
 // 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2 pipeline otherwise).
 // 3. intra-node G2S warp group(1 warp, only valid for multinode scenario). 4. inter-node G2S warp group(1 warp for multinode scenario, 2 warps otherwise). 5. inter-node N2N rdma warp group(1 warp, only valid for multinode scenario).
-// Total 6(single-node) or 11(multi-node) warps per CUDA block/SM.
-__launch_bounds__(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size(), 1)
+// 6. [optional] INPUT_COPY warp group(1 warp, only when ENABLE_INPUT_COPY=true).
+// Total 6(single-node) or 11(multi-node) warps per CUDA block/SM (+1 for INPUT_COPY).
+__launch_bounds__(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size() + INPUT_COPY_GROUP::size(), 1)
 __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LSA_TEAM_SIZE> param)
 {
   // Compile-time check (only enforce for multi-node layout).
@@ -4281,7 +4304,8 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
                                NUM_OF_STAGES_S2G,
                                NUM_OF_TOKENS_PER_CHUNK,
                                BACKWARD_COMBINE,
-                               c_model);
+                               c_model,
+                               ENABLE_INPUT_COPY);
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
   // ===== FUSED DEVICE SYNC (combine head) =====
@@ -4331,6 +4355,12 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
     if constexpr(NUM_LSA_TEAMS != 1) {
       *(smem_buffer_ptr->rdma_streaming_counter) = 0u;
     }
+    // [Combine input-copy overlap, 2026-05-09] Init INPUT_COPY ring mbarriers.
+    if constexpr (ENABLE_INPUT_COPY) {
+      for (int s = 0; s < HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES; s++) {
+        cuda::ptx::mbarrier_init(smem_buffer_ptr->get_input_copy_mbar(s), 1);
+      }
+    }
     // Make mbarriers initialization visible to async proxy(TMA).
     cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
   }
@@ -4378,6 +4408,19 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
       (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.rdma_to_attn_map,
        param.dcomms, param.nccl_window, param.num_gin_comms, param.num_ctx_per_comm, param.gin_base_ptr, param.signals_base, param.combine_signal_offset,
        &param.mr_info, smem_buffer_ptr, param.hidden_dim, param.experts_per_rank);
+    }
+  }else if(threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size() + INPUT_COPY_GROUP::size()){
+    // [Combine input-copy overlap, 2026-05-09] INPUT_COPY warp_group.
+    // Active only when ENABLE_INPUT_COPY=true (otherwise INPUT_COPY_GROUP::size()==0).
+    if constexpr (ENABLE_INPUT_COPY) {
+      combine_input_copy_warp_group_device_function<INPUT_COPY_GROUP, uint16_t, cur_smem_t>(
+          param.hidden_dim,
+          param.num_recv_tokens,
+          param.combine_input_chunk_tokens,
+          param.user_input_token,
+          param.expert_input_token[param.local_rank],
+          param.combine_input_ready[param.local_rank],
+          smem_buffer_ptr);
     }
   }else{
     // Too many threads, should not goes here.
@@ -5026,7 +5069,12 @@ public:
            // Number of fully in-flight S2G in intra-node reduction warp group.
            int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G,
            // Whether the combine kernel is used in backward process.
-           bool BACKWARD_COMBINE>
+           bool BACKWARD_COMBINE,
+           // [Combine input-copy overlap, 2026-05-09] If true, kernel runs an
+           // INPUT_COPY warp_group that does in-kernel chunked G->S->G of
+           // user x to fabric expert_input_token (host skips the
+           // pre-kernel cudaMemcpyAsync).
+           bool ENABLE_INPUT_COPY = false>
   static void combine(combine_kernel_param_t<LSA_TEAM_SIZE> param, cudaStream_t stream)
   {
     // The warp groups data type for combine kernel, must match the warp groups layout required by the combine kernel.
@@ -5041,11 +5089,14 @@ public:
     constexpr int INTER_NODE_G2S_GROUP_START = multinode_layout ? 9 : 4;
     constexpr int INTER_NODE_RDMA_GROUP_WARPS = multinode_layout ? 1 : 0;
     constexpr int INTER_NODE_RDMA_GROUP_START = multinode_layout ? 10 : 6;
+    constexpr int INPUT_COPY_GROUP_WARPS = ENABLE_INPUT_COPY ? HYBRIDEP_COMBINE_INPUT_COPY_WARPS : 0;
+    constexpr int INPUT_COPY_GROUP_START = INTER_NODE_RDMA_GROUP_START + INTER_NODE_RDMA_GROUP_WARPS;
     using INTRA_NODE_RED_GROUP = warp_group<INTRA_NODE_RED_GROUP_WARPS, INTRA_NODE_RED_GROUP_START>;
     using INTER_NODE_RED_GROUP = warp_group<INTER_NODE_RED_GROUP_WARPS, INTER_NODE_RED_GROUP_START>;
     using INTRA_NODE_G2S_GROUP = warp_group<INTRA_NODE_G2S_GROUP_WARPS, INTRA_NODE_G2S_GROUP_START>;
     using INTER_NODE_G2S_GROUP = warp_group<INTER_NODE_G2S_GROUP_WARPS, INTER_NODE_G2S_GROUP_START>;
     using INTER_NODE_RDMA_GROUP = warp_group<INTER_NODE_RDMA_GROUP_WARPS, INTER_NODE_RDMA_GROUP_START>;
+    using INPUT_COPY_GROUP = warp_group<INPUT_COPY_GROUP_WARPS, INPUT_COPY_GROUP_START>;
     constexpr int NUM_OF_DATA_PIPELINE_PER_BLOCK = multinode_layout ? 1 : 2;
     static_assert(INTER_NODE_G2S_GROUP::warp_size() == NUM_OF_DATA_PIPELINE_PER_BLOCK, "Inter-node G2S warp group pipeline and inter-node red warp group pipeline mismatch.");
 
@@ -5053,7 +5104,8 @@ public:
     // The combine kernel to be launched.
     const auto combine_kernel_ptr = combine_kernel<INTRA_NODE_RED_GROUP, INTER_NODE_RED_GROUP, INTRA_NODE_G2S_GROUP, INTER_NODE_G2S_GROUP, INTER_NODE_RDMA_GROUP, NUM_OF_DATA_PIPELINE_PER_BLOCK, NUM_OF_STAGES_G2S,
                                                    NUM_OF_STAGES_S2G, NUM_OF_TOKENS_PER_GROUP, NUM_OF_TOKENS_PER_CHUNK, MAX_NUM_OF_TOKENS_PER_RANK,
-                                                  NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE, LSA_TEAM_SIZE>;
+                                                  NUM_LSA_TEAMS, NUM_OF_BLOCKS, NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, BACKWARD_COMBINE, LSA_TEAM_SIZE,
+                                                  ENABLE_INPUT_COPY, INPUT_COPY_GROUP>;
 
     // Configure dynamic shared memory for the combine kernel.
     model_config_t model;
@@ -5067,7 +5119,8 @@ public:
                                                                   NUM_OF_TOKENS_PER_CHUNK,
                                                                   MAX_NUM_OF_TOKENS_PER_RANK,
                                                                   NUM_LSA_TEAMS,
-                                                                  BACKWARD_COMBINE>(model);
+                                                                  BACKWARD_COMBINE,
+                                                                  ENABLE_INPUT_COPY>(model);
     // Configure dynamic shared memory; reconfigure if size grows.
     static int configured_smem = 0;
     if(SMEM_SIZE > configured_smem){
@@ -5078,7 +5131,7 @@ public:
     }
 
     // Launch combine kernel (device_sync is fused into combine kernel head).
-    constexpr int BLOCK_DIM = INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size();
+    constexpr int BLOCK_DIM = INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size() + INPUT_COPY_GROUP::size();
     combine_kernel_ptr<<<NUM_OF_BLOCKS, BLOCK_DIM, SMEM_SIZE, stream>>>(param);
 
     // Check if there is any CUDA error.
