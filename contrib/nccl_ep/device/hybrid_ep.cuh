@@ -4266,6 +4266,12 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
                token_id, bytes_per_token, g_src, g_dst, smem_s, mbar_s, stage);
       }
 
+      // [BENCH-DEBUG 2026-05-09] Skip the actual cp.async.bulk to verify
+      // it's the PTX call that aborts (not host setup or kernel-head sync).
+      // If sweep now passes (no abort), the issue is in cp.async.bulk
+      // touching fabric memory.  If it still aborts, look elsewhere.
+      return;
+
       // Step 1: G->S (TMA load user x token into SMEM ring slot)
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_shared,
