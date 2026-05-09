@@ -1319,8 +1319,7 @@ template<typename INTRA_NODE_S2G_GROUP,
          bool FORWARD_DISPATCH,
          bool ENABLE_TMA_COPY,
          int NUM_PIPELINES,
-         int LSA_TEAM_SIZE,
-         bool ENABLE_LDST_COPY = false>
+         int LSA_TEAM_SIZE>
 __forceinline__ __device__ void S2G_warp_group_device_function(const int local_rank,
                                                       const int node_rank,
                                                       const int num_of_tokens_per_rank,
@@ -1467,7 +1466,7 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
             if (token_needed_by_this_node){
               int copy_chunk_ids[LSA_TEAM_SIZE];
               bool copy_wrote_rank[LSA_TEAM_SIZE];
-              if constexpr (ENABLE_TMA_COPY || ENABLE_LDST_COPY) {
+              if constexpr (ENABLE_TMA_COPY) {
                 #pragma unroll
                 for (int r = 0; r < LSA_TEAM_SIZE; r++) {
                   copy_chunk_ids[r] = -1;
@@ -1508,7 +1507,7 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
                                                reinterpret_cast<const void*>(smem_buffer_ptr->get_sf_buffer(pipeline_rank, stage)),
                                                (uint32_t)((HIDDEN_DIM / 128) * sizeof(float)));
                     }
-                    if constexpr (ENABLE_TMA_COPY || ENABLE_LDST_COPY) {
+                    if constexpr (ENABLE_TMA_COPY) {
                       if (remote_dispatch_copy_ready != nullptr &&
                           dispatch_copy_chunk_tokens > 0 &&
                           remote_rank_id < LSA_TEAM_SIZE) {
@@ -1520,12 +1519,10 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
                 }
               }
               cuda::ptx::cp_async_bulk_commit_group();
-              if constexpr (ENABLE_TMA_COPY || ENABLE_LDST_COPY) {
+              if constexpr (ENABLE_TMA_COPY) {
                 // Correctness first: signal per-output-chunk readiness only
-                // after all TMA writes for this token are complete.  Same
-                // synchronization for both ENABLE_TMA_COPY (in-kernel TMA
-                // copy) and ENABLE_LDST_COPY (in-kernel ld.v4/st.v4 copy)
-                // because both consumer paths spin on dispatch_copy_ready.
+                // after all TMA writes for this token are complete. This limits
+                // S2G in-flight depth when the overlap prototype is enabled.
                 cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
                 #pragma unroll
                 for (int r = 0; r < LSA_TEAM_SIZE; r++) {
@@ -1567,9 +1564,7 @@ __forceinline__ __device__ void S2G_warp_group_device_function(const int local_r
     // Drain all in-flight TMA S2G writes before returning.
     // Required because fused device_sync signals inter-rank completion
     // inside this kernel (no stream-ordering guarantee from a separate kernel).
-    // Both ENABLE_TMA_COPY and ENABLE_LDST_COPY already drained per-token
-    // (cp_async_bulk_wait_group<0> right before the red.relaxed.sys.global.add).
-    if constexpr (!(ENABLE_TMA_COPY || ENABLE_LDST_COPY)) {
+    if constexpr (!ENABLE_TMA_COPY) {
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
     }
   }
@@ -4073,7 +4068,7 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
     param.gin_base_ptr, &param.mr_info, smem_buffer_ptr, param.experts_per_rank);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size()){
     S2G_warp_group_device_function
-    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, ENABLE_TMA_COPY, NUM_PIPELINES, LSA_TEAM_SIZE, ENABLE_LDST_COPY>
+    <INTRA_NODE_S2G_GROUP, TOKEN_DATA_TYPE, cur_smem_t, NUM_OF_STAGES, NUM_OF_IN_FLIGHT_S2G, NUM_OF_TOKENS_PER_CHUNK, NUM_LSA_TEAMS, NUM_OF_BLOCKS, FORWARD_DISPATCH, ENABLE_TMA_COPY, NUM_PIPELINES, LSA_TEAM_SIZE>
     (param.local_rank, param.node_rank, param.num_of_tokens_per_rank, param.num_of_ranks_per_node, param.hidden_dim, param.rdma_to_attn_map, param.sparse_to_dense_map, param.expert_output_token, param.expert_output_prob,
     param.expert_output_scaling_factor, param.dispatch_copy_ready, param.dispatch_copy_chunk_tokens, smem_buffer_ptr, param.experts_per_rank);
   } else if (threadIdx_x_int < INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size() + COPY_GROUP::size()){
