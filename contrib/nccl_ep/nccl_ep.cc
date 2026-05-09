@@ -4080,6 +4080,14 @@ ncclResult_t ncclEpCombine(
         assert(combined_x->sizes[0] == num_combined_tokens); // Output should match original token count
         assert(combined_x->sizes[1] == hidden);              // Should match input hidden dimension
 
+        // Resolve NV72 cell here (instead of right before call_combine) because
+        // the combine input-copy overlap host gate below needs it to decide
+        // whether to skip the pre-kernel cudaMemcpyAsync.
+        int ht_nv72_num_sms = 0;
+        int ht_nv72_chunk_tokens = 0;
+        select_ht_nv72_tuning(group, handle->num_tokens, handle->use_fp8,
+                              &ht_nv72_num_sms, &ht_nv72_chunk_tokens);
+
         /* ===== Copy input to IPC staging buffers ===== */
         // Expert MLP output needs to be in IPC buffer so other ranks can read it.
         //
@@ -4218,10 +4226,8 @@ ncclResult_t ncclEpCombine(
         params.combine_input_chunk_tokens = HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS;
         params.combine_input_expected = group->ht_buffers.host_combine_input_expected;
 
-        int ht_nv72_num_sms = 0;
-        int ht_nv72_chunk_tokens = 0;
-        select_ht_nv72_tuning(group, handle->num_tokens, handle->use_fp8,
-                              &ht_nv72_num_sms, &ht_nv72_chunk_tokens);
+        // (ht_nv72_num_sms / ht_nv72_chunk_tokens already resolved earlier
+        // for the combine input-copy overlap host gate.)
 
         /* ===== Call combine kernel ===== */
         nccl_ep::hybridep::call_combine(
