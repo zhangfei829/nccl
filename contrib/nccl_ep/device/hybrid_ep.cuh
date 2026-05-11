@@ -4294,24 +4294,29 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
   static_assert(kNumWarps == kNumStages,
                 "V7 requires NUM_WARPS == NUM_STAGES (each warp owns 1 slot).");
 
-  // [V7 2026-05-11 attempt 2] Spin-wait per-CTA SMEM gate set by
-  // inter_node_G2S warp_group at end of its work, with __nanosleep yield
-  // so spin-loop releases SM scheduler slot.  Without yield (V7 attempt 1)
-  // INPUT_COPY's 4 warps each spinning starved INTER_NODE_G2S's 2 warps
-  // of issue slots, causing combine_kernel ~1500us per iter and ep_bench
-  // 100+ iter timeout at 123s (rc=124).  __nanosleep PTX is sm_70+ and
-  // gives the scheduler a hard yield hint each iter so G2S can issue
-  // cp.async.bulk and reach the atomicAdd at G2S func end.
+  // [V7 attempt 3 2026-05-11] DISABLED: V7 SMEM gate causes cross-rank
+  // deadlock cycle when combined with V5-A's existing cross-rank
+  // remote_combine_input_ready spin-wait in inter_node_G2S (line ~2793):
   //
-  // Sleep granularity 1024 ns ~= 1us is fine because gate monotonically
-  // increases and we only need to detect the transition once.  Total
-  // INPUT_COPY spin time ~= G2S work time ~200us, so ~200 nanosleep
-  // iterations total (negligible cost).
+  //   本 rank INPUT_COPY  --waits-->  本 rank G2S  (V7 SMEM gate)
+  //   本 rank G2S         --waits-->  peer ready    (V5-A cross-rank)
+  //   peer  INPUT_COPY    --waits-->  peer G2S      (V7 peer SMEM gate)
+  //   peer  G2S           --waits-->  本 rank ready (V5-A cross-rank)
+  //   --> 4-node cycle, all 16 ranks deadlock simultaneously.
+  //
+  // Both attempt 1 (no nanosleep) and attempt 2 (with nanosleep yield) hit
+  // 123s timeout because deadlock is logical, not SM-scheduling.
+  //
+  // V7 SMEM gate fundamentally incompatible with combine's cross-rank
+  // dependency (G2S must wait peer's INPUT_COPY).  Disabling the
+  // spin-wait restores V5-A baseline (~1660us combine_kernel, -48% wall
+  // BW vs no-overlap, but no deadlock).  Going beyond V5-A in-kernel
+  // requires architectural change (push-mode combine, removes G2S->peer
+  // ready dependency entirely).
+  //
+  // (void) num_g2s_warps;  // unused
   if (smem_buffer_ptr->input_copy_g2s_gate != nullptr && num_g2s_warps > 0) {
-    volatile uint32_t* gate_v = smem_buffer_ptr->input_copy_g2s_gate;
-    while (*gate_v < static_cast<uint32_t>(num_g2s_warps)) {
-      __nanosleep(1024u);  // yield SM scheduler slot ~1us per iter
-    }
+    // intentionally empty: see deadlock note above
   }
 
   if (blockIdx.x == 0 && warp_id == 0) {
