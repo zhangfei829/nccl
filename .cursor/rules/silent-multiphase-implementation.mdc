@@ -1,0 +1,67 @@
+---
+description: When user authorises a multi-phase implementation, agent should silently commit + push intermediate phases without checkpointing user. Only stop / ask at functional + testable phase or build error.
+alwaysApply: true
+---
+
+# Multi-phase implementation: silent intermediate phases
+
+这条规则是 2026-05-11 当天的直接产物。原话:
+> 写入规则，既然不需要测试，你后台按轮次完成，不用通知我
+
+## 根因
+
+agent 跟 user 商定 multi-phase implementation (例如 push-mode combine 的 R1-R5 phases). agent 之前每 phase 都:
+1. write code
+2. commit + push
+3. **ask user 是否继续下一 phase** ← 浪费 conversation round + user time
+
+User 视角: "phase 中间的 commit 我不可能 test, 你还问我干嘛, 直接做完到我能 test 的 phase". phase 1-3 build-only / scaffolding, 不可独立 test, ask user 是 over-cautious / agent 自我设防.
+
+## 硬性规则
+
+1. **multi-phase 任务在 user 明确 authorise 之后** (e.g., "go", "implement", "做"), agent 必须:
+   - 在单个 response 内 sequentially commit + push *所有 phases* 直到第一个 testable phase
+   - 不 ask user 是否继续中间 phase
+   - 只在最后一个 testable phase 完成时 ask user 跑测试
+
+2. **什么算 "testable phase"**:
+   - functional 完整 (代码逻辑 closed loop, 不 break correctness)
+   - 用户可以 sweep / run validation get evidence-driven 数据
+   - phase 之前 commit 是 scaffolding (struct/macro/header changes / dead code), 不 testable
+
+3. **强制 stop 例外**:
+   - **build error**: any commit 跑 lint 报新 error → stop + report (但 pre-existing CUDA lint warnings 不算)
+   - **runtime/logic 严重 bug 自检发现**: e.g., infinite loop 在 spin-wait, deadlock 假设, 必须 stop
+   - **scope drift**: 实施过程中发现 design 跟 user 沟通的 architecture 不符 (e.g., 决定 implement A 但实际写成 B), 必须 stop + 重新 sync
+
+4. **Commit message 格式**:
+   - 中间 phase: `[X phase N/M] <what>` (用户能从 git log 看到 N of M progress)
+   - 最后 testable phase: `[X phase N/M, READY-FOR-TEST] <what>`
+
+5. **Final response 格式**:
+   - 简短列出 phase 1..N 各自 commit hash
+   - 给 1 个测试命令 (single-shot, kill stale + run + grep markers, 按 `auto-run-and-collect-cluster-tests.mdc` rule)
+   - 不要 re-explain design (那已经在多 round 上对齐过)
+
+## 反模式 (这次踩的)
+
+- ❌ 每个 phase 1 个 response, ask "OK 我开始 R2 吗?"
+- ❌ phase 1 commit 后报告 "phase 1 done, 等你 confirm 才 R2", user 已 explicit "go"
+- ❌ 把 multi-phase 拆成 multi-conversation-round, 每 round 用户都要重新 context
+
+## 自检清单 (multi-phase task 必过)
+
+- [ ] user 是否明确 authorise multi-phase? (e.g., "implement", "go", 不是 "我考虑一下")
+- [ ] 当前 phase 是 testable 还是 scaffolding?
+   - scaffolding → 直接 commit + push + 进下一 phase, 不 stop
+   - testable → ask user 跑测试
+- [ ] 我是否在每 phase 都问 user "继续吗?" → 错, 立即改
+- [ ] 我是否把 1 hour 的 multi-phase 工作 spread 成 5 个 conversation round? → 错, 应该 1 个 response 做完直到 testable phase
+
+## 跟现有规则的关系
+
+- `one-step-at-a-time.mdc`: 能聚合就聚合一步搞定. 这条规则同方向, applied to multi-phase implementation.
+- `root-cause-before-revert.mdc`: 失败时不退缩. 这条规则补缺: 成功路径上不要 over-checkpoint.
+- `never-propose-abandon.mdc`: 不主动 propose abandon. 同样不 over-ask 让 user 决定中间 phase.
+
+合起来: agent 在 *做* 事时, 应该 silent + forward, 不 over-checkpoint user.
