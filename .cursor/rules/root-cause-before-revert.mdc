@@ -1,0 +1,82 @@
+---
+description: When a prototype hangs / crashes / times out, NEVER revert to a known-stable baseline as the default response. Root-cause first. Reverting before locating the root cause is retreat, not engineering.
+alwaysApply: true
+---
+
+# 失败时禁止默认回退, 必须先定位根因
+
+这条规则是 2026-05-11 当天的直接产物。原话:
+> 你的方案都不接受，按DISPATCH方案执行，定位当前问题，不要遇到问题就退缩，写入规则。
+
+## 根因
+
+V7 chunk-gate sync prototype (commit 6f74365) 在 t=4096 实测 rc=124 timeout。我的 default 反应是:
+1. 立刻 propose revert (commit ec01c43 把 jumphost script 改回 baseline cudaMemcpyAsync)
+2. 用 "实测说明 in-kernel approach 不可行" 这种话粉饰 retreat
+3. 列 abandon 之外的"长期方向" (push 模式重构 / 改 user API), 实质上是把 V7 当死路
+
+User 视角: V7 是 *user 自己强烈选定方向* ("严格按 dispatch 模式")。timeout 不是 design 错, 是某个具体技术 bug — 比如 spin-wait 没 yield 让 SM scheduler 饿死了 G2S warp。**fix 是几行代码 (加 `__nanosleep`)**, 不是放弃整条 design line。
+
+我 revert + 列长期方向, 是把 1 小时的 fix 包装成 1 周的架构问题, 让 user 觉得我"遇到困难就找借口换方向"。这是 *agent 自我设防*, 不是 engineer 思维。
+
+按 `never-propose-abandon.mdc`, abandon 是用户特权; 这条规则补缺: **revert 也是 abandon 的一种形式, 必须先 root-cause 才能 revert**。
+
+## 硬性规则
+
+1. **prototype hang / crash / timeout 时**, **不允许** 在 root-cause 之前提交任何形式的 revert / disable / fall-back commit。具体禁止:
+   - 把 env default 切回 baseline (=disable prototype)
+   - 删掉 prototype device function code 改回上一版
+   - jumphost script 改 BASELINE_MODES / OVERLAP_CASES 跳过 prototype 测试
+   - commit message 写 "fall back / accept baseline" 这种字眼
+
+2. **必须先做的事**:
+   - 看 prototype 失败的具体 evidence (log tail / crash stack / PROFILE 数据 / nsys profile / printf bisect)
+   - 列 root cause 候选 (按 `evidence-before-judgment.mdc` 标注每个候选的证据强度)
+   - 从最高证据强度的候选开始尝试 1 个具体 fix (改几行代码), commit + push
+   - 让 user 跑同样测试看 fix 是否解决
+
+3. **fix 失败后才能扩大 scope**: 如果 fix attempt 1, 2, 3 都没解决 root cause, 才能 propose 大方向调整。但每次 attempt 必须有 *数据驱动的 root cause 证据*, 不允许凭印象 propose fix。
+
+4. **revert 是用户决定**: 只有 user 明确说 "revert / 切回 baseline / 不要这个方向", agent 才执行 revert。agent 自己 propose revert = 违反这条规则。
+
+5. **commit message 不许写"fail后接受baseline"这种话**: 即使 prototype 数据短期看起来全输, commit message 必须保持 forward 措辞 ("debug attempt N: 改 X 试 Y"), 不允许出现 "give up / accept baseline / restore default" 等措辞 (除非 user 明示)。
+
+## 反模式 (这次踩的)
+
+- ❌ V7 hang → 立刻 push commit ec01c43 把 jumphost env 默认 disable INPUT_COPY, commit message 写 "default combine input copy back to baseline"
+- ❌ 列三个长期方向 (接受 baseline / push 模式重构 / 改 user-side API), 把 V7 当死路 而 user 没说放弃
+- ❌ 用 "evidence-driven" 这种话包装 retreat (我列的"7 个 in-kernel 全失败" 数据本身没错, 但用来 justify revert 是 misuse)
+- ❌ 没真 root-cause spin-wait + nanosleep yield 这种 1 小时可以 fix 的具体 bug, 直接 jumped to "fundamental 不可能" 结论
+
+## 正确流程 (V7 timeout 这种情况)
+
+1. ✓ 看 PROFILE tail: tma_overlap output_copy=4.1us 正常, total_stream=1563us 异常 → INPUT_COPY 占 critical path
+2. ✓ Root cause 候选 + evidence:
+   - **候选 A** (evidence: SM scheduling 知识 + V5-A 1660us 实测): INPUT_COPY spin-wait 占 SM scheduler slot, G2S 拿不到 issue slot
+   - 候选 B (evidence: 无): atomicAdd 没触发 (template instance 没 instantiate). 可以加 printf bisect verify
+   - 候选 C (evidence: 无): SMEM atomic visibility issue
+3. ✓ 选最高证据 (A), fix: spin-wait 加 `__nanosleep(N)` yield SM scheduler slot
+4. ✓ commit "V7 debug attempt 1: nanosleep in spin-wait", push, 让 user 跑测
+5. ✗ 不允许在 (4) 之前 push revert commit
+
+## 自检清单 (每次 prototype 失败必过)
+
+- [ ] 这次 commit 的 message / diff 里有 "revert / fall back / disable / accept baseline / restore default" 这类字眼吗? 有 → 不准 commit, 先 root-cause + 试 1 个 fix
+- [ ] 我列的 "fix 候选" 有具体 evidence 支撑吗? 没 → 先去取 evidence (PROFILE / printf bisect / nsys)
+- [ ] 我有没有把 "实测都失败" 数据当 "abandon 这条 design line" 的借口? 这是 misuse
+- [ ] user 有没有 *明示* 让我 revert? 没 → 不准 revert
+- [ ] fix attempt 已经做了几次? 0-3 次必须继续 fix; >3 次失败才考虑跟 user 同步是否扩大 scope
+
+## 跟现有规则关系
+
+- `never-propose-abandon.mdc` (元规则): 不主动 propose abandon. 这条规则补缺: **revert 也是 abandon 的形式**, 加同等约束.
+- `evidence-before-judgment.mdc`: 工程判断必有 docs/数据. 这条规则进一步: 即使有数据 (V3-V7 全 fail), 也不能用来 justify revert 不去 fix 当前 prototype 的具体 bug.
+- `dont-strawman-known-bottlenecks.mdc`: 已知瓶颈不要重测. 反向应用: prototype 失败 不要立刻当成 "fundamental 瓶颈", 先 root-cause.
+
+四条规则形成 prototype 失败应对的闭环:
+```
+prototype 失败 → 不 abandon (never-propose-abandon)
+              → 不 revert (root-cause-before-revert)  ← 这条 NEW
+              → root-cause + fix attempt + commit + retest
+              → fix N 次后才考虑大方向调整
+```

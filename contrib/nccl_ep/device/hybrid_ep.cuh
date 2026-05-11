@@ -4294,17 +4294,24 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
   static_assert(kNumWarps == kNumStages,
                 "V7 requires NUM_WARPS == NUM_STAGES (each warp owns 1 slot).");
 
-  // [V7 2026-05-11] Spin-wait per-CTA SMEM gate set by inter_node_G2S
-  // warp_group at end of its work.  This sequentialises TMA engine usage
-  // between INTER_NODE_G2S (cp.async.bulk read peer expert_input_token)
-  // and INPUT_COPY (cp.async.bulk LOAD/STORE for local expert_input_token
-  // write), which V5-A measurement showed was the missing piece vs
-  // dispatch_tma_copy_warp_group's chunk-wise wait.  Each lane-0 of each
-  // INPUT_COPY warp spins independently; volatile load is safe since gate
-  // is monotonically increasing in this CTA.
+  // [V7 2026-05-11 attempt 2] Spin-wait per-CTA SMEM gate set by
+  // inter_node_G2S warp_group at end of its work, with __nanosleep yield
+  // so spin-loop releases SM scheduler slot.  Without yield (V7 attempt 1)
+  // INPUT_COPY's 4 warps each spinning starved INTER_NODE_G2S's 2 warps
+  // of issue slots, causing combine_kernel ~1500us per iter and ep_bench
+  // 100+ iter timeout at 123s (rc=124).  __nanosleep PTX is sm_70+ and
+  // gives the scheduler a hard yield hint each iter so G2S can issue
+  // cp.async.bulk and reach the atomicAdd at G2S func end.
+  //
+  // Sleep granularity 1024 ns ~= 1us is fine because gate monotonically
+  // increases and we only need to detect the transition once.  Total
+  // INPUT_COPY spin time ~= G2S work time ~200us, so ~200 nanosleep
+  // iterations total (negligible cost).
   if (smem_buffer_ptr->input_copy_g2s_gate != nullptr && num_g2s_warps > 0) {
     volatile uint32_t* gate_v = smem_buffer_ptr->input_copy_g2s_gate;
-    while (*gate_v < static_cast<uint32_t>(num_g2s_warps)) { /* spin */ }
+    while (*gate_v < static_cast<uint32_t>(num_g2s_warps)) {
+      __nanosleep(1024u);  // yield SM scheduler slot ~1us per iter
+    }
   }
 
   if (blockIdx.x == 0 && warp_id == 0) {
