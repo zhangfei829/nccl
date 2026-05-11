@@ -27,6 +27,10 @@ HEAD_TRAY="${HEAD_TRAY:-$(echo "$TRAYS" | awk '{print $1}')}"
 TOKENS="${TOKENS:-4096 8192}"
 BASELINE_MODES="${BASELINE_MODES:-ht_bf16}"
 OVERLAP_CASES="${OVERLAP_CASES:-32:128 64:128}"
+# Extra build-time defines (passed to both EXTRA_CXXFLAGS and EXTRA_NVCCFLAGS).
+# Used to opt into compile-time profiling macros without forking the script.
+# Example: EXTRA_BUILD_FLAGS="-DNCCL_EP_HT_INPUT_COPY_STAGE_PROFILE"
+EXTRA_BUILD_FLAGS="${EXTRA_BUILD_FLAGS:-}"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/ep16_tma_overlap_${TS}}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
@@ -44,14 +48,15 @@ mkdir -p "$LOCAL_OUT"
 cat <<EOF
 ===========================================================
 Jumphost EP16 TMA-overlap comparison
-  SSH_KEY       : $SSH_KEY
-  USER_NAME     : $USER_NAME
-  HEAD_TRAY     : $HEAD_TRAY
-  TRAYS         : $TRAYS
-  TOKENS        : $TOKENS
-  BASELINE_MODES: $BASELINE_MODES
-  OVERLAP_CASES : $OVERLAP_CASES
-  LOCAL_OUT     : $LOCAL_OUT
+  SSH_KEY          : $SSH_KEY
+  USER_NAME        : $USER_NAME
+  HEAD_TRAY        : $HEAD_TRAY
+  TRAYS            : $TRAYS
+  TOKENS           : $TOKENS
+  BASELINE_MODES   : $BASELINE_MODES
+  OVERLAP_CASES    : $OVERLAP_CASES
+  EXTRA_BUILD_FLAGS: ${EXTRA_BUILD_FLAGS:-<none>}
+  LOCAL_OUT        : $LOCAL_OUT
 ===========================================================
 EOF
 
@@ -113,8 +118,8 @@ rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
 
 time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
   NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY" \\
-  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY" \\
+  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY $EXTRA_BUILD_FLAGS" \\
+  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY $EXTRA_BUILD_FLAGS" \\
   MPI_HOME=\$MPI_HOME
 REMOTE
 

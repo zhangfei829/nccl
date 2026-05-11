@@ -4206,6 +4206,16 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
 //     per chunk
 //   - With chunked pipeline: max(190, 280) = ~280us per chunk × 4 chunks
 //     ~= 1120us, vs baseline 555+1114 = 1669us -> ~1.4x combine speedup.
+
+// 64-bit nanosecond globaltimer (PTX ISA 9.x special register %globaltimer,
+// supported sm_30+). Used by NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE (default off)
+// to break down V3 PRODUCER/CONSUMER stage time without touching kernel sig.
+__forceinline__ __device__ uint64_t hybridep_get_globaltimer_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
 template<typename COPY_GROUP,
          typename TOKEN_DATA_TYPE,
          typename SMEM_TYPE>
@@ -4273,6 +4283,10 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     int      stage = 0;
     uint32_t consumer_phase = 1;  // wait_parity(1) immediately satisfies on init parity 0
     int      tokens_issued = 0;
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+    uint64_t p_wait_ns = 0;   // PRODUCER waiting cons_mbar (slot free)
+    uint64_t p_issue_ns = 0;  // PRODUCER cp.async.bulk LOAD issue + arrive_expect_tx
+#endif
 
     for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
       const int chunk_start = chunk_id * input_copy_chunk_tokens;
@@ -4290,11 +4304,18 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
         uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
         uint64_t* cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(stage);
 
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t pt0 = hybridep_get_globaltimer_ns();
+#endif
         // Wait for consumer to free this slot (skip first NUM_STAGES iters
         // since slots start free with parity 0).
         if (tokens_issued >= kNumStages) {
           while (!cuda::ptx::mbarrier_try_wait_parity(cons_m, consumer_phase)) {}
         }
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t pt1 = hybridep_get_globaltimer_ns();
+        p_wait_ns += (pt1 - pt0);
+#endif
 
         cuda::ptx::cp_async_bulk(
             cuda::ptx::space_shared,
@@ -4309,6 +4330,10 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
             cuda::ptx::space_shared,
             prod_m,
             static_cast<uint32_t>(bytes_per_token));
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t pt2 = hybridep_get_globaltimer_ns();
+        p_issue_ns += (pt2 - pt1);
+#endif
 
         tokens_issued += 1;
         stage += 1;
@@ -4322,10 +4347,31 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     if (blockIdx.x == 0) {
       printf("[INPUT-COPY-V3-PROD-DONE] tokens_issued=%d\n", tokens_issued);
     }
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+    if (blockIdx.x == 0) {
+      // ns -> us divide by 1000.0; sum p_wait + p_issue ~ producer wall time
+      printf("[INPUT-COPY-PROFILE-PROD] block=0 tokens=%d "
+             "p_wait_us=%.1f p_issue_us=%.1f p_total_us=%.1f "
+             "p_wait_ns=%llu p_issue_ns=%llu\n",
+             tokens_issued,
+             (double)p_wait_ns / 1000.0,
+             (double)p_issue_ns / 1000.0,
+             (double)(p_wait_ns + p_issue_ns) / 1000.0,
+             (unsigned long long)p_wait_ns,
+             (unsigned long long)p_issue_ns);
+    }
+#endif
   } else if (warp_id == 1) {
     // ====== CONSUMER warp ======
     int      stage = 0;
     uint32_t producer_phase = 0;  // wait_parity(0) waits until parity flips to 1
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+    uint64_t c_wait_ns   = 0;  // CONSUMER waiting prod_mbar (LOAD complete)
+    uint64_t c_store_ns  = 0;  // CONSUMER cp.async.bulk STORE issue + commit + wait_group_read drain
+    uint64_t c_arrive_ns = 0;  // CONSUMER mbarrier_arrive(cons_m) (slot free signal)
+    uint64_t c_fence_ns  = 0;  // per-chunk wait_group + __threadfence_system + red.release
+    int      c_tokens_done = 0;
+#endif
 
     for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
       const int chunk_start = chunk_id * input_copy_chunk_tokens;
@@ -4347,9 +4393,16 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
         uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
         uint64_t* cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(stage);
 
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t ct0 = hybridep_get_globaltimer_ns();
+#endif
         // Wait for producer to fill this slot.
         while (!cuda::ptx::mbarrier_try_wait_parity(prod_m, producer_phase)) {}
         cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t ct1 = hybridep_get_globaltimer_ns();
+        c_wait_ns += (ct1 - ct0);
+#endif
 
         if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
           printf("[INPUT-COPY-V3-CONS-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n",
@@ -4366,6 +4419,10 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
             static_cast<uint32_t>(bytes_per_token));
         cuda::ptx::cp_async_bulk_commit_group();
         cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t ct2 = hybridep_get_globaltimer_ns();
+        c_store_ns += (ct2 - ct1);
+#endif
 
         if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
           printf("[INPUT-COPY-V3-CONS-T0-AFTER-STORE] STORE drain OK\n");
@@ -4373,6 +4430,11 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
 
         // Signal slot free for producer.
         cuda::ptx::mbarrier_arrive(cons_m);
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+        const uint64_t ct3 = hybridep_get_globaltimer_ns();
+        c_arrive_ns += (ct3 - ct2);
+        c_tokens_done += 1;
+#endif
 
         stage += 1;
         if (stage == kNumStages) {
@@ -4381,6 +4443,9 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
         }
       }
 
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+      const uint64_t cf0 = hybridep_get_globaltimer_ns();
+#endif
       // After all tokens in this chunk are stored: ensure visibility to peer
       // GPUs (which read via cp.async.bulk in inter_node_G2S) before
       // signalling combine_input_ready[chunk_id].
@@ -4391,7 +4456,31 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
                    : "l"(__cvta_generic_to_global(combine_input_ready + chunk_id)),
                      "n"(1)
                    : "memory");
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+      const uint64_t cf1 = hybridep_get_globaltimer_ns();
+      c_fence_ns += (cf1 - cf0);
+#endif
     }
+
+#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
+    if (blockIdx.x == 0) {
+      const uint64_t c_total_ns = c_wait_ns + c_store_ns + c_arrive_ns + c_fence_ns;
+      printf("[INPUT-COPY-PROFILE-CONS] block=0 tokens=%d "
+             "c_wait_us=%.1f c_store_us=%.1f c_arrive_us=%.1f c_fence_us=%.1f c_total_us=%.1f\n",
+             c_tokens_done,
+             (double)c_wait_ns   / 1000.0,
+             (double)c_store_ns  / 1000.0,
+             (double)c_arrive_ns / 1000.0,
+             (double)c_fence_ns  / 1000.0,
+             (double)c_total_ns  / 1000.0);
+      printf("[INPUT-COPY-PROFILE-CONS-NS] block=0 "
+             "c_wait_ns=%llu c_store_ns=%llu c_arrive_ns=%llu c_fence_ns=%llu\n",
+             (unsigned long long)c_wait_ns,
+             (unsigned long long)c_store_ns,
+             (unsigned long long)c_arrive_ns,
+             (unsigned long long)c_fence_ns);
+    }
+#endif
   }
 }
 
