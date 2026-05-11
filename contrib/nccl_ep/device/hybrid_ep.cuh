@@ -4362,14 +4362,32 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     }
 #endif
   } else if (warp_id == 1) {
-    // ====== CONSUMER warp ======
+    // ====== CONSUMER warp (V4: in-flight pipelining mimics dispatch INTRA_NODE_S2G) ======
+    //
+    // V3 used wait_group_read<0> after every STORE -> serialised fabric writes
+    // -> measured combine_kernel +1088us regression vs baseline cudaMemcpyAsync.
+    //
+    // V4 lets up to (kNumStages - 1) STOREs be in-flight before the next
+    // wait_group_read, matching dispatch INTRA_NODE_S2G's NUM_OF_IN_FLIGHT_S2G
+    // pattern (see hybrid_ep.cuh line ~1626 for production reference).
+    //
+    // SMEM slot lifecycle:
+    //   - PRODUCER LOAD -> mbarrier_arrive prod_mbar[stage]
+    //   - CONSUMER wait prod_mbar[stage], issue STORE, commit_group
+    //   - When in-flight exceeds kInFlight, wait_group_read<kInFlight> brings
+    //     in-flight back to kInFlight; the just-completed STORE's SMEM read
+    //     is done, so we mbarrier_arrive cons_mbar[oldest_stage] to free that
+    //     slot for PRODUCER to reuse.
+    //   - oldest_stage = (current_issue_stage - kInFlight + kNumStages) % kNumStages
     int      stage = 0;
     uint32_t producer_phase = 0;  // wait_parity(0) waits until parity flips to 1
+    int      issued_stores = 0;
+    constexpr int kInFlight = kNumStages - 1;
 #ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
     uint64_t c_wait_ns   = 0;  // CONSUMER waiting prod_mbar (LOAD complete)
-    uint64_t c_store_ns  = 0;  // CONSUMER cp.async.bulk STORE issue + commit + wait_group_read drain
-    uint64_t c_arrive_ns = 0;  // CONSUMER mbarrier_arrive(cons_m) (slot free signal)
-    uint64_t c_fence_ns  = 0;  // per-chunk wait_group + __threadfence_system + red.release
+    uint64_t c_store_ns  = 0;  // CONSUMER STORE issue + commit (no per-token wait now)
+    uint64_t c_drain_ns  = 0;  // CONSUMER conditional wait_group_read<kInFlight> + mbarrier_arrive oldest
+    uint64_t c_fence_ns  = 0;  // per-chunk wait_group + threadfence_system + red.release
     int      c_tokens_done = 0;
 #endif
 
@@ -4383,7 +4401,8 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
       if (chunk_active <= 0) continue;
 
       if (blockIdx.x == 0 && chunk_id == 0) {
-        printf("[INPUT-COPY-V3-CONS-CHUNK0] chunk_active=%d\n", chunk_active);
+        printf("[INPUT-COPY-V4-CONS-CHUNK0] chunk_active=%d kInFlight=%d kNumStages=%d\n",
+               chunk_active, kInFlight, kNumStages);
       }
 
       for (int t = 0; t < chunk_active; t++) {
@@ -4391,7 +4410,6 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
         TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
         void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
         uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
-        uint64_t* cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(stage);
 
 #ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
         const uint64_t ct0 = hybridep_get_globaltimer_ns();
@@ -4405,12 +4423,12 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
 #endif
 
         if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-          printf("[INPUT-COPY-V3-CONS-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n",
+          printf("[INPUT-COPY-V4-CONS-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n",
                  g_dst, smem_s);
         }
 
-        // STORE SMEM -> fabric memory (same instruction that crashed in V1
-        // when issued from same warp; here issued from CONSUMER warp).
+        // V4: issue STORE without immediate per-token wait; let kInFlight
+        // STOREs pipeline like dispatch INTRA_NODE_S2G does.
         cuda::ptx::cp_async_bulk(
             cuda::ptx::space_global,
             cuda::ptx::space_shared,
@@ -4418,23 +4436,32 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
             reinterpret_cast<const void*>(smem_s),
             static_cast<uint32_t>(bytes_per_token));
         cuda::ptx::cp_async_bulk_commit_group();
-        cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+        issued_stores += 1;
 #ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
         const uint64_t ct2 = hybridep_get_globaltimer_ns();
         c_store_ns += (ct2 - ct1);
 #endif
 
-        if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-          printf("[INPUT-COPY-V3-CONS-T0-AFTER-STORE] STORE drain OK\n");
+        // Free oldest slot only when in-flight exceeds kInFlight. The
+        // wait_group_read<kInFlight>{} brings the count back down to
+        // kInFlight; the (kInFlight+1)-th oldest STORE has its SMEM read
+        // done, so we can release that slot's cons_mbar for the producer.
+        if (issued_stores > kInFlight) {
+          cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<kInFlight>{});
+          const int oldest_stage = (stage - kInFlight + kNumStages) % kNumStages;
+          uint64_t* old_cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(oldest_stage);
+          cuda::ptx::mbarrier_arrive(old_cons_m);
         }
-
-        // Signal slot free for producer.
-        cuda::ptx::mbarrier_arrive(cons_m);
 #ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
         const uint64_t ct3 = hybridep_get_globaltimer_ns();
-        c_arrive_ns += (ct3 - ct2);
+        c_drain_ns += (ct3 - ct2);
         c_tokens_done += 1;
 #endif
+
+        if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
+          printf("[INPUT-COPY-V4-CONS-T0-AFTER-ISSUE] STORE issued, in_flight=%d\n",
+                 issued_stores);
+        }
 
         stage += 1;
         if (stage == kNumStages) {
@@ -4446,10 +4473,22 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
 #ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
       const uint64_t cf0 = hybridep_get_globaltimer_ns();
 #endif
-      // After all tokens in this chunk are stored: ensure visibility to peer
-      // GPUs (which read via cp.async.bulk in inter_node_G2S) before
-      // signalling combine_input_ready[chunk_id].
+      // Drain all in-flight STOREs: fabric write must complete before peers
+      // read combine_input_ready[chunk_id].
       cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+
+      // Free remaining un-arrived cons_mbar slots (the last `remaining` stages
+      // whose STOREs were drained but whose mbarrier_arrive was deferred).
+      {
+        const int remaining = (issued_stores < kInFlight) ? issued_stores : kInFlight;
+        for (int i = 0; i < remaining; i++) {
+          const int s = (stage - 1 - i + kNumStages) % kNumStages;
+          uint64_t* m = smem_buffer_ptr->get_input_copy_cons_mbar(s);
+          cuda::ptx::mbarrier_arrive(m);
+        }
+      }
+      issued_stores = 0;
+
       __threadfence_system();
       asm volatile("red.release.sys.global.add.u32 [%0], %1;"
                    :
@@ -4464,20 +4503,20 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
 
 #ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
     if (blockIdx.x == 0) {
-      const uint64_t c_total_ns = c_wait_ns + c_store_ns + c_arrive_ns + c_fence_ns;
+      const uint64_t c_total_ns = c_wait_ns + c_store_ns + c_drain_ns + c_fence_ns;
       printf("[INPUT-COPY-PROFILE-CONS] block=0 tokens=%d "
-             "c_wait_us=%.1f c_store_us=%.1f c_arrive_us=%.1f c_fence_us=%.1f c_total_us=%.1f\n",
+             "c_wait_us=%.1f c_store_us=%.1f c_drain_us=%.1f c_fence_us=%.1f c_total_us=%.1f\n",
              c_tokens_done,
-             (double)c_wait_ns   / 1000.0,
-             (double)c_store_ns  / 1000.0,
-             (double)c_arrive_ns / 1000.0,
-             (double)c_fence_ns  / 1000.0,
-             (double)c_total_ns  / 1000.0);
+             (double)c_wait_ns  / 1000.0,
+             (double)c_store_ns / 1000.0,
+             (double)c_drain_ns / 1000.0,
+             (double)c_fence_ns / 1000.0,
+             (double)c_total_ns / 1000.0);
       printf("[INPUT-COPY-PROFILE-CONS-NS] block=0 "
-             "c_wait_ns=%llu c_store_ns=%llu c_arrive_ns=%llu c_fence_ns=%llu\n",
+             "c_wait_ns=%llu c_store_ns=%llu c_drain_ns=%llu c_fence_ns=%llu\n",
              (unsigned long long)c_wait_ns,
              (unsigned long long)c_store_ns,
-             (unsigned long long)c_arrive_ns,
+             (unsigned long long)c_drain_ns,
              (unsigned long long)c_fence_ns);
     }
 #endif
