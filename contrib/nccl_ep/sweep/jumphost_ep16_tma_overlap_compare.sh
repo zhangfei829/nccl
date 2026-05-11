@@ -118,8 +118,8 @@ rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
 
 time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
   NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY $EXTRA_BUILD_FLAGS" \\
-  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY $EXTRA_BUILD_FLAGS" \\
+  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_STANDALONE $EXTRA_BUILD_FLAGS" \\
+  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY -DNCCL_EP_ENABLE_HT_COMBINE_INPUT_STANDALONE $EXTRA_BUILD_FLAGS" \\
   MPI_HOME=\$MPI_HOME
 REMOTE
 
@@ -139,10 +139,17 @@ export CUDA_HOME=/usr/local/cuda
 export NCCL_EP_HT_PROFILE=1
 if [[ "$enable_copy" == "1" ]]; then
   export NCCL_EP_HT_DISPATCH_TMA_COPY=1
-  export NCCL_EP_HT_COMBINE_INPUT_COPY=1
+  # V8 standalone has priority over V5-A in-kernel when both env are set
+  # (see nccl_ep.cc combine path).  V8 reuses launch_dispatch_output_tma_copy_bf16
+  # as a generic local D2D TMA kernel ~3us GPU work vs cudaMemcpyAsync ~280us
+  # stream wall.  Set INPUT_STANDALONE only; INPUT_COPY (V5-A in-kernel) is
+  # known-regression in current measurements.
+  export NCCL_EP_HT_COMBINE_INPUT_STANDALONE=1
+  unset NCCL_EP_HT_COMBINE_INPUT_COPY || true
 else
   unset NCCL_EP_HT_DISPATCH_TMA_COPY || true
   unset NCCL_EP_HT_COMBINE_INPUT_COPY || true
+  unset NCCL_EP_HT_COMBINE_INPUT_STANDALONE || true
 fi
 cd /home/fizhang/nccl
 OUT="$REMOTE_BASE/$tag" \\

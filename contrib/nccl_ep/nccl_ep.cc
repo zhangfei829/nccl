@@ -4091,12 +4091,29 @@ ncclResult_t ncclEpCombine(
         /* ===== Copy input to IPC staging buffers ===== */
         // Expert MLP output needs to be in IPC buffer so other ranks can read it.
         //
-        // [Combine input-copy overlap, 2026-05-09] When NCCL_EP_HT_COMBINE_INPUT_COPY
-        // is enabled (env + macro + cell match), the in-kernel INPUT_COPY warp_group
-        // takes over: it does chunked G->S->G into expert_input_token and signals
-        // combine_input_ready[chunk_id]+=1, allowing the consumer-side G2S warp on
-        // peer ranks to start reading chunk_id as soon as our INPUT_COPY finishes
-        // that chunk (instead of waiting for the entire host cudaMemcpyAsync).
+        // Three mutually-exclusive paths for this local D2D copy:
+        //   1. baseline (default): host cudaMemcpyAsync via copy engine, ~280us
+        //      stream wall at t=4096 BF16.
+        //   2. V5-A in-kernel chunked overlap (NCCL_EP_HT_COMBINE_INPUT_COPY=1):
+        //      INPUT_COPY warp_group inside combine_kernel does G->S->G with
+        //      chunk-wise ready signal.  Measured combine_kernel +1100us
+        //      (regression) due to TMA-engine / warp-scheduler contention with
+        //      main combine warps.  Kept as opt-in for further investigation.
+        //   3. V8 standalone TMA copy kernel (NCCL_EP_HT_COMBINE_INPUT_STANDALONE=1):
+        //      reuses launch_dispatch_output_tma_copy_bf16 (generic local D2D
+        //      TMA copy) on the same stream as combine_kernel.  Stream-sequential
+        //      with combine_kernel (not pipelined) but TMA copy GPU work time
+        //      ~3us vs cudaMemcpyAsync ~280us stream wall ==> ~270us net saving.
+        //
+        // V8 takes priority over V5-A when both env are set.
+#ifdef NCCL_EP_ENABLE_HT_COMBINE_INPUT_STANDALONE
+        static const bool ht_combine_input_standalone = [](){
+            const char* v = std::getenv("NCCL_EP_HT_COMBINE_INPUT_STANDALONE");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
+#else
+        const bool ht_combine_input_standalone = false;
+#endif
 #ifdef NCCL_EP_ENABLE_HT_COMBINE_INPUT_COPY
         static const bool ht_combine_input_copy = [](){
             const char* v = std::getenv("NCCL_EP_HT_COMBINE_INPUT_COPY");
@@ -4117,9 +4134,26 @@ ncclResult_t ncclEpCombine(
             ht_combine_input_cell_supported;
 #else
         const bool ht_combine_input_copy_enabled = false;
+        const bool input_x_tma_aligned =
+            ((static_cast<int>(x->sizes[1]) * static_cast<int>(sizeof(uint16_t))) & 15) == 0;
 #endif
+        const bool ht_combine_input_standalone_enabled =
+            ht_combine_input_standalone && x->datatype == ncclBfloat16 &&
+            input_x_tma_aligned;
         size_t token_copy_size = static_cast<size_t>(num_tokens) * hidden * sizeof(uint16_t); // BF16 = uint16_t
-        if (!ht_combine_input_copy_enabled) {
+        if (ht_combine_input_standalone_enabled) {
+            // V8: standalone TMA copy kernel replaces cudaMemcpyAsync. Same
+            // stream as combine_kernel, so combine_kernel still waits for
+            // copy completion via stream order; but TMA kernel GPU work
+            // time is ~3us vs copy engine's ~280us stream wall.
+            nccl_ep::hybridep::launch_dispatch_output_tma_copy_bf16(
+                x->data,
+                group->ht_buffers.expert_input_token,
+                static_cast<int>(num_tokens),
+                hidden,
+                /*num_blocks=*/16,
+                stream);
+        } else if (!ht_combine_input_copy_enabled) {
             CUDA_CHECK(cudaMemcpyAsync(
                 group->ht_buffers.expert_input_token,
                 x->data,
@@ -4216,11 +4250,16 @@ ncclResult_t ncclEpCombine(
         params.num_tokens_per_rank = num_combined_tokens;
         params.num_recv_tokens = num_tokens;
 
-        // [Combine input-copy overlap, 2026-05-09]
-        params.user_input_token = ht_combine_input_copy_enabled
+        // [Combine input-copy overlap, 2026-05-09 / V8 2026-05-11]
+        // V8 standalone TMA copy already wrote expert_input_token before
+        // launching combine_kernel; disable V5-A in-kernel INPUT_COPY
+        // warp_group when V8 is active to avoid duplicate work.
+        const bool in_kernel_input_copy_active =
+            ht_combine_input_copy_enabled && !ht_combine_input_standalone_enabled;
+        params.user_input_token = in_kernel_input_copy_active
                                       ? static_cast<const uint16_t*>(x->data)
                                       : nullptr;
-        params.combine_input_ready_ptrs = ht_combine_input_copy_enabled
+        params.combine_input_ready_ptrs = in_kernel_input_copy_active
                                               ? group->ht_buffers.combine_input_ready_buffer_ptrs
                                               : nullptr;
         params.combine_input_chunk_tokens = HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS;
