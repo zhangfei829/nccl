@@ -4180,49 +4180,49 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
 }
 
 // =================== Combine input-copy overlap (2026-05-11) ===================
-// V5-A: multi-warp same-warp LOAD+STORE pattern, clones the production
-// dispatch_tma_copy_warp_group_device_function (hybrid_ep.cuh:3846).
+// V6: 1 warp 1 stage, minimal SMEM footprint to preserve combine main
+// kernel occupancy.  See hybridep_configs.cuh for the SMEM cap analysis.
 //
-// IMPORTANT FACT (corrected 2026-05-11): combine_input_copy moves data
-// entirely on the LOCAL GPU.  expert_input_token is allocated by
-// cuMemCreate(CU_MEM_LOCATION_TYPE_DEVICE) on this rank; the FABRIC handle
-// is only for peers to import later.  src->dst here is local HBM -> local
-// HBM (D2D), no NVSwitch traffic.  Earlier hypotheses that blamed "fabric
-// STORE serialization" for V1/V3/V4 slowness were wrong.
+// IMPORTANT FACT: combine_input_copy moves data entirely on the LOCAL GPU.
+// expert_input_token is allocated by cuMemCreate(CU_MEM_LOCATION_TYPE_DEVICE)
+// on this rank; the FABRIC handle is only for peers to import later.
+// src->dst here is local HBM -> local HBM (D2D), no NVSwitch traffic.
 //
-// Pattern history:
-//   V1 (2026-05-09): 1 warp same-warp LOAD+STORE -> rc=134 crash on
-//                    cp.async.bulk(SMEM->local HBM).  Root cause unknown
-//                    (NOT fabric, NOT same-warp per se since dispatch
-//                    standalone uses same-warp and works).  Likely a
-//                    structural issue with SMEM sharing or mbarrier init
-//                    inside combine kernel's multi-warp_group layout.
-//                    Abandoned without clean root cause.
-//   V3 (2026-05-10): 1 PROD + 1 CONS cross-warp serial wait_group_read<0>.
-//                    No crash but combine_kernel +1153us (~2.25us/token,
-//                    30x above the per-cp.async.bulk-token cost on local
-//                    HBM).  Single-warp lane-0 issue inside combine kernel
-//                    contends for SM with other warp_groups; per-token
-//                    mbarrier+fence+issue overhead piles up.
-//   V4 (2026-05-11): in-flight wait_group_read<3>.  combine_kernel +1963us
-//                    (-64% wall BW vs no-overlap, worse than V3).
-//                    Deferred mbarrier_arrive(cons_m) until wait_group_read
-//                    broke PROD/CONS overlap entirely.
-//   V5-A (this):     4 warps, each owns 1 SMEM slot + 1 mbar, processes
-//                    tokens [warp_id, warp_id+kNumWarps, ...] same-warp
-//                    LOAD then STORE (matches dispatch_tma_copy exactly,
-//                    here also writing local HBM).  Spreads per-token
-//                    overhead across 4 SM scheduling slots.
+// Pattern history (combine input copy overlap attempts):
+//   V1 (1 warp same-warp, 2 stages):       rc=134 crash on STORE.  Root cause
+//                                          unattributed (not fabric, not
+//                                          same-warp per se, possibly
+//                                          structural SMEM/mbar init bug).
+//   V3 (1 PROD + 1 CONS cross-warp, 4 st): no crash, combine_kernel +1153us
+//                                          (-48% wall BW).
+//   V4 (V3 + in-flight wait_group_read<3>): combine_kernel +1963us (-64%,
+//                                          worse than V3, deferred
+//                                          mbarrier_arrive broke overlap).
+//   V5-A (4 warps same-warp, 4 stages):    combine_kernel matches V3
+//                                          (~1660us), multi-warp in same
+//                                          CTA shares 1 TMA engine queue,
+//                                          no parallelism gained.
+//   V6 (1 warp same-warp, 1 stage):        target SMEM-cap-driven occupancy
+//                                          recovery.  56 KB INPUT_COPY ring
+//                                          + ~150-180 KB main kernel SMEM
+//                                          pushed total above the
+//                                          two-CTA/SM threshold; reducing
+//                                          INPUT_COPY ring to ~14 KB brings
+//                                          back 2 CTA/SM, main work runs at
+//                                          full speed; INPUT_COPY itself
+//                                          serial 1-warp ~70us/SM in
+//                                          parallel across 16 CTAs.
 //
-// Risk: same-warp LOAD+STORE inside combine kernel may still hit V1's
-// crash trigger.  No PTX docs explain V1's rc=134.  Runtime test required.
+// V6 design = same as V1 (1 warp same-warp same-thread LOAD then STORE).
+// V1 crashed; V5-A's 4-warp variant launched fine; reducing back to 1 warp
+// is a runtime test of whether V1's crash actually involved warp count or
+// something else (e.g. ENABLE_INPUT_COPY=true template instance smem layout
+// allocator that has since changed).
 //
 // Each warp signals combine_input_ready[chunk_id] += 1 after its STORE
-// drain; this gives kNumWarps signals per chunk per CTA.  Host's
-// host_combine_input_expected only +=1 per combine call (single counter,
-// broadcast across chunks), so spin condition `ready < expected` becomes
-// `ready (kNumWarps * combine_calls) < expected (combine_calls)` which is
-// satisfied immediately - no host change needed.
+// drain.  With kNumWarps=1, this is 1 signal/chunk/CTA.  Host's
+// host_combine_input_expected also +=1 per combine call, so spin condition
+// `ready < expected` is monotonic and satisfied.
 
 template<typename COPY_GROUP,
          typename TOKEN_DATA_TYPE,

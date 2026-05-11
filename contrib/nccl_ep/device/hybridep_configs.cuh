@@ -147,39 +147,40 @@
 //     fabric memory layout / counter array sizing).
 // CORRECTION (2026-05-11): expert_input_token is allocated by cuMemCreate
 // (CU_MEM_LOCATION_TYPE_DEVICE) on the LOCAL rank's HBM and only the FABRIC
-// handle is shared with peers.  The src->dst path of combine_input_copy
-// (user_input_token -> expert_input_token) is entirely LOCAL D2D on the
-// current GPU's HBM; no NVSwitch traffic until a peer later reads our
-// expert_input_token via its imported fabric handle.  Earlier comments that
-// blamed "fabric STORE serialization" or "fabric memory write ordering" for
-// V1/V3/V4 issues were wrong; the slowness is local D2D mechanics in-kernel.
+// handle is shared with peers.  combine_input_copy moves user x -> local
+// HBM expert_input_token entirely on the current GPU; no NVSwitch traffic.
 //
-// V5-A: multi-warp same-warp LOAD+STORE pattern (clones the production
-// dispatch_tma_copy_warp_group_device_function in hybrid_ep.cuh:3846 which
-// works for HBM dst with HYBRIDEP_DISPATCH_TMA_COPY_WARPS=4).  Each warp
-// owns 1 SMEM slot + 1 mbarrier and processes tokens
-// [warp_id, warp_id+kNumWarps, warp_id+2*kNumWarps, ...] within each chunk.
+// V6 (2026-05-11): minimal SMEM footprint to preserve main combine kernel
+// occupancy.  V3/V4/V5-A all measured combine_kernel ~1100us extra time vs
+// baseline 570us, traced to SMEM cap pressure:
 //
-// V3 (1 PROD + 1 CONS cross-warp serial) measured combine_kernel +1153us
-// (= ~2.25us/token, ~30x above what cp.async.bulk per-token cost should be
-// on local HBM).  Single-warp lane-0 issue inside the combine kernel where
-// other warp_groups (G2S/S2G/N2N) also run gets long per-token mbarrier +
-// fence + issue overhead due to SM scheduling sharing.  V4 in-flight
-// wait_group_read<3> made it worse (-64% wall BW) because deferred
-// mbarrier_arrive broke the PROD/CONS overlap.
+//   sm_103 dynamic SMEM cap per CTA = 228 KB.
+//   combine main kernel base SMEM ~150-180 KB (G2S 8-stage + S2G + prob +
+//     mbars).
+//   V3/V4/V5-A INPUT_COPY ring (NUM_STAGES=4 * 7168 bytes = 56 KB) pushed
+//     total to 206-236 KB -> per-SM occupancy dropped from 2 CTA/SM to
+//     1 CTA/SM, halving main work throughput while INPUT_COPY itself cost
+//     only ~70 us/SM (256 tokens / 16 SMs parallel).
 //
-// V5-A spreads that overhead across 4 warps issuing independently:
-// 4 SMEM slots, 4 mbarriers, each warp's lane-0 issues its own LOAD+STORE
-// pipeline for token subset [w, w+4, w+8, ...].
+// V6 reduces INPUT_COPY SMEM to ~14 KB (1 stage * 7168 bytes + 16 bytes
+// mbar), bringing combine total back below 200 KB so 2 CTA/SM occupancy is
+// preserved.  Cost: INPUT_COPY runs as a single-warp single-stage serial
+// LOAD+STORE per CTA (~70 us/SM total when 16 CTAs run in parallel).
 //
-// V1 (1 warp same-warp) crashed with rc=134 -- root cause unknown (NOT
-// fabric write since this is local D2D).  V5-A's per-warp same-warp pattern
-// matches V1's structure but with 4 warps; if V5-A also crashes, the V1
-// root cause is structural (e.g. SMEM sharing with combine kernel's other
-// warp_groups, or mbarrier init ordering) and needs different debugging.
-#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 4
+// Net target: combine_kernel ~ max(input_copy ~70us, main work ~570us)
+// = 570us == baseline.  Combined with host_overhead saving (-280us from
+// removing pre-kernel cudaMemcpyAsync), combine_avg ~593us vs baseline
+// 873us -> 1.47x combine speedup, ~1.18x total D+C speedup.
+//
+// V6 == V1 design (1 warp same-warp LOAD+STORE).  V1 originally crashed at
+// rc=134 on cp.async.bulk(SMEM->local HBM); root cause was never found
+// because we wrongly attributed it to fabric writes.  V5-A successfully
+// launched a 4-warp same-warp version, so the V1 crash is unlikely
+// fundamental to "1 warp same-warp + local HBM dst".  V6 will runtime-test
+// whether reducing back to 1 warp 1 stage retriggers V1's crash.
+#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 1
 #define HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS 32
-#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 4  // = NUM_WARPS in V5-A (1 slot per warp)
+#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 1  // = NUM_WARPS in V6 (1 slot)
 
 // ============================================================================
 // Preprocessing kernel configuration
