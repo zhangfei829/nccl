@@ -145,14 +145,24 @@
 //   - 1 SMEM ring slot per warp (single-stage), 2 mbarriers (g2s + s2g).
 //   - chunk_tokens = 32 (matches dispatch_copy_chunk_tokens for symmetric
 //     fabric memory layout / counter array sizing).
-// V3 cross-warp pattern: warp 0 = producer (cp.async.bulk LOAD HBM->SMEM),
-// warp 1 = consumer (cp.async.bulk STORE SMEM->fabric memory).
-// Mimics dispatch S2G's cross-warp pattern that's known to work for
-// fabric-memory targets.  Same-warp LOAD+STORE was crashing with rc=134
-// in V1 when the destination was local fabric memory.
-#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 2
+// V5-A: multi-warp same-warp LOAD+STORE pattern (clones the production
+// dispatch_tma_copy_warp_group_device_function in hybrid_ep.cuh:3846 which
+// works for HBM dst with HYBRIDEP_DISPATCH_TMA_COPY_WARPS=4).  Each warp
+// owns 1 SMEM slot + 1 mbarrier and processes tokens
+// [warp_id, warp_id+kNumWarps, warp_id+2*kNumWarps, ...] within each chunk.
+//
+// V3 cross-warp 1 PROD + 1 CONS measured -48% wall BW vs no-overlap; V4
+// in-flight wait_group_read<3> measured -64% (worse, fabric stores don't
+// actually pipeline within single thread / single warp).  V5-A gets true
+// HW parallelism by issuing from 4 warps = 4 independent per-thread
+// async-group queues.
+//
+// Risk note: V1 (1 warp same-warp + fabric STORE) crashed with rc=134.  V5-A
+// uses 4 warps but each warp's pattern is the same as V1.  No PTX docs
+// guarantee that multi-warp avoids the V1 crash; this needs runtime test.
+#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 4
 #define HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS 32
-#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 4  // 4-stage ring for pipelining
+#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 4  // = NUM_WARPS in V5-A (1 slot per warp)
 
 // ============================================================================
 // Preprocessing kernel configuration

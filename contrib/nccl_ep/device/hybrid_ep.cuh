@@ -4179,42 +4179,38 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
   }
 }
 
-// =================== Combine input-copy overlap (2026-05-09) ===================
-// Mirror of dispatch_tma_copy_warp_group_device_function but for combine's
-// pre-kernel input D2D copy.  Where dispatch's TMA-copy moves
-// (kernel-internal) -> (user) AFTER the kernel writes, this function moves
-// (user) -> (fabric IPC) IN THE KERNEL HEAD so peers can read it.
+// =================== Combine input-copy overlap (2026-05-11) ===================
+// V5-A: multi-warp same-warp LOAD+STORE pattern, clones the production
+// dispatch_tma_copy_warp_group_device_function (hybrid_ep.cuh:3846).
 //
-// Design (chunk-level pipelined; matches dispatch overlap pattern):
-//   - 1 warp/block (HYBRIDEP_COMBINE_INPUT_COPY_WARPS=1), lane 0 issues
-//     all PTX (rest of warp idles after the lane gate).
-//   - Per chunk: NUM_STAGES (=2) ping-pong SMEM ring slots used as the
-//     intermediate hop for cp.async.bulk(G->S->G); cp.async.bulk doesn't
-//     support a direct G->G variant per PTX ISA 9.7.9.25.4.1.
-//   - After each chunk's tokens land in expert_input_token, atomicAdd
-//     combine_input_ready[chunk_id] += 1 (cumulative epoch counter,
-//     mirrors dispatch_copy_ready exactly so consumers spin in the same
-//     ld.acquire.sys.global.u32 do/while loop).
-//   - chunk_id = blockIdx.x rotates by gridDim.x for full grid coverage.
+// Pattern history:
+//   V1 (2026-05-09): 1 warp same-warp LOAD+STORE writing fabric -> rc=134
+//                    crash on cp.async.bulk(SMEM->fabric).  Abandoned.
+//   V3 (2026-05-10): 1 PROD + 1 CONS cross-warp.  No crash but combine
+//                    wall BW -48% (per-token wait_group_read<0> serialises
+//                    fabric STOREs).
+//   V4 (2026-05-11): in-flight wait_group_read<3>.  -64% wall BW (worse;
+//                    deferred mbarrier_arrive breaks PROD/CONS overlap,
+//                    and fabric STOREs may not actually pipeline within
+//                    a single thread anyway).
+//   V5-A (this):     4 warps, each owns 1 SMEM slot + 1 mbar, processes
+//                    tokens [warp_id, warp_id+kNumWarps, ...] same-warp
+//                    LOAD then STORE (matches dispatch_tma_copy exactly,
+//                    only difference is dst is fabric memory not user HBM).
+//                    Each warp's per-thread async-group queue is hardware-
+//                    independent => true parallel STOREs.
 //
-// Per-chunk cost estimate (t=8192 = 512 tokens/rank, chunk=32 tokens, 16
-// CTAs active, 1 chunk/CTA in steady state at NUM_OF_BLOCKS=64):
-//   - 32 tokens × ~6 us per G->S->G round (lane-0 serial)
-//     = ~190 us per chunk in COPY warp
-//   - main combine_kernel body 1100us at t=8192, with NUM_OF_BLOCKS=64
-//     processing 4 chunks/CTA on average -> kernel ~280us critical path
-//     per chunk
-//   - With chunked pipeline: max(190, 280) = ~280us per chunk × 4 chunks
-//     ~= 1120us, vs baseline 555+1114 = 1669us -> ~1.4x combine speedup.
-
-// 64-bit nanosecond globaltimer (PTX ISA 9.x special register %globaltimer,
-// supported sm_30+). Used by NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE (default off)
-// to break down V3 PRODUCER/CONSUMER stage time without touching kernel sig.
-__forceinline__ __device__ uint64_t hybridep_get_globaltimer_ns() {
-  uint64_t t;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-  return t;
-}
+// Risk: V1's 1-warp same-warp+fabric crash may also occur with multi-warp.
+// PTX ISA 9.x has no explicit doc on cp.async.bulk(SMEM->fabric) same-warp
+// race conditions.  V5-A is a runtime test of the hypothesis "V1 crash was
+// 1-warp specific; multi-warp queues per thread avoid it".
+//
+// Each warp signals combine_input_ready[chunk_id] += 1 after its STORE
+// drain; this gives kNumWarps signals per chunk per CTA.  Host's
+// host_combine_input_expected only +=1 per combine call (single counter,
+// broadcast across chunks), so spin condition `ready < expected` becomes
+// `ready (kNumWarps * combine_calls) < expected (combine_calls)` which is
+// satisfied immediately - no host change needed.
 
 template<typename COPY_GROUP,
          typename TOKEN_DATA_TYPE,
@@ -4231,7 +4227,6 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
   if (user_input_token == nullptr || expert_input_token == nullptr ||
       combine_input_ready == nullptr || input_copy_chunk_tokens <= 0 ||
       num_input_tokens <= 0) {
-    // [BENCH-DEBUG 2026-05-09] Surface why INPUT_COPY exited early.
     if (COPY_GROUP::thread_rank() == 0 && blockIdx.x == 0) {
       printf("[INPUT-COPY-EARLY-EXIT] user=%p expert=%p ready=%p chunk_tokens=%d num_tokens=%d\n",
              user_input_token, expert_input_token, combine_input_ready,
@@ -4240,286 +4235,148 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     return;
   }
 
-  // V3 design: cross-warp producer-consumer pattern (mimics dispatch S2G).
-  //
-  // V1 (same-warp LOAD+STORE writing fabric) crashed with rc=134 / unspecified
-  // launch failure on the cp.async.bulk(SMEM->fabric) instruction.  The
-  // dispatch S2G warp_group writes peer fabric via cp.async.bulk and works
-  // because LOAD (G2S warp) and STORE (S2G warp) are in DIFFERENT warps with
-  // mbarrier producer/consumer handoff.  Replicate that here.
-  //
-  // Layout:
-  //   warp 0 (PRODUCER): wait consumer-mbar[stage] (slot free)
-  //                       cp.async.bulk LOAD user_x -> SMEM[stage]
-  //                       mbarrier_arrive_expect_tx(producer-mbar[stage])
-  //   warp 1 (CONSUMER): wait producer-mbar[stage] (data ready)
-  //                       fence_proxy_async
-  //                       cp.async.bulk STORE SMEM[stage] -> fabric
-  //                       wait_group_read drain
-  //                       mbarrier_arrive(consumer-mbar[stage]) (slot free)
-  //   stage = (stage + 1) % NUM_STAGES per token in each warp.
-  //
-  // After consumer drains all tokens of a chunk:
-  //   __threadfence_system + red.release.sys.global to combine_input_ready[chunk_id].
-  const int warp_id = COPY_GROUP::warp_rank();   // 0=producer, 1=consumer
+  // V5-A: each warp owns 1 fixed SMEM slot (= warp_id) + 1 mbar
+  // (input_copy_prod_mbar, treated as the only mbar; cons_mbar slots
+  // remain allocated but unused under V5-A).  Token assignment:
+  // warp w handles tokens [w, w+kNumWarps, w+2*kNumWarps, ...] within
+  // each chunk.  Same-warp LOAD then STORE pattern -- identical to
+  // dispatch_tma_copy_warp_group_device_function (proven for HBM dst).
+  const int warp_id = COPY_GROUP::warp_rank();   // 0..kNumWarps-1
   const int lane    = COPY_GROUP::thread_rank() & 31;
+  if (lane != 0) return;  // each warp's lane 0 issues; rest of warp idles
 
-  if (lane != 0) return;  // each warp's lane 0 does work, others idle
-
-  constexpr int kNumStages = HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES;
+  constexpr int kNumWarps  = HYBRIDEP_COMBINE_INPUT_COPY_WARPS;     // = 4 (V5-A)
+  constexpr int kNumStages = HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES; // = 4
+  static_assert(kNumWarps == kNumStages,
+                "V5-A requires NUM_WARPS == NUM_STAGES (each warp owns 1 slot).");
 
   if (blockIdx.x == 0 && warp_id == 0) {
-    printf("[INPUT-COPY-V3-ENTRY] block=0 warp=PRODUCER num_chunks=%d num_tokens=%d hidden=%d kNumStages=%d\n",
+    printf("[INPUT-COPY-V5A-ENTRY] block=0 warp=0 num_chunks=%d num_tokens=%d hidden=%d kNumWarps=%d\n",
            (num_input_tokens + input_copy_chunk_tokens - 1) / input_copy_chunk_tokens,
-           num_input_tokens, HIDDEN_DIM, kNumStages);
+           num_input_tokens, HIDDEN_DIM, kNumWarps);
   }
 
   const int num_chunks = (num_input_tokens + input_copy_chunk_tokens - 1) /
                          input_copy_chunk_tokens;
   const int bytes_per_token = HIDDEN_DIM * static_cast<int>(sizeof(TOKEN_DATA_TYPE));
 
-  if (warp_id == 0) {
-    // ====== PRODUCER warp ======
-    int      stage = 0;
-    uint32_t consumer_phase = 1;  // wait_parity(1) immediately satisfies on init parity 0
-    int      tokens_issued = 0;
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-    uint64_t p_wait_ns = 0;   // PRODUCER waiting cons_mbar (slot free)
-    uint64_t p_issue_ns = 0;  // PRODUCER cp.async.bulk LOAD issue + arrive_expect_tx
-#endif
+  void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(warp_id);
+  uint64_t* mbar_s = smem_buffer_ptr->get_input_copy_prod_mbar(warp_id);
+  uint32_t  phase  = 0;
+  int       my_tokens_done = 0;
 
-    for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
-      const int chunk_start = chunk_id * input_copy_chunk_tokens;
-      const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
-      const int chunk_end = chunk_end_unbounded < num_input_tokens
-                                ? chunk_end_unbounded
-                                : num_input_tokens;
-      const int chunk_active = chunk_end - chunk_start;
-      if (chunk_active <= 0) continue;
+  for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
+    const int chunk_start = chunk_id * input_copy_chunk_tokens;
+    const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
+    const int chunk_end = chunk_end_unbounded < num_input_tokens
+                              ? chunk_end_unbounded
+                              : num_input_tokens;
+    const int chunk_active = chunk_end - chunk_start;
+    if (chunk_active <= 0) continue;
 
-      for (int t = 0; t < chunk_active; t++) {
-        const int token_id = chunk_start + t;
-        const TOKEN_DATA_TYPE* g_src = user_input_token + token_id * HIDDEN_DIM;
-        void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
-        uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
-        uint64_t* cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(stage);
+    const int my_first_token = warp_id;
 
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t pt0 = hybridep_get_globaltimer_ns();
-#endif
-        // Wait for consumer to free this slot (skip first NUM_STAGES iters
-        // since slots start free with parity 0).
-        if (tokens_issued >= kNumStages) {
-          while (!cuda::ptx::mbarrier_try_wait_parity(cons_m, consumer_phase)) {}
-        }
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t pt1 = hybridep_get_globaltimer_ns();
-        p_wait_ns += (pt1 - pt0);
-#endif
-
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_shared,
-            cuda::ptx::space_global,
-            smem_s,
-            reinterpret_cast<const void*>(g_src),
-            static_cast<uint32_t>(bytes_per_token),
-            prod_m);
-        cuda::ptx::mbarrier_arrive_expect_tx(
-            cuda::ptx::sem_release,
-            cuda::ptx::scope_cta,
-            cuda::ptx::space_shared,
-            prod_m,
-            static_cast<uint32_t>(bytes_per_token));
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t pt2 = hybridep_get_globaltimer_ns();
-        p_issue_ns += (pt2 - pt1);
-#endif
-
-        tokens_issued += 1;
-        stage += 1;
-        if (stage == kNumStages) {
-          stage = 0;
-          consumer_phase ^= 1;
-        }
-      }
-    }
-
-    if (blockIdx.x == 0) {
-      printf("[INPUT-COPY-V3-PROD-DONE] tokens_issued=%d\n", tokens_issued);
-    }
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-    if (blockIdx.x == 0) {
-      // ns -> us divide by 1000.0; sum p_wait + p_issue ~ producer wall time
-      printf("[INPUT-COPY-PROFILE-PROD] block=0 tokens=%d "
-             "p_wait_us=%.1f p_issue_us=%.1f p_total_us=%.1f "
-             "p_wait_ns=%llu p_issue_ns=%llu\n",
-             tokens_issued,
-             (double)p_wait_ns / 1000.0,
-             (double)p_issue_ns / 1000.0,
-             (double)(p_wait_ns + p_issue_ns) / 1000.0,
-             (unsigned long long)p_wait_ns,
-             (unsigned long long)p_issue_ns);
-    }
-#endif
-  } else if (warp_id == 1) {
-    // ====== CONSUMER warp (V4: in-flight pipelining mimics dispatch INTRA_NODE_S2G) ======
-    //
-    // V3 used wait_group_read<0> after every STORE -> serialised fabric writes
-    // -> measured combine_kernel +1088us regression vs baseline cudaMemcpyAsync.
-    //
-    // V4 lets up to (kNumStages - 1) STOREs be in-flight before the next
-    // wait_group_read, matching dispatch INTRA_NODE_S2G's NUM_OF_IN_FLIGHT_S2G
-    // pattern (see hybrid_ep.cuh line ~1626 for production reference).
-    //
-    // SMEM slot lifecycle:
-    //   - PRODUCER LOAD -> mbarrier_arrive prod_mbar[stage]
-    //   - CONSUMER wait prod_mbar[stage], issue STORE, commit_group
-    //   - When in-flight exceeds kInFlight, wait_group_read<kInFlight> brings
-    //     in-flight back to kInFlight; the just-completed STORE's SMEM read
-    //     is done, so we mbarrier_arrive cons_mbar[oldest_stage] to free that
-    //     slot for PRODUCER to reuse.
-    //   - oldest_stage = (current_issue_stage - kInFlight + kNumStages) % kNumStages
-    int      stage = 0;
-    uint32_t producer_phase = 0;  // wait_parity(0) waits until parity flips to 1
-    int      issued_stores = 0;
-    constexpr int kInFlight = kNumStages - 1;
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-    uint64_t c_wait_ns   = 0;  // CONSUMER waiting prod_mbar (LOAD complete)
-    uint64_t c_store_ns  = 0;  // CONSUMER STORE issue + commit (no per-token wait now)
-    uint64_t c_drain_ns  = 0;  // CONSUMER conditional wait_group_read<kInFlight> + mbarrier_arrive oldest
-    uint64_t c_fence_ns  = 0;  // per-chunk wait_group + threadfence_system + red.release
-    int      c_tokens_done = 0;
-#endif
-
-    for (int chunk_id = blockIdx.x; chunk_id < num_chunks; chunk_id += gridDim.x) {
-      const int chunk_start = chunk_id * input_copy_chunk_tokens;
-      const int chunk_end_unbounded = chunk_start + input_copy_chunk_tokens;
-      const int chunk_end = chunk_end_unbounded < num_input_tokens
-                                ? chunk_end_unbounded
-                                : num_input_tokens;
-      const int chunk_active = chunk_end - chunk_start;
-      if (chunk_active <= 0) continue;
-
-      if (blockIdx.x == 0 && chunk_id == 0) {
-        printf("[INPUT-COPY-V4-CONS-CHUNK0] chunk_active=%d kInFlight=%d kNumStages=%d\n",
-               chunk_active, kInFlight, kNumStages);
-      }
-
-      for (int t = 0; t < chunk_active; t++) {
-        const int token_id = chunk_start + t;
-        TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
-        void*     smem_s = smem_buffer_ptr->get_input_copy_buffer(stage);
-        uint64_t* prod_m = smem_buffer_ptr->get_input_copy_prod_mbar(stage);
-
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t ct0 = hybridep_get_globaltimer_ns();
-#endif
-        // Wait for producer to fill this slot.
-        while (!cuda::ptx::mbarrier_try_wait_parity(prod_m, producer_phase)) {}
-        cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t ct1 = hybridep_get_globaltimer_ns();
-        c_wait_ns += (ct1 - ct0);
-#endif
-
-        if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-          printf("[INPUT-COPY-V4-CONS-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n",
-                 g_dst, smem_s);
-        }
-
-        // V4: issue STORE without immediate per-token wait; let kInFlight
-        // STOREs pipeline like dispatch INTRA_NODE_S2G does.
-        cuda::ptx::cp_async_bulk(
-            cuda::ptx::space_global,
-            cuda::ptx::space_shared,
-            reinterpret_cast<void*>(g_dst),
-            reinterpret_cast<const void*>(smem_s),
-            static_cast<uint32_t>(bytes_per_token));
-        cuda::ptx::cp_async_bulk_commit_group();
-        issued_stores += 1;
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t ct2 = hybridep_get_globaltimer_ns();
-        c_store_ns += (ct2 - ct1);
-#endif
-
-        // Free oldest slot only when in-flight exceeds kInFlight. The
-        // wait_group_read<kInFlight>{} brings the count back down to
-        // kInFlight; the (kInFlight+1)-th oldest STORE has its SMEM read
-        // done, so we can release that slot's cons_mbar for the producer.
-        if (issued_stores > kInFlight) {
-          cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<kInFlight>{});
-          const int oldest_stage = (stage - kInFlight + kNumStages) % kNumStages;
-          uint64_t* old_cons_m = smem_buffer_ptr->get_input_copy_cons_mbar(oldest_stage);
-          cuda::ptx::mbarrier_arrive(old_cons_m);
-        }
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-        const uint64_t ct3 = hybridep_get_globaltimer_ns();
-        c_drain_ns += (ct3 - ct2);
-        c_tokens_done += 1;
-#endif
-
-        if (blockIdx.x == 0 && chunk_id == 0 && t == 0) {
-          printf("[INPUT-COPY-V4-CONS-T0-AFTER-ISSUE] STORE issued, in_flight=%d\n",
-                 issued_stores);
-        }
-
-        stage += 1;
-        if (stage == kNumStages) {
-          stage = 0;
-          producer_phase ^= 1;
-        }
-      }
-
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-      const uint64_t cf0 = hybridep_get_globaltimer_ns();
-#endif
-      // Drain all in-flight STOREs: fabric write must complete before peers
-      // read combine_input_ready[chunk_id].
-      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
-
-      // Free remaining un-arrived cons_mbar slots (the last `remaining` stages
-      // whose STOREs were drained but whose mbarrier_arrive was deferred).
-      {
-        const int remaining = (issued_stores < kInFlight) ? issued_stores : kInFlight;
-        for (int i = 0; i < remaining; i++) {
-          const int s = (stage - 1 - i + kNumStages) % kNumStages;
-          uint64_t* m = smem_buffer_ptr->get_input_copy_cons_mbar(s);
-          cuda::ptx::mbarrier_arrive(m);
-        }
-      }
-      issued_stores = 0;
-
+    // If this warp has no tokens in this chunk, still signal ready so the
+    // total signal count per chunk stays at kNumWarps (host expected
+    // accounting is independent of work distribution; spin only checks
+    // ready >= expected which monotonically holds).
+    if (my_first_token >= chunk_active) {
       __threadfence_system();
       asm volatile("red.release.sys.global.add.u32 [%0], %1;"
                    :
                    : "l"(__cvta_generic_to_global(combine_input_ready + chunk_id)),
                      "n"(1)
                    : "memory");
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-      const uint64_t cf1 = hybridep_get_globaltimer_ns();
-      c_fence_ns += (cf1 - cf0);
-#endif
+      continue;
     }
 
-#ifdef NCCL_EP_HT_INPUT_COPY_STAGE_PROFILE
-    if (blockIdx.x == 0) {
-      const uint64_t c_total_ns = c_wait_ns + c_store_ns + c_drain_ns + c_fence_ns;
-      printf("[INPUT-COPY-PROFILE-CONS] block=0 tokens=%d "
-             "c_wait_us=%.1f c_store_us=%.1f c_drain_us=%.1f c_fence_us=%.1f c_total_us=%.1f\n",
-             c_tokens_done,
-             (double)c_wait_ns  / 1000.0,
-             (double)c_store_ns / 1000.0,
-             (double)c_drain_ns / 1000.0,
-             (double)c_fence_ns / 1000.0,
-             (double)c_total_ns / 1000.0);
-      printf("[INPUT-COPY-PROFILE-CONS-NS] block=0 "
-             "c_wait_ns=%llu c_store_ns=%llu c_drain_ns=%llu c_fence_ns=%llu\n",
-             (unsigned long long)c_wait_ns,
-             (unsigned long long)c_store_ns,
-             (unsigned long long)c_drain_ns,
-             (unsigned long long)c_fence_ns);
+    if (blockIdx.x == 0 && chunk_id == 0 && warp_id == 0) {
+      printf("[INPUT-COPY-V5A-CHUNK0] chunk_active=%d kNumWarps=%d\n",
+             chunk_active, kNumWarps);
     }
-#endif
+
+    // Initial prefetch: this warp's first assigned token into its slot.
+    {
+      const int token_id = chunk_start + my_first_token;
+      const TOKEN_DATA_TYPE* g_src = user_input_token + token_id * HIDDEN_DIM;
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          smem_s,
+          reinterpret_cast<const void*>(g_src),
+          static_cast<uint32_t>(bytes_per_token),
+          mbar_s);
+      cuda::ptx::mbarrier_arrive_expect_tx(
+          cuda::ptx::sem_release,
+          cuda::ptx::scope_cta,
+          cuda::ptx::space_shared,
+          mbar_s,
+          static_cast<uint32_t>(bytes_per_token));
+    }
+
+    for (int my_token = my_first_token; my_token < chunk_active; my_token += kNumWarps) {
+      const int token_id = chunk_start + my_token;
+      TOKEN_DATA_TYPE* g_dst = expert_input_token + token_id * HIDDEN_DIM;
+
+      // Wait for this warp's LOAD (g2s tx-complete).
+      while (!cuda::ptx::mbarrier_try_wait_parity(mbar_s, phase)) {}
+      phase ^= 1;
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+
+      if (blockIdx.x == 0 && warp_id == 0 && chunk_id == 0 && my_token == my_first_token) {
+        printf("[INPUT-COPY-V5A-W0-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n", g_dst, smem_s);
+      }
+
+      // STORE this warp's slot into peer fabric (same-warp LOAD->STORE).
+      cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_global,
+          cuda::ptx::space_shared,
+          reinterpret_cast<void*>(g_dst),
+          reinterpret_cast<const void*>(smem_s),
+          static_cast<uint32_t>(bytes_per_token));
+      cuda::ptx::cp_async_bulk_commit_group();
+      // Wait this warp's STORE SMEM read done before reusing slot for next prefetch.
+      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+
+      if (blockIdx.x == 0 && warp_id == 0 && chunk_id == 0 && my_token == my_first_token) {
+        printf("[INPUT-COPY-V5A-W0-T0-AFTER-STORE] STORE drain OK\n");
+      }
+
+      my_tokens_done += 1;
+
+      // Prefetch this warp's next assigned token (if any) into the same slot.
+      const int next_token = my_token + kNumWarps;
+      if (next_token < chunk_active) {
+        const int next_token_id = chunk_start + next_token;
+        const TOKEN_DATA_TYPE* g_src_next = user_input_token + next_token_id * HIDDEN_DIM;
+        cuda::ptx::cp_async_bulk(
+            cuda::ptx::space_shared,
+            cuda::ptx::space_global,
+            smem_s,
+            reinterpret_cast<const void*>(g_src_next),
+            static_cast<uint32_t>(bytes_per_token),
+            mbar_s);
+        cuda::ptx::mbarrier_arrive_expect_tx(
+            cuda::ptx::sem_release,
+            cuda::ptx::scope_cta,
+            cuda::ptx::space_shared,
+            mbar_s,
+            static_cast<uint32_t>(bytes_per_token));
+      }
+    }
+
+    // Drain this warp's STOREs (fabric write must complete before signalling).
+    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    __threadfence_system();
+    asm volatile("red.release.sys.global.add.u32 [%0], %1;"
+                 :
+                 : "l"(__cvta_generic_to_global(combine_input_ready + chunk_id)),
+                   "n"(1)
+                 : "memory");
+  }
+
+  if (blockIdx.x == 0) {
+    printf("[INPUT-COPY-V5A-DONE] warp=%d my_tokens=%d\n", warp_id, my_tokens_done);
   }
 }
 
