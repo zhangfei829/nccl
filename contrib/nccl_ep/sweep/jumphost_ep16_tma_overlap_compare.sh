@@ -139,11 +139,12 @@ export CUDA_HOME=/usr/local/cuda
 export NCCL_EP_HT_PROFILE=1
 if [[ "$enable_copy" == "1" ]]; then
   export NCCL_EP_HT_DISPATCH_TMA_COPY=1
-  # V7 (2026-05-11): in-kernel INPUT_COPY (V5-A 4-warp same-warp) + chunk
-  # gate sync (inter_node_G2S writes SMEM gate at end, INPUT_COPY entry
-  # spin-waits).  V8 standalone path measured worse than baseline (host
-  # wall 2700us vs cudaMemcpyAsync 280us) so V7 in-kernel is the path.
-  export NCCL_EP_HT_COMBINE_INPUT_COPY=1
+  # 2026-05-11: in-kernel combine INPUT_COPY (V3/V4/V5-A/V6/V7) all measured
+  # net loss vs baseline cudaMemcpyAsync (V7 with spin-wait gate even hung
+  # at t=4096 timeout 123s).  V8 standalone TMA kernel also worse.  Default
+  # combine input copy back to baseline cudaMemcpyAsync.  Dispatch
+  # in-kernel TMA overlap (above) is still enabled.
+  unset NCCL_EP_HT_COMBINE_INPUT_COPY || true
   unset NCCL_EP_HT_COMBINE_INPUT_STANDALONE || true
 else
   unset NCCL_EP_HT_DISPATCH_TMA_COPY || true
