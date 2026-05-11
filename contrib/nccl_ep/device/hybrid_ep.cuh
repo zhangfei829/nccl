@@ -4391,7 +4391,10 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
         printf("[INPUT-COPY-V5A-W0-T0-BEFORE-STORE] g_dst=%p smem_s=%p\n", g_dst, smem_s);
       }
 
-      // STORE this warp's slot into peer fabric (same-warp LOAD->STORE).
+      // STORE this warp's SMEM slot into THIS RANK's own expert_input_token
+      // (cuMemMap'd local HBM, fabric handle exported so peers can later pull).
+      // This is local D2D (本卡 HBM->HBM); NVSwitch only used later when peer's
+      // main G2S warp_group cp.async.bulk-pulls this expert_input_token chunk.
       cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global,
           cuda::ptx::space_shared,
