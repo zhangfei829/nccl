@@ -258,6 +258,13 @@ struct combine_smem_layout_t {
   uint64_t* input_copy_consumer_mbar;          // NUM_STAGES mbarriers
   int input_copy_stage_stride;                 // bytes per ring stage
 
+  // [V7, 2026-05-11] Per-CTA gate counter for "main G2S done" signal.
+  // INPUT_COPY warp_group spin-waits this gate to reach the inter-node G2S
+  // warp count before issuing its first cp.async.bulk; this sequentialises
+  // TMA engine usage between G2S and INPUT_COPY (mirrors dispatch's
+  // dispatch_copy_ready chunk-wise wait at coarser granularity).
+  uint32_t* input_copy_g2s_gate;               // single uint32 atomic counter
+
   __device__ __forceinline__ void* get_input_copy_buffer(int stage) const {
     return reinterpret_cast<void*>(
         reinterpret_cast<uint8_t*>(input_copy_buffer) + stage * input_copy_stage_stride);
@@ -753,11 +760,17 @@ __device__ combine_smem_layout_t create_combine_smem_layout(
     layout.input_copy_consumer_mbar = reinterpret_cast<uint64_t*>(
         reinterpret_cast<uint8_t*>(smem_base) + offset);
     offset += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);
+    // [V7] Per-CTA gate counter
+    align_offset(4);
+    layout.input_copy_g2s_gate = reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uint8_t*>(smem_base) + offset);
+    offset += sizeof(uint32_t);
   } else {
     layout.input_copy_buffer = nullptr;
     layout.input_copy_producer_mbar = nullptr;
     layout.input_copy_consumer_mbar = nullptr;
     layout.input_copy_stage_stride = 0;
+    layout.input_copy_g2s_gate = nullptr;
   }
 
   return layout;
@@ -884,6 +897,7 @@ static size_t calculate_combine_smem_layout_size(
 
   // [Combine input-copy overlap V3, 2026-05-09] INPUT_COPY ring buffer +
   // 2 mbarrier arrays (producer + consumer for cross-warp pattern).
+  // [V7, 2026-05-11] Plus single uint32_t gate for G2S->INPUT_COPY sync.
   if constexpr (ENABLE_INPUT_COPY) {
     total_size = (total_size + 127) & ~127;
     total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * hidden_dim * sizeof(uint16_t);
@@ -891,6 +905,8 @@ static size_t calculate_combine_smem_layout_size(
     total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);  // producer
     total_size = (total_size + 7) & ~7;
     total_size += HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES * sizeof(uint64_t);  // consumer
+    total_size = (total_size + 3) & ~3;
+    total_size += sizeof(uint32_t);  // V7 gate
   }
 
   return total_size;
@@ -3106,6 +3122,21 @@ __forceinline__ __device__ void inter_node_G2S_warp_group_device_function(const 
       }
     }
   }
+
+  // [V7 2026-05-11] Signal "G2S warp_group done" to INPUT_COPY warp_group via
+  // per-CTA SMEM gate.  Each warp's lane 0 atomicAdds 1; INPUT_COPY entry
+  // spin-waits gate == INTER_NODE_G2S_GROUP::warp_size().  This sequentialises
+  // TMA engine usage between G2S (which does cp.async.bulk read of peer
+  // expert_input_token) and INPUT_COPY (which does cp.async.bulk LOAD/STORE
+  // for local expert_input_token write), mirroring dispatch_tma_copy_warp_group
+  // chunk-wise spin-wait pattern at coarser grain.  No-op if smem ptr null
+  // (ENABLE_INPUT_COPY=false template instance has nullptr in SMEM layout).
+  if constexpr (ENABLE_INPUT_COPY) {
+    if (smem_buffer_ptr->input_copy_g2s_gate != nullptr &&
+        (INTER_NODE_G2S_GROUP::thread_rank() & 31) == 0) {
+      atomicAdd(smem_buffer_ptr->input_copy_g2s_gate, 1u);
+    }
+  }
 }
 
 // Device function for inter-node reduction warp group for combine kernel.
@@ -4234,7 +4265,8 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
     const TOKEN_DATA_TYPE* user_input_token,
     TOKEN_DATA_TYPE* expert_input_token,
     uint32_t* combine_input_ready,
-    SMEM_TYPE* smem_buffer_ptr)
+    SMEM_TYPE* smem_buffer_ptr,
+    int num_g2s_warps)  // V7: number of INTER_NODE_G2S warps to wait for
 {
   if (user_input_token == nullptr || expert_input_token == nullptr ||
       combine_input_ready == nullptr || input_copy_chunk_tokens <= 0 ||
@@ -4257,15 +4289,28 @@ __forceinline__ __device__ void combine_input_copy_warp_group_device_function(
   const int lane    = COPY_GROUP::thread_rank() & 31;
   if (lane != 0) return;  // each warp's lane 0 issues; rest of warp idles
 
-  constexpr int kNumWarps  = HYBRIDEP_COMBINE_INPUT_COPY_WARPS;     // = 4 (V5-A)
+  constexpr int kNumWarps  = HYBRIDEP_COMBINE_INPUT_COPY_WARPS;     // = 4 (V7)
   constexpr int kNumStages = HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES; // = 4
   static_assert(kNumWarps == kNumStages,
-                "V5-A requires NUM_WARPS == NUM_STAGES (each warp owns 1 slot).");
+                "V7 requires NUM_WARPS == NUM_STAGES (each warp owns 1 slot).");
+
+  // [V7 2026-05-11] Spin-wait per-CTA SMEM gate set by inter_node_G2S
+  // warp_group at end of its work.  This sequentialises TMA engine usage
+  // between INTER_NODE_G2S (cp.async.bulk read peer expert_input_token)
+  // and INPUT_COPY (cp.async.bulk LOAD/STORE for local expert_input_token
+  // write), which V5-A measurement showed was the missing piece vs
+  // dispatch_tma_copy_warp_group's chunk-wise wait.  Each lane-0 of each
+  // INPUT_COPY warp spins independently; volatile load is safe since gate
+  // is monotonically increasing in this CTA.
+  if (smem_buffer_ptr->input_copy_g2s_gate != nullptr && num_g2s_warps > 0) {
+    volatile uint32_t* gate_v = smem_buffer_ptr->input_copy_g2s_gate;
+    while (*gate_v < static_cast<uint32_t>(num_g2s_warps)) { /* spin */ }
+  }
 
   if (blockIdx.x == 0 && warp_id == 0) {
-    printf("[INPUT-COPY-V5A-ENTRY] block=0 warp=0 num_chunks=%d num_tokens=%d hidden=%d kNumWarps=%d\n",
+    printf("[INPUT-COPY-V7-ENTRY] block=0 warp=0 num_chunks=%d num_tokens=%d hidden=%d kNumWarps=%d num_g2s_warps=%d\n",
            (num_input_tokens + input_copy_chunk_tokens - 1) / input_copy_chunk_tokens,
-           num_input_tokens, HIDDEN_DIM, kNumWarps);
+           num_input_tokens, HIDDEN_DIM, kNumWarps, num_g2s_warps);
   }
 
   const int num_chunks = (num_input_tokens + input_copy_chunk_tokens - 1) /
@@ -4529,6 +4574,10 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
         cuda::ptx::mbarrier_init(smem_buffer_ptr->get_input_copy_prod_mbar(s), 1);
         cuda::ptx::mbarrier_init(smem_buffer_ptr->get_input_copy_cons_mbar(s), 1);
       }
+      // [V7] Init G2S->INPUT_COPY gate counter to 0; main G2S warps will
+      // atomicAdd this when they finish reading peer expert_input_token,
+      // INPUT_COPY warps spin-wait on this before issuing local LOAD/STORE.
+      *(smem_buffer_ptr->input_copy_g2s_gate) = 0u;
     }
     // Make mbarriers initialization visible to async proxy(TMA).
     cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
@@ -4583,6 +4632,9 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
     // [Combine input-copy overlap, 2026-05-09] INPUT_COPY warp_group.
     // Active only when ENABLE_INPUT_COPY=true (otherwise INPUT_COPY_GROUP::size()==0).
     if constexpr (ENABLE_INPUT_COPY) {
+      // V7: pass INTER_NODE_G2S warp count so INPUT_COPY entry can spin-wait
+      // gate to reach this value (each G2S warp atomicAdds 1 at end of work).
+      constexpr int kNumG2SWarps = static_cast<int>(INTER_NODE_G2S_GROUP::size() / 32);
       combine_input_copy_warp_group_device_function<INPUT_COPY_GROUP, uint16_t, cur_smem_t>(
           param.hidden_dim,
           param.num_recv_tokens,
@@ -4590,7 +4642,8 @@ __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t<LS
           param.user_input_token,
           param.expert_input_token[param.local_rank],
           param.combine_input_ready[param.local_rank],
-          smem_buffer_ptr);
+          smem_buffer_ptr,
+          kNumG2SWarps);
     }
   }else{
     // Too many threads, should not goes here.

@@ -150,37 +150,24 @@
 // handle is shared with peers.  combine_input_copy moves user x -> local
 // HBM expert_input_token entirely on the current GPU; no NVSwitch traffic.
 //
-// V6 (2026-05-11): minimal SMEM footprint to preserve main combine kernel
-// occupancy.  V3/V4/V5-A all measured combine_kernel ~1100us extra time vs
-// baseline 570us, traced to SMEM cap pressure:
+// V6 (1 warp 1 stage SMEM-min) measured combine_kernel 2809us, even worse
+// than V5-A's 1652us.  SMEM occupancy hypothesis was wrong; losing the
+// ring buffer prefetch made INPUT_COPY itself serialise harder.
 //
-//   sm_103 dynamic SMEM cap per CTA = 228 KB.
-//   combine main kernel base SMEM ~150-180 KB (G2S 8-stage + S2G + prob +
-//     mbars).
-//   V3/V4/V5-A INPUT_COPY ring (NUM_STAGES=4 * 7168 bytes = 56 KB) pushed
-//     total to 206-236 KB -> per-SM occupancy dropped from 2 CTA/SM to
-//     1 CTA/SM, halving main work throughput while INPUT_COPY itself cost
-//     only ~70 us/SM (256 tokens / 16 SMs parallel).
-//
-// V6 reduces INPUT_COPY SMEM to ~14 KB (1 stage * 7168 bytes + 16 bytes
-// mbar), bringing combine total back below 200 KB so 2 CTA/SM occupancy is
-// preserved.  Cost: INPUT_COPY runs as a single-warp single-stage serial
-// LOAD+STORE per CTA (~70 us/SM total when 16 CTAs run in parallel).
-//
-// Net target: combine_kernel ~ max(input_copy ~70us, main work ~570us)
-// = 570us == baseline.  Combined with host_overhead saving (-280us from
-// removing pre-kernel cudaMemcpyAsync), combine_avg ~593us vs baseline
-// 873us -> 1.47x combine speedup, ~1.18x total D+C speedup.
-//
-// V6 == V1 design (1 warp same-warp LOAD+STORE).  V1 originally crashed at
-// rc=134 on cp.async.bulk(SMEM->local HBM); root cause was never found
-// because we wrongly attributed it to fabric writes.  V5-A successfully
-// launched a 4-warp same-warp version, so the V1 crash is unlikely
-// fundamental to "1 warp same-warp + local HBM dst".  V6 will runtime-test
-// whether reducing back to 1 warp 1 stage retriggers V1's crash.
-#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 1
+// V7 (2026-05-11): restore V5-A config (4 warps, NUM_STAGES = NUM_WARPS = 4)
+// AND add the missing chunk-wise spin-wait that strictly mirrors dispatch's
+// dispatch_copy_ready check.  Hypothesis: V5-A failed because per-token
+// cp.async.bulk lane-0 issue ran in parallel with combine main G2S/S2G
+// also issuing cp.async.bulk; both compete for the per-SM TMA engine.
+// Adding a chunk-start gate (INPUT_COPY waits for main G2S to finish a
+// chunk before issuing) sequentialises TMA engine usage chunk-by-chunk
+// like dispatch_tma_copy_warp_group_device_function does.  This is the
+// only line-level difference between V5-A and dispatch_tma_copy after
+// careful diff -- everything else (warp count, slot count, mbar pattern,
+// prefetch loop, same-warp LOAD/STORE) matches.
+#define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 4
 #define HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS 32
-#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 1  // = NUM_WARPS in V6 (1 slot)
+#define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 4  // = NUM_WARPS in V7 (1 slot per warp)
 
 // ============================================================================
 // Preprocessing kernel configuration

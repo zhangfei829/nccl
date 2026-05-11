@@ -139,13 +139,12 @@ export CUDA_HOME=/usr/local/cuda
 export NCCL_EP_HT_PROFILE=1
 if [[ "$enable_copy" == "1" ]]; then
   export NCCL_EP_HT_DISPATCH_TMA_COPY=1
-  # V8 standalone has priority over V5-A in-kernel when both env are set
-  # (see nccl_ep.cc combine path).  V8 reuses launch_dispatch_output_tma_copy_bf16
-  # as a generic local D2D TMA kernel ~3us GPU work vs cudaMemcpyAsync ~280us
-  # stream wall.  Set INPUT_STANDALONE only; INPUT_COPY (V5-A in-kernel) is
-  # known-regression in current measurements.
-  export NCCL_EP_HT_COMBINE_INPUT_STANDALONE=1
-  unset NCCL_EP_HT_COMBINE_INPUT_COPY || true
+  # V7 (2026-05-11): in-kernel INPUT_COPY (V5-A 4-warp same-warp) + chunk
+  # gate sync (inter_node_G2S writes SMEM gate at end, INPUT_COPY entry
+  # spin-waits).  V8 standalone path measured worse than baseline (host
+  # wall 2700us vs cudaMemcpyAsync 280us) so V7 in-kernel is the path.
+  export NCCL_EP_HT_COMBINE_INPUT_COPY=1
+  unset NCCL_EP_HT_COMBINE_INPUT_STANDALONE || true
 else
   unset NCCL_EP_HT_DISPATCH_TMA_COPY || true
   unset NCCL_EP_HT_COMBINE_INPUT_COPY || true
