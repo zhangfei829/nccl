@@ -145,21 +145,38 @@
 //   - 1 SMEM ring slot per warp (single-stage), 2 mbarriers (g2s + s2g).
 //   - chunk_tokens = 32 (matches dispatch_copy_chunk_tokens for symmetric
 //     fabric memory layout / counter array sizing).
+// CORRECTION (2026-05-11): expert_input_token is allocated by cuMemCreate
+// (CU_MEM_LOCATION_TYPE_DEVICE) on the LOCAL rank's HBM and only the FABRIC
+// handle is shared with peers.  The src->dst path of combine_input_copy
+// (user_input_token -> expert_input_token) is entirely LOCAL D2D on the
+// current GPU's HBM; no NVSwitch traffic until a peer later reads our
+// expert_input_token via its imported fabric handle.  Earlier comments that
+// blamed "fabric STORE serialization" or "fabric memory write ordering" for
+// V1/V3/V4 issues were wrong; the slowness is local D2D mechanics in-kernel.
+//
 // V5-A: multi-warp same-warp LOAD+STORE pattern (clones the production
 // dispatch_tma_copy_warp_group_device_function in hybrid_ep.cuh:3846 which
 // works for HBM dst with HYBRIDEP_DISPATCH_TMA_COPY_WARPS=4).  Each warp
 // owns 1 SMEM slot + 1 mbarrier and processes tokens
 // [warp_id, warp_id+kNumWarps, warp_id+2*kNumWarps, ...] within each chunk.
 //
-// V3 cross-warp 1 PROD + 1 CONS measured -48% wall BW vs no-overlap; V4
-// in-flight wait_group_read<3> measured -64% (worse, fabric stores don't
-// actually pipeline within single thread / single warp).  V5-A gets true
-// HW parallelism by issuing from 4 warps = 4 independent per-thread
-// async-group queues.
+// V3 (1 PROD + 1 CONS cross-warp serial) measured combine_kernel +1153us
+// (= ~2.25us/token, ~30x above what cp.async.bulk per-token cost should be
+// on local HBM).  Single-warp lane-0 issue inside the combine kernel where
+// other warp_groups (G2S/S2G/N2N) also run gets long per-token mbarrier +
+// fence + issue overhead due to SM scheduling sharing.  V4 in-flight
+// wait_group_read<3> made it worse (-64% wall BW) because deferred
+// mbarrier_arrive broke the PROD/CONS overlap.
 //
-// Risk note: V1 (1 warp same-warp + fabric STORE) crashed with rc=134.  V5-A
-// uses 4 warps but each warp's pattern is the same as V1.  No PTX docs
-// guarantee that multi-warp avoids the V1 crash; this needs runtime test.
+// V5-A spreads that overhead across 4 warps issuing independently:
+// 4 SMEM slots, 4 mbarriers, each warp's lane-0 issues its own LOAD+STORE
+// pipeline for token subset [w, w+4, w+8, ...].
+//
+// V1 (1 warp same-warp) crashed with rc=134 -- root cause unknown (NOT
+// fabric write since this is local D2D).  V5-A's per-warp same-warp pattern
+// matches V1's structure but with 4 warps; if V5-A also crashes, the V1
+// root cause is structural (e.g. SMEM sharing with combine kernel's other
+// warp_groups, or mbarrier init ordering) and needs different debugging.
 #define HYBRIDEP_COMBINE_INPUT_COPY_WARPS 4
 #define HYBRIDEP_COMBINE_INPUT_COPY_CHUNK_TOKENS 32
 #define HYBRIDEP_COMBINE_INPUT_COPY_NUM_STAGES 4  // = NUM_WARPS in V5-A (1 slot per warp)

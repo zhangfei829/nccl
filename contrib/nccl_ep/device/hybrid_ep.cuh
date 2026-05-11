@@ -4183,27 +4183,39 @@ __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<
 // V5-A: multi-warp same-warp LOAD+STORE pattern, clones the production
 // dispatch_tma_copy_warp_group_device_function (hybrid_ep.cuh:3846).
 //
+// IMPORTANT FACT (corrected 2026-05-11): combine_input_copy moves data
+// entirely on the LOCAL GPU.  expert_input_token is allocated by
+// cuMemCreate(CU_MEM_LOCATION_TYPE_DEVICE) on this rank; the FABRIC handle
+// is only for peers to import later.  src->dst here is local HBM -> local
+// HBM (D2D), no NVSwitch traffic.  Earlier hypotheses that blamed "fabric
+// STORE serialization" for V1/V3/V4 slowness were wrong.
+//
 // Pattern history:
-//   V1 (2026-05-09): 1 warp same-warp LOAD+STORE writing fabric -> rc=134
-//                    crash on cp.async.bulk(SMEM->fabric).  Abandoned.
-//   V3 (2026-05-10): 1 PROD + 1 CONS cross-warp.  No crash but combine
-//                    wall BW -48% (per-token wait_group_read<0> serialises
-//                    fabric STOREs).
-//   V4 (2026-05-11): in-flight wait_group_read<3>.  -64% wall BW (worse;
-//                    deferred mbarrier_arrive breaks PROD/CONS overlap,
-//                    and fabric STOREs may not actually pipeline within
-//                    a single thread anyway).
+//   V1 (2026-05-09): 1 warp same-warp LOAD+STORE -> rc=134 crash on
+//                    cp.async.bulk(SMEM->local HBM).  Root cause unknown
+//                    (NOT fabric, NOT same-warp per se since dispatch
+//                    standalone uses same-warp and works).  Likely a
+//                    structural issue with SMEM sharing or mbarrier init
+//                    inside combine kernel's multi-warp_group layout.
+//                    Abandoned without clean root cause.
+//   V3 (2026-05-10): 1 PROD + 1 CONS cross-warp serial wait_group_read<0>.
+//                    No crash but combine_kernel +1153us (~2.25us/token,
+//                    30x above the per-cp.async.bulk-token cost on local
+//                    HBM).  Single-warp lane-0 issue inside combine kernel
+//                    contends for SM with other warp_groups; per-token
+//                    mbarrier+fence+issue overhead piles up.
+//   V4 (2026-05-11): in-flight wait_group_read<3>.  combine_kernel +1963us
+//                    (-64% wall BW vs no-overlap, worse than V3).
+//                    Deferred mbarrier_arrive(cons_m) until wait_group_read
+//                    broke PROD/CONS overlap entirely.
 //   V5-A (this):     4 warps, each owns 1 SMEM slot + 1 mbar, processes
 //                    tokens [warp_id, warp_id+kNumWarps, ...] same-warp
 //                    LOAD then STORE (matches dispatch_tma_copy exactly,
-//                    only difference is dst is fabric memory not user HBM).
-//                    Each warp's per-thread async-group queue is hardware-
-//                    independent => true parallel STOREs.
+//                    here also writing local HBM).  Spreads per-token
+//                    overhead across 4 SM scheduling slots.
 //
-// Risk: V1's 1-warp same-warp+fabric crash may also occur with multi-warp.
-// PTX ISA 9.x has no explicit doc on cp.async.bulk(SMEM->fabric) same-warp
-// race conditions.  V5-A is a runtime test of the hypothesis "V1 crash was
-// 1-warp specific; multi-warp queues per thread avoid it".
+// Risk: same-warp LOAD+STORE inside combine kernel may still hit V1's
+// crash trigger.  No PTX docs explain V1's rc=134.  Runtime test required.
 //
 // Each warp signals combine_input_ready[chunk_id] += 1 after its STORE
 // drain; this gives kNumWarps signals per chunk per CTA.  Host's
