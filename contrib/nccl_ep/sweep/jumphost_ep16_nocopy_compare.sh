@@ -11,10 +11,15 @@
 # no_copy         : NCCL_EP_HT_NO_COPY=1 -> skip ALL host cudaMemcpyAsync
 #                   (dispatch input + dispatch output + combine input). Kernel
 #                   does no in-kernel COPY warps either (tma_overlap forced
-#                   off). Caller is expected to already have valid data in the
-#                   internal staging buffers; benchmark runs as-is so calc_diff
-#                   validation will fail, but kernel/wall timing is real and
-#                   represents the kernel-only cost (no copy overhead at all).
+#                   off). Caller is expected to read/write NCCL's internal
+#                   staging buffers directly via:
+#                     ncclEpHtGetDispatchOutputBuffer(handle, &ptr, &maxsz)
+#                     ncclEpHtGetCombineInputBuffer  (handle, &ptr, &maxsz)
+#                   ep_bench uses those APIs in its --validate path to bridge
+#                   STAGE<->user buffers ONLY for the one-shot validation
+#                   iteration (NOT in the timing loop), so calc_diff is
+#                   meaningful while the timing data still reflects true
+#                   no-copy cost.
 #
 # Default: EP=16, BF16, tokens 4096/8192, all 3 cases.
 # Same binary handles all 3 cases (env-only switching, no rebuild).
@@ -156,6 +161,11 @@ for ep in $EP_SIZES; do
     esac
     OUT=$REMOTE_BASE/ep\${ep}/\${case}
     mkdir -p "\$OUT"
+    # Validation: enable for all 3 cases. baseline confirms validator infra
+    # works, dispatch_overlap exercises in-kernel TMA write to recv_x,
+    # no_copy exercises the bench-side STAGE<->user bridging copies that
+    # ep_bench performs only in the validation path when NCCL_EP_HT_NO_COPY=1.
+    BENCH_EXTRA="--validate"
     echo
     echo "===== EP=\$ep case=\$case (DISPATCH_TMA=\${NCCL_EP_HT_DISPATCH_TMA_COPY:-unset} NO_COPY=\${NCCL_EP_HT_NO_COPY:-unset}) ====="
     EP_SIZE=\$ep \\
@@ -164,6 +174,7 @@ for ep in $EP_SIZES; do
     LOG_DIR="\$OUT" \\
     CSV_FILE="\$OUT/results.csv" \\
     HOSTFILE_OVERRIDE="\$HOSTFILE" \\
+    EXTRA_BENCH_ARGS="\$BENCH_EXTRA" \\
     bash contrib/nccl_ep/sweep/ep_sweep.sh
   done
 done
@@ -177,8 +188,30 @@ for ep in $EP_SIZES; do
     mkdir -p "$LOCAL_OUT/ep${ep}/${case}"
     "${SSH_BASE_N[@]}" "$USER_NAME@$HEAD_TRAY" "cat '$REMOTE_BASE/ep${ep}/${case}/results.csv'" \
       > "$LOCAL_OUT/ep${ep}/${case}/results.csv" 2>/dev/null || true
+    # Pull all token-size logs for this case so we can grep validation lines.
+    "${SSH_BASE_N[@]}" "$USER_NAME@$HEAD_TRAY" \
+      "tar -C '$REMOTE_BASE/ep${ep}/${case}' -cf - . 2>/dev/null" \
+      | tar -C "$LOCAL_OUT/ep${ep}/${case}" -xf - 2>/dev/null || true
   done
 done
+
+echo
+echo "===== [5b/6] Validation summary (grep --validate output) ====="
+for ep in $EP_SIZES; do
+  for case in baseline dispatch_overlap no_copy; do
+    LOG_DIR_LOCAL="$LOCAL_OUT/ep${ep}/${case}"
+    [ -d "$LOG_DIR_LOCAL" ] || continue
+    for log in "$LOG_DIR_LOCAL"/*.log; do
+      [ -f "$log" ] || continue
+      tok=$(basename "$log" .log)
+      d_line=$(grep -E '^Dispatch validation' "$log" | head -1 || true)
+      c_line=$(grep -E '^Combine validation'  "$log" | head -1 || true)
+      g_line=$(grep -E '^Global validation'   "$log" | head -1 || true)
+      printf "[VAL] EP=%s case=%-16s %-40s\n" "$ep" "$case" "$tok"
+      printf "      %s\n      %s\n      %s\n" "${d_line:-<no Dispatch line>}" "${c_line:-<no Combine line>}" "${g_line:-<no Global line>}"
+    done
+  done
+done | tee "$LOCAL_OUT/validation_summary.txt"
 
 echo
 echo "===== [6/6] Comparison Tables ====="

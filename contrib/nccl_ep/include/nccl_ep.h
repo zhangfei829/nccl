@@ -416,6 +416,49 @@ ncclResult_t ncclEpTensorGetSizes(
 );
 
 
+// =============================================================================
+// HT NO-COPY mode introspection (HIGH_THROUGHPUT only)
+// =============================================================================
+// When NCCL_EP_HT_NO_COPY=1 is set in the environment, ncclEpDispatch and
+// ncclEpCombine skip all internal cudaMemcpyAsync between the user buffers
+// and NCCL's internal IPC staging buffers (dispatch input + dispatch output +
+// combine input). The caller is then expected to read/write those staging
+// buffers directly.
+//
+// The two APIs below expose the local rank's HT IPC staging buffers so the
+// caller can populate inputs / read outputs in NO-COPY mode.
+
+// Returns the local rank's dispatch output internal IPC buffer.
+//   *ptr      = base pointer to a BF16 buffer of layout [max_recv_tokens, hidden].
+//   *max_size = capacity in bytes (= max_recv_tokens * hidden * sizeof(uint16_t)).
+// In NO-COPY mode this buffer holds the dispatch kernel output; the caller
+// reads at most num_recv_tokens * hidden * sizeof(uint16_t) bytes.
+// Without NO-COPY, NCCL also copies a prefix of this buffer to recv_x.
+// HT mode only; returns ncclInvalidUsage in LL/FULLMESH.
+
+ncclResult_t ncclEpHtGetDispatchOutputBuffer(
+    ncclEpHandle_t handle,
+    void** ptr,
+    size_t* max_size
+);
+
+// Returns the local rank's combine input internal IPC buffer.
+//   *ptr      = base pointer to a BF16 buffer of layout [max_recv_tokens, hidden].
+//   *max_size = capacity in bytes.
+// In NO-COPY mode the caller MUST place valid combine-input data
+// (num_tokens * hidden * sizeof(uint16_t) bytes at offset 0) into this buffer
+// before calling ncclEpCombine, otherwise the kernel reads stale bytes and
+// reduce produces garbage.
+// Without NO-COPY, NCCL copies x->data into this buffer per ncclEpCombine call.
+// HT mode only; returns ncclInvalidUsage in LL/FULLMESH.
+
+ncclResult_t ncclEpHtGetCombineInputBuffer(
+    ncclEpHandle_t handle,
+    void** ptr,
+    size_t* max_size
+);
+
+
 #ifdef __cplusplus
 }
 #endif

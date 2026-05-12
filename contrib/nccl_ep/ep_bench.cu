@@ -2636,6 +2636,23 @@ int main(int argc, char* argv[]) {
         // Run one more dispatch+combine with validation
         if (myRank == 0) { printf("\n=== Data Validation ===\n"); fflush(stdout); }
 
+        // [NO-COPY validation] When NCCL_EP_HT_NO_COPY=1 is active in the
+        // child process env, NCCL's ncclEpDispatch / ncclEpCombine skip
+        // their internal cudaMemcpyAsync between the user buffers and the
+        // internal IPC staging buffers. The bench must then bridge those
+        // copies in the validation path so end-to-end calc_diff stays
+        // meaningful: after dispatch we copy STAGE -> recv_x so the
+        // existing validateDispatchOutput (which reads recv_x) still
+        // works; before combine we copy expert_outputs -> STAGE so the
+        // combine kernel sees real data instead of zero/stale fabric
+        // memory contents. These bridging copies live OUTSIDE the timing
+        // loop and only run once for the validation pass.
+        const char* no_copy_env = ::getenv("NCCL_EP_HT_NO_COPY");
+        const bool no_copy_validate =
+            (no_copy_env != nullptr && no_copy_env[0] != '0' &&
+             no_copy_env[0] != '\0' &&
+             algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
+
         // Re-initialize validation data (benchmark may have modified it)
         initializeValidationData(tensors, num_tokens, hidden, top_k, myRank,
                                  algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT);
@@ -2644,6 +2661,35 @@ int main(int argc, char* argv[]) {
         dispatch_fn();
         CUDACHECK(cudaStreamSynchronize(stream));
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+
+        // [NO-COPY validation] Bridge: NCCL skipped the dispatch output
+        // cudaMemcpyAsync, so recv_x (= outputs[0]) is empty. Pull from
+        // the dispatch internal IPC buffer into recv_x so the existing
+        // validation reader does not need to know about NO-COPY mode.
+        if (no_copy_validate) {
+            void* dispatch_stage_ptr = nullptr;
+            size_t dispatch_stage_max = 0;
+            ncclResult_t r = ncclEpHtGetDispatchOutputBuffer(
+                ep_handle, &dispatch_stage_ptr, &dispatch_stage_max);
+            if (r != ncclSuccess || dispatch_stage_ptr == nullptr) {
+                if (myRank == 0) {
+                    printf("[NO-COPY-VAL] WARN: GetDispatchOutputBuffer rc=%d ptr=%p\n",
+                           (int)r, dispatch_stage_ptr);
+                    fflush(stdout);
+                }
+            } else {
+                unsigned int actual_recv = 0;
+                NCCLCHECK(ncclEpHandleGetNumRecvTokens(ep_handle, &actual_recv));
+                void* output0_data = nullptr;
+                NCCLCHECK(ncclEpTensorGetData(tensors.outputs[0], &output0_data));
+                size_t valid_bytes = static_cast<size_t>(actual_recv) *
+                                     static_cast<size_t>(hidden) * sizeof(uint16_t);
+                if (valid_bytes > dispatch_stage_max) valid_bytes = dispatch_stage_max;
+                CUDACHECK(cudaMemcpy(output0_data, dispatch_stage_ptr,
+                                     valid_bytes, cudaMemcpyDeviceToDevice));
+                CUDACHECK(cudaStreamSynchronize(0));
+            }
+        }
 
         ValidationResult dispatch_valid = validateDispatchOutput(
             tensors, num_tokens, hidden, top_k, num_experts, num_local_experts, myRank, nRanks,
@@ -2665,6 +2711,31 @@ int main(int argc, char* argv[]) {
                 NCCLCHECK(ncclEpTensorGetSizes(tensors.expert_outputs, &eo_sizes, &eo_ndim));
                 size_t data_size = eo_sizes[0] * eo_sizes[1] * sizeof(uint16_t);
                 CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
+
+                // [NO-COPY validation] Bridge: NCCL will skip the combine
+                // input cudaMemcpyAsync(expert_input_token, x->data, ...).
+                // Place the same data into the internal staging buffer so
+                // the combine kernel reads valid bytes instead of stale
+                // fabric memory.
+                if (no_copy_validate) {
+                    void* combine_stage_ptr = nullptr;
+                    size_t combine_stage_max = 0;
+                    ncclResult_t r = ncclEpHtGetCombineInputBuffer(
+                        ep_handle, &combine_stage_ptr, &combine_stage_max);
+                    if (r != ncclSuccess || combine_stage_ptr == nullptr) {
+                        if (myRank == 0) {
+                            printf("[NO-COPY-VAL] WARN: GetCombineInputBuffer rc=%d ptr=%p\n",
+                                   (int)r, combine_stage_ptr);
+                            fflush(stdout);
+                        }
+                    } else {
+                        size_t copy_bytes = data_size;
+                        if (copy_bytes > combine_stage_max) copy_bytes = combine_stage_max;
+                        CUDACHECK(cudaMemcpy(combine_stage_ptr, eo_data,
+                                             copy_bytes, cudaMemcpyDeviceToDevice));
+                        CUDACHECK(cudaStreamSynchronize(0));
+                    }
+                }
             } else {
                 // LL mode: 3D [num_local_experts, max_tokens_per_expert, hidden]
                 const unsigned int* out0_sizes;

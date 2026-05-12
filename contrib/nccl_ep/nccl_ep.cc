@@ -4417,3 +4417,50 @@ ncclResult_t ncclEpHandleGetNumRecvTokens(
     }
     return ncclSuccess;
 }
+
+// =============================================================================
+// HT NO-COPY mode introspection: expose internal staging buffers
+// =============================================================================
+ncclResult_t ncclEpHtGetDispatchOutputBuffer(
+    ncclEpHandle_t handle,
+    void** ptr,
+    size_t* max_size
+) {
+    if (handle == nullptr || ptr == nullptr || max_size == nullptr) {
+        return ncclInvalidArgument;
+    }
+    if (handle->group == nullptr ||
+        handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        return ncclInvalidUsage;
+    }
+    auto* group = handle->group;
+    if (group->ht_buffers.dispatch_expert_output_token_buffer_ptrs == nullptr) {
+        return ncclInternalError;
+    }
+    *ptr = group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node];
+    *max_size = static_cast<size_t>(group->max_recv_tokens) *
+                static_cast<size_t>(group->hidden) * sizeof(uint16_t);
+    return ncclSuccess;
+}
+
+ncclResult_t ncclEpHtGetCombineInputBuffer(
+    ncclEpHandle_t handle,
+    void** ptr,
+    size_t* max_size
+) {
+    if (handle == nullptr || ptr == nullptr || max_size == nullptr) {
+        return ncclInvalidArgument;
+    }
+    if (handle->group == nullptr ||
+        handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        return ncclInvalidUsage;
+    }
+    auto* group = handle->group;
+    if (group->ht_buffers.expert_input_token == nullptr) {
+        return ncclInternalError;
+    }
+    *ptr = group->ht_buffers.expert_input_token;
+    *max_size = static_cast<size_t>(group->max_recv_tokens) *
+                static_cast<size_t>(group->hidden) * sizeof(uint16_t);
+    return ncclSuccess;
+}
