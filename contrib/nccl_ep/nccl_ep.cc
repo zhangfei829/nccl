@@ -3291,6 +3291,24 @@ ncclResult_t ncclEpDispatch(
             const char* v = std::getenv("NCCL_EP_HT_PROFILE");
             return v != nullptr && v[0] != '0' && v[0] != '\0';
         }();
+        // [NO-COPY mode] When NCCL_EP_HT_NO_COPY=1, host skips all
+        // dispatch/combine cudaMemcpyAsync (input + output) and the kernel
+        // skips its in-kernel COPY warps (tma_overlap is forced off so the
+        // dispatch kernel does not write to recv_x). This is a measurement
+        // mode: the user is expected to write/read the NCCL-internal staging
+        // buffers directly (see ncclEpHtGetDispatchInputBuffer/
+        // ncclEpHtGetDispatchOutputBuffer/ncclEpHtGetCombineInputBuffer).
+        // Dispatch validation reads from the dispatch internal output buffer
+        // returned by ncclEpHtGetDispatchOutputBuffer. Multi-node RDMA still
+        // requires the source to be GIN-registered; in NO-COPY mode the
+        // caller MUST place valid input data into the staging buffer once
+        // (ncclEpHtGetDispatchInputBuffer) before calling dispatch, otherwise
+        // the kernel will RDMA-put stale/zero bytes (steady-state timing is
+        // still real but data correctness will fail).
+        static const bool ht_no_copy = [](){
+            const char* v = std::getenv("NCCL_EP_HT_NO_COPY");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
         cudaEvent_t ev_h0 = nullptr, ev_h1 = nullptr, ev_h2 = nullptr,
                     ev_h3 = nullptr, ev_h4 = nullptr, ev_h5 = nullptr;
         if (ht_prof_d) {
@@ -3308,18 +3326,20 @@ ncclResult_t ncclEpDispatch(
         // This avoids ~60ms GIN registration overhead on the dispatch hot path
         void* token_ptr = x->data;  // Default: use user buffer directly
         if (!is_single_node && handle->hybridep.token_staging_buffer != nullptr) {
-            // Copy user tokens to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
-            size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);
-            CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.token_staging_buffer, x->data, token_size, cudaMemcpyDeviceToDevice, stream));
+            if (!ht_no_copy) {
+                size_t token_size = x->sizes[0] * x->sizes[1] * ncclTypeSize(x->datatype);
+                CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.token_staging_buffer, x->data, token_size, cudaMemcpyDeviceToDevice, stream));
+            }
             token_ptr = handle->hybridep.token_staging_buffer;
         }
 
         // For FP8: copy user scaling factors to pre-registered staging buffer
         float* scales_ptr = use_fp8 ? static_cast<float*>(scales->data) : nullptr;  // Default: use user buffer directly
         if (use_fp8 && !is_single_node && handle->hybridep.scaling_factor_staging_buffer != nullptr) {
-            // Copy user scaling factors to pre-registered staging buffer (D2D copy is ~0.1ms vs ~30ms GIN registration)
-            size_t scales_size = x->sizes[0] * sizeof(float);  // One scale per token
-            CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.scaling_factor_staging_buffer, scales->data, scales_size, cudaMemcpyDeviceToDevice, stream));
+            if (!ht_no_copy) {
+                size_t scales_size = x->sizes[0] * sizeof(float);
+                CUDA_CHECK(cudaMemcpyAsync(handle->hybridep.scaling_factor_staging_buffer, scales->data, scales_size, cudaMemcpyDeviceToDevice, stream));
+            }
             scales_ptr = handle->hybridep.scaling_factor_staging_buffer;
         }
         if (!use_fp8) {
@@ -3473,7 +3493,8 @@ ncclResult_t ncclEpDispatch(
             ht_dispatch_tma_copy && !use_fp8 && recv_x != nullptr &&
             recv_x->datatype == ncclBfloat16 && recv_x_tma_aligned &&
             group->ht_buffers.use_fabric_memory &&
-            ht_tma_cell_supported;
+            ht_tma_cell_supported &&
+            !ht_no_copy;  // NO-COPY mode skips output copy entirely; do not engage tma_overlap path
 #else
         const bool ht_dispatch_tma_copy_enabled = false;
 #endif
@@ -3524,6 +3545,9 @@ ncclResult_t ncclEpDispatch(
             if (ht_dispatch_tma_copy_enabled) {
                 // Internal dispatch kernel copied local internal output chunks
                 // to recv_x; skip the legacy copy-engine path.
+            } else if (ht_no_copy) {
+                // [NO-COPY] Output stays in dispatch_expert_output_token_buffer_ptrs;
+                // caller reads via ncclEpHtGetDispatchOutputBuffer.
             } else {
                 CUDA_CHECK(cudaMemcpyAsync(recv_x->data,
                     group->ht_buffers.dispatch_expert_output_token_buffer_ptrs[group->rank_in_node],
@@ -3566,7 +3590,7 @@ ncclResult_t ncclEpDispatch(
         }
 
         // Copy FP8 scales output
-        if (use_fp8) {
+        if (use_fp8 && !ht_no_copy) {
             ncclNDTensor_t recv_scales = find_tensor_by_tag(outputs, num_outputs, NCCL_EP_TENSOR_TAG_SCALES);
             if (recv_scales != nullptr) {
                 assert(recv_scales->ndim == 2 && tensor_is_contiguous(recv_scales));
@@ -4031,6 +4055,15 @@ ncclResult_t ncclEpCombine(
             const char* v = std::getenv("NCCL_EP_HT_PROFILE");
             return v != nullptr && v[0] != '0' && v[0] != '\0';
         }();
+        // [NO-COPY mode] Same env as dispatch. When set, host skips the pre-kernel
+        // cudaMemcpyAsync(expert_input_token, x->data, ...). Caller is expected to
+        // place valid data into expert_input_token directly via
+        // ncclEpHtGetCombineInputBuffer (or accept stale-data results when only
+        // measuring kernel timing).
+        static const bool ht_no_copy_c = [](){
+            const char* v = std::getenv("NCCL_EP_HT_NO_COPY");
+            return v != nullptr && v[0] != '0' && v[0] != '\0';
+        }();
         cudaEvent_t ev_c0 = nullptr, ev_c1 = nullptr, ev_c2 = nullptr,
                     ev_c3 = nullptr, ev_c4 = nullptr;
         if (ht_prof_c) {
@@ -4141,7 +4174,9 @@ ncclResult_t ncclEpCombine(
             ht_combine_input_standalone && x->datatype == ncclBfloat16 &&
             input_x_tma_aligned;
         size_t token_copy_size = static_cast<size_t>(num_tokens) * hidden * sizeof(uint16_t); // BF16 = uint16_t
-        if (ht_combine_input_standalone_enabled) {
+        if (ht_no_copy_c) {
+            // [NO-COPY] caller is responsible for filling expert_input_token directly.
+        } else if (ht_combine_input_standalone_enabled) {
             // V8: standalone TMA copy kernel replaces cudaMemcpyAsync. Same
             // stream as combine_kernel, so combine_kernel still waits for
             // copy completion via stream order; but TMA kernel GPU work
