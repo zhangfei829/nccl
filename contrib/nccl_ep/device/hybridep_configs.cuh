@@ -23,6 +23,18 @@
 #define HYBRIDEP_DISPATCH_NUM_OF_BLOCKS HYBRIDEP_MAX_NUM_SMS_PER_RANK
 #define HYBRIDEP_DISPATCH_NUM_OF_PIPELINES_PER_BLOCK 2
 #define HYBRIDEP_DISPATCH_N2N_WARPS 2
+
+// [LSA_TEAM_SIZE>16 SMEM relief, 2026-05-18]
+// Single-node MNNVL with LSA_TEAM_SIZE=32 (e.g., EP32 inside NVL72 fabric)
+// has experts_per_node = experts_per_rank * 32 = ~256 (vs 64 on EP16 4-tray
+// multi-node). The s2d_map buffer scales with chunk_tokens * ranks_per_node,
+// pushing dispatch SMEM above sm_103 ~228KiB cap at chunk=128 with the
+// default NUM_OF_STAGES=12 (=> ~253KiB measured: 172KiB token + 64KiB s2d +
+// 12KiB prob). Use the same 8-stage / 3-in-flight depth as the dispatch
+// TMA-overlap path (already validated for sm_103 SMEM budget) when
+// LSA_TEAM_SIZE > 16 in single-node MNNVL mode.
+#define HYBRIDEP_DISPATCH_NUM_OF_STAGES_LSA32 8
+#define HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_LSA32 3
 // Maximum consecutive tokens batched into a single RDMA put in dispatch N2N.
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE 4
@@ -114,6 +126,15 @@
 // Single-node configuration: optimized for intra-node only (2 pipelines, deep FIFO)
 #define HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S 12
 #define HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G 2
+
+// [LSA_TEAM_SIZE>16 SMEM relief, 2026-05-18]
+// Same reasoning as HYBRIDEP_DISPATCH_NUM_OF_STAGES_LSA32 above. Combine
+// single-node intra_node block is skipped (NUM_LSA_TEAMS==1 path), so the
+// dominant SMEM consumer is NUM_OF_STAGES_G2S * hidden * 2 = 12 * 14KiB =
+// 168KiB plus inter_node_S2G + prob. EP32 (LSA_TEAM_SIZE=32) inflates prob
+// stages by 4x vs EP16, pushing combine SMEM close to or past the 228KiB
+// cap. Halve G2S depth to 6 to fit conservatively.
+#define HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S_LSA32 6
 
 // Multi-node configuration: optimized for inter-node RDMA (1 pipeline, shallow FIFO)
 #define HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_G2S 4

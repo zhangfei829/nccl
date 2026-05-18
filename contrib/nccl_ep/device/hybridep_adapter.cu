@@ -608,6 +608,20 @@ void dispatch_impl(
 
                 auto kp = build_dispatch_param<TOKEN_DATA_TYPE, LSA_TEAM_SIZE>(params);
 
+                // [LSA_TEAM_SIZE>16 SMEM relief] At LSA_TEAM_SIZE=32 (EP32
+                // single-node MNNVL inside NVL72), s2d_map + prob inflate
+                // dispatch SMEM past sm_103 ~228KiB cap with the default
+                // 12-stage / 4-in-flight ring at chunk=128. Drop to 8/3
+                // (same depth as dispatch TMA-overlap path, well validated).
+                // EP4/EP8 single-node MNNVL keep the default 12/4 because
+                // their experts_per_node is small enough.
+                constexpr int dispatch_num_stages_lsa = (LSA_TEAM_SIZE > 16)
+                    ? HYBRIDEP_DISPATCH_NUM_OF_STAGES_LSA32
+                    : HYBRIDEP_DISPATCH_NUM_OF_STAGES;
+                constexpr int dispatch_num_inflight_lsa = (LSA_TEAM_SIZE > 16)
+                    ? HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_LSA32
+                    : HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
+
                 if constexpr (NUM_LSA_TEAMS == 1) {
                     // NV72 / MNNVL single-LSA-domain path. Production build
                     // only instantiates the 3 cells (16,64) / (32,128) /
@@ -650,8 +664,8 @@ void dispatch_impl(
                                 } else {
                                     HybridEPType::template dispatch<
                                         TOKEN_DATA_TYPE,
-                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                        dispatch_num_stages_lsa,
+                                        dispatch_num_inflight_lsa,
                                         CHUNK_TOKENS_TUNED,
                                         NUM_BLOCKS_TUNED,
                                         FORWARD_DISPATCH,
@@ -660,8 +674,8 @@ void dispatch_impl(
                             } else {
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    dispatch_num_stages_lsa,
+                                    dispatch_num_inflight_lsa,
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
                                     FORWARD_DISPATCH,
@@ -674,8 +688,8 @@ void dispatch_impl(
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
                             HybridEPType::template dispatch<
                                 TOKEN_DATA_TYPE,
-                                HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                dispatch_num_stages_lsa,
+                                dispatch_num_inflight_lsa,
                                 CHUNK_TOKENS_TUNED,
                                 NUM_BLOCKS_TUNED,
                                 FORWARD_DISPATCH,
@@ -712,8 +726,8 @@ void dispatch_impl(
                             } else {
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                    dispatch_num_stages_lsa,
+                                    dispatch_num_inflight_lsa,
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
                                     FORWARD_DISPATCH,
@@ -722,8 +736,8 @@ void dispatch_impl(
                         } else {
                             HybridEPType::template dispatch<
                                 TOKEN_DATA_TYPE,
-                                HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                                HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                                dispatch_num_stages_lsa,
+                                dispatch_num_inflight_lsa,
                                 CHUNK_TOKENS_TUNED,
                                 NUM_BLOCKS_TUNED,
                                 FORWARD_DISPATCH,
@@ -734,8 +748,8 @@ void dispatch_impl(
                     HYBRIDEP_SWITCH_NV72_CELL(num_blocks, chunk_tokens, {
                         HybridEPType::template dispatch<
                             TOKEN_DATA_TYPE,
-                            HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                            HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                            dispatch_num_stages_lsa,
+                            dispatch_num_inflight_lsa,
                             CHUNK_TOKENS_TUNED,
                             NUM_BLOCKS_TUNED,
                             FORWARD_DISPATCH,
@@ -746,8 +760,8 @@ void dispatch_impl(
                 } else {
                     HybridEPType::template dispatch<
                         TOKEN_DATA_TYPE,
-                        HYBRIDEP_DISPATCH_NUM_OF_STAGES,
-                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G,
+                        dispatch_num_stages_lsa,
+                        dispatch_num_inflight_lsa,
                         HT_OF_NUM_TOKENS_PER_CHUNK,
                         HYBRIDEP_DISPATCH_NUM_OF_BLOCKS,
                         FORWARD_DISPATCH,
@@ -896,8 +910,16 @@ void combine_impl(
                 auto kp = build_combine_param<LSA_TEAM_SIZE>(params);
 
                 // Select config based on NUM_LSA_TEAMS (single-node: 12 stages/2 pipelines, multi-node: 5 stages/1 pipeline)
+                // [LSA_TEAM_SIZE>16 SMEM relief, 2026-05-18] EP32 single-node
+                // MNNVL (LSA_TEAM_SIZE=32) inflates prob/inter buffers, push
+                // combine SMEM past sm_103 cap. Drop SINGLENODE G2S depth from
+                // 12 to 6 in that case. EP4/EP8/EP16 single-node MNNVL keep
+                // the deeper 12-stage default since their experts_per_node is
+                // small enough.
                 constexpr int num_stages_g2s = (NUM_LSA_TEAMS == 1)
-                    ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S
+                    ? ((LSA_TEAM_SIZE > 16)
+                        ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S_LSA32
+                        : HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_G2S)
                     : HYBRIDEP_COMBINE_MULTINODE_NUM_OF_STAGES_G2S;
                 constexpr int num_stages_s2g = (NUM_LSA_TEAMS == 1)
                     ? HYBRIDEP_COMBINE_SINGLENODE_NUM_OF_STAGES_S2G
