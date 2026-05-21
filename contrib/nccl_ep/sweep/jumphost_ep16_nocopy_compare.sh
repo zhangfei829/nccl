@@ -45,6 +45,13 @@ EXTRA_BUILD_FLAGS="${EXTRA_BUILD_FLAGS:-}"
 # last build (e.g., only sweep .sh / python summary changed).
 # git fetch + reset still runs to sync any source for inspection.
 SKIP_BUILD="${SKIP_BUILD:-0}"
+# ENABLE_PROFILE=1 turns on NCCL_EP_HT_PROFILE=1 for ALL cases, prints
+# [HT-PROFILE] dispatch/combine lines with per-stage breakdown:
+#   combine: input_copy=X us  kernel=Y us  total_stream=Z us
+# Use these to derive STRICT Adjusted API BW = total - input_copy (only subtract
+# real cudaMemcpyAsync time, not other host overhead diff between baseline and
+# no_copy paths). PROFILE adds ~5us per call event overhead, OK for verification.
+ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/nocopy_compare_${TS}}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
@@ -165,12 +172,15 @@ sed 's/^/  /' "\$HOSTFILE"
 
 for ep in $EP_SIZES; do
   for case in baseline dispatch_overlap no_copy; do
-    unset NCCL_EP_HT_DISPATCH_TMA_COPY NCCL_EP_HT_NO_COPY || true
+    unset NCCL_EP_HT_DISPATCH_TMA_COPY NCCL_EP_HT_NO_COPY NCCL_EP_HT_PROFILE || true
     case "\$case" in
       baseline)         : ;;
       dispatch_overlap) export NCCL_EP_HT_DISPATCH_TMA_COPY=1 ;;
       no_copy)          export NCCL_EP_HT_NO_COPY=1 ;;
     esac
+    if [[ "$ENABLE_PROFILE" == "1" ]]; then
+      export NCCL_EP_HT_PROFILE=1
+    fi
     OUT=$REMOTE_BASE/ep\${ep}/\${case}
     mkdir -p "\$OUT"
     # Validation: enable for all 3 cases. baseline confirms validator infra
@@ -370,6 +380,43 @@ for (ep, t) in sorted(data.keys()):
               f"{adj:>26.1f} GB/s | "
               f"{gain:>6.2f}x")
 PY
+
+if [[ "$ENABLE_PROFILE" == "1" ]]; then
+  echo
+  echo "===== [6b/6] STRICT Adjusted API BW (from PROFILE input_copy field) ====="
+  echo "Definition: strict_adjusted_API_us = baseline.combine_avg_us - baseline.input_copy_us"
+  echo "            (subtracts ONLY measured cudaMemcpyAsync, not other host diff)"
+  echo
+  for ep_dir in "$LOCAL_OUT"/ep*; do
+    [ -d "$ep_dir" ] || continue
+    ep="${ep_dir##*/ep}"
+    for log in "$ep_dir"/baseline/ep*_ht_bf16_t*.log; do
+      [ -f "$log" ] || continue
+      tok=$(basename "$log" .log | sed -E 's/^ep[0-9]+_ht_bf16_t//')
+      # Average PROFILE values (last few iterations, exclude warmup spike)
+      c_input=$(grep "HT-PROFILE.*combine" "$log" | tail -10 | awk -F'input_copy=' 'NF>1{n=split($2,a," "); s+=a[1]; c++} END{if(c) printf "%.1f", s/c}')
+      c_kernel=$(grep "HT-PROFILE.*combine" "$log" | tail -10 | awk -F'kernel=' 'NF>1{n=split($2,a," "); s+=a[1]; c++} END{if(c) printf "%.1f", s/c}')
+      c_total=$(grep "HT-PROFILE.*combine" "$log" | tail -10 | awk -F'total_stream=' 'NF>1{n=split($2,a," "); s+=a[1]; c++} END{if(c) printf "%.1f", s/c}')
+      d_input=$(grep "HT-PROFILE.*dispatch" "$log" | tail -10 | awk -F'output_copy=' 'NF>1{n=split($2,a," "); s+=a[1]; c++} END{if(c) printf "%.1f", s/c}')
+      d_kernel=$(grep "HT-PROFILE.*dispatch" "$log" | tail -10 | awk -F'kernel=' 'NF>1{n=split($2,a," "); s+=a[1]; c++} END{if(c) printf "%.1f", s/c}')
+      d_total=$(grep "HT-PROFILE.*dispatch" "$log" | tail -10 | awk -F'total_stream=' 'NF>1{n=split($2,a," "); s+=a[1]; c++} END{if(c) printf "%.1f", s/c}')
+      if [ -n "$c_total" ]; then
+        printf "  EP=%-3s t=%-5s | combine: input_copy=%6s us  kernel=%6s us  total=%7s us  (strict_adj=%6s us)\n" \
+               "$ep" "$tok" "${c_input:-?}" "${c_kernel:-?}" "${c_total:-?}" "$(awk -v t=${c_total:-0} -v i=${c_input:-0} 'BEGIN{printf "%.1f", t-i}')"
+        printf "  EP=%-3s t=%-5s | dispatch: output_copy=%5s us  kernel=%6s us  total=%7s us  (strict_adj=%6s us)\n" \
+               "$ep" "$tok" "${d_input:-?}" "${d_kernel:-?}" "${d_total:-?}" "$(awk -v t=${d_total:-0} -v i=${d_input:-0} 'BEGIN{printf "%.1f", t-i}')"
+        echo
+      else
+        echo "  EP=$ep t=$tok | (no [HT-PROFILE] lines found in baseline log)"
+      fi
+    done
+  done
+  echo
+  echo "Note: strict_adj is the TIGHT bound on what registered-memory framework"
+  echo "      can save = ONLY removing host cudaMemcpyAsync. The earlier 'Adjusted"
+  echo "      API BW = no_copy API BW' may overshoot if NO-COPY also incidentally"
+  echo "      skips other host work; use strict_adj for the rigorous bound."
+fi
 
 echo
 echo "==========================================================="
