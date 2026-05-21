@@ -40,6 +40,11 @@ HEAD_TRAY="${HEAD_TRAY:-$(echo "$TRAYS" | awk '{print $1}')}"
 EP_SIZES="${EP_SIZES:-16}"
 TOKENS="${TOKENS:-4096 8192}"
 EXTRA_BUILD_FLAGS="${EXTRA_BUILD_FLAGS:-}"
+# SKIP_BUILD=1 skips NCCL EP rebuild if libnccl_ep.so + ep_bench already exist
+# on head tray. Set when conversation context confirms no C++ changes since
+# last build (e.g., only sweep .sh / python summary changed).
+# git fetch + reset still runs to sync any source for inspection.
+SKIP_BUILD="${SKIP_BUILD:-0}"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/nocopy_compare_${TS}}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
@@ -114,18 +119,25 @@ if [[ ! -f /home/fizhang/nccl/build/lib/libnccl.so ]]; then
     NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103"
 fi
 
-rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
-      /home/fizhang/nccl/build/obj/nccl_ep/device/hybridep_adapter.o \\
-      /home/fizhang/nccl/build/lib/libnccl_ep.so \\
-      /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+if [[ "$SKIP_BUILD" == "1" ]] \\
+   && [[ -f /home/fizhang/nccl/build/lib/libnccl_ep.so ]] \\
+   && [[ -f /home/fizhang/nccl/build/test/nccl_ep/ep_bench ]]; then
+  echo "[SKIP_BUILD=1] reusing cached NCCL EP binaries"
+  ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+else
+  rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
+        /home/fizhang/nccl/build/obj/nccl_ep/device/hybridep_adapter.o \\
+        /home/fizhang/nccl/build/lib/libnccl_ep.so \\
+        /home/fizhang/nccl/build/test/nccl_ep/ep_bench
 
-time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
-  NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP $EXTRA_BUILD_FLAGS" \\
-  EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP $EXTRA_BUILD_FLAGS" \\
-  MPI_HOME=\$MPI_HOME
+  time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
+    NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
+    EXTRA_CXXFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP $EXTRA_BUILD_FLAGS" \\
+    EXTRA_NVCCFLAGS="-DNCCL_EP_ENABLE_HT_TMA_COPY_OVERLAP $EXTRA_BUILD_FLAGS" \\
+    MPI_HOME=\$MPI_HOME
 
-ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+  ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+fi
 REMOTE
 
 REMOTE_BASE="/home/fizhang/nccl-sweeps/nocopy-${TS}"

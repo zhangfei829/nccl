@@ -32,6 +32,8 @@ HEAD_TRAY="${HEAD_TRAY:-$(echo "$TRAYS" | awk '{print $1}')}"
 EP_SIZES="${EP_SIZES:-32}"
 TOKENS="${TOKENS:-16 256 512 4096 8192}"
 EXTRA_BUILD_FLAGS="${EXTRA_BUILD_FLAGS:-}"
+# SKIP_BUILD=1 reuses cached NCCL EP binaries if libnccl_ep.so + ep_bench exist.
+SKIP_BUILD="${SKIP_BUILD:-0}"
 NV72_NUM_SMS_TUNING="${NV72_NUM_SMS_TUNING:-32}"
 NV72_CHUNK_TUNING="${NV72_CHUNK_TUNING:-128}"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -110,18 +112,25 @@ if [[ ! -f /home/fizhang/nccl/build/lib/libnccl.so ]]; then
     NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103"
 fi
 
-rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
-      /home/fizhang/nccl/build/obj/nccl_ep/device/hybridep_adapter.o \\
-      /home/fizhang/nccl/build/lib/libnccl_ep.so \\
-      /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+if [[ "$SKIP_BUILD" == "1" ]] \\
+   && [[ -f /home/fizhang/nccl/build/lib/libnccl_ep.so ]] \\
+   && [[ -f /home/fizhang/nccl/build/test/nccl_ep/ep_bench ]]; then
+  echo "[SKIP_BUILD=1] reusing cached NCCL EP binaries"
+  ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+else
+  rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
+        /home/fizhang/nccl/build/obj/nccl_ep/device/hybridep_adapter.o \\
+        /home/fizhang/nccl/build/lib/libnccl_ep.so \\
+        /home/fizhang/nccl/build/test/nccl_ep/ep_bench
 
-time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
-  NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  EXTRA_CXXFLAGS="$EXTRA_BUILD_FLAGS" \\
-  EXTRA_NVCCFLAGS="$EXTRA_BUILD_FLAGS" \\
-  MPI_HOME=\$MPI_HOME
+  time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
+    NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
+    EXTRA_CXXFLAGS="$EXTRA_BUILD_FLAGS" \\
+    EXTRA_NVCCFLAGS="$EXTRA_BUILD_FLAGS" \\
+    MPI_HOME=\$MPI_HOME
 
-ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+  ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+fi
 REMOTE
 
 REMOTE_BASE="/home/fizhang/nccl-sweeps/ep32_base_vs_tuning-${TS}"

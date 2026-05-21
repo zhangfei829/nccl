@@ -21,6 +21,9 @@ TRAYS="${TRAYS:-pod4-gb300-2-tray11-f3 pod4-gb300-2-tray12-f3 pod4-gb300-2-tray1
 HEAD_TRAY="${HEAD_TRAY:-$(echo "$TRAYS" | awk '{print $1}')}"
 EP_SIZES="${EP_SIZES:-16}"
 TOKENS="${TOKENS:-4096}"
+# SKIP_BUILD=1 reuses cached NCCL EP binaries if libnccl_ep.so + ep_bench exist.
+# Set when no C++ changes since last build on this tray set.
+SKIP_BUILD="${SKIP_BUILD:-0}"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOCAL_OUT="${LOCAL_OUT:-$HOME/nccl_ep_runs/ep16_pure_baseline_${TS}}"
 NCCL_GIT_URL="${NCCL_GIT_URL:-https://github.com/zhangfei829/nccl.git}"
@@ -83,19 +86,26 @@ if [[ ! -f /home/fizhang/nccl/build/lib/libnccl.so ]]; then
     NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103"
 fi
 
-# Force rebuild EP with NO macros
-rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
-      /home/fizhang/nccl/build/obj/nccl_ep/device/hybridep_adapter.o \\
-      /home/fizhang/nccl/build/lib/libnccl_ep.so \\
-      /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+if [[ "$SKIP_BUILD" == "1" ]] \\
+   && [[ -f /home/fizhang/nccl/build/lib/libnccl_ep.so ]] \\
+   && [[ -f /home/fizhang/nccl/build/test/nccl_ep/ep_bench ]]; then
+  echo "[SKIP_BUILD=1] reusing cached NCCL EP binaries (caller asserts no C++ change)"
+  ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+else
+  # Force rebuild EP with NO macros
+  rm -f /home/fizhang/nccl/build/obj/nccl_ep/nccl_ep.o \\
+        /home/fizhang/nccl/build/obj/nccl_ep/device/hybridep_adapter.o \\
+        /home/fizhang/nccl/build/lib/libnccl_ep.so \\
+        /home/fizhang/nccl/build/test/nccl_ep/ep_bench
 
-time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
-  NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
-  MPI_HOME=\$MPI_HOME
+  time make -j3 -C contrib/nccl_ep MPI=1 BUILDDIR=/home/fizhang/nccl/build \\
+    NVCC_GENCODE="-gencode=arch=compute_103,code=sm_103" \\
+    MPI_HOME=\$MPI_HOME
 
-echo "--- verify NO optimization macros in binary ---"
-strings /home/fizhang/nccl/build/lib/libnccl_ep.so | grep -E "NCCL_EP_ENABLE_HT_(TMA_COPY|COMBINE_INPUT)" | head -5 || echo "(none, as expected)"
-ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+  echo "--- verify NO optimization macros in binary ---"
+  strings /home/fizhang/nccl/build/lib/libnccl_ep.so | grep -E "NCCL_EP_ENABLE_HT_(TMA_COPY|COMBINE_INPUT)" | head -5 || echo "(none, as expected)"
+  ls -l /home/fizhang/nccl/build/lib/libnccl_ep.so /home/fizhang/nccl/build/test/nccl_ep/ep_bench
+fi
 REMOTE
 
 REMOTE_BASE="/home/fizhang/nccl-sweeps/ep16_pure_baseline-${TS}"
