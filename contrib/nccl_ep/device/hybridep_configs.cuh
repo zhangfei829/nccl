@@ -35,6 +35,20 @@
 // LSA_TEAM_SIZE > 16 in single-node MNNVL mode.
 #define HYBRIDEP_DISPATCH_NUM_OF_STAGES_LSA32 8
 #define HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_LSA32 3
+
+// [LSA_TEAM_SIZE>16 + TMA_OVERLAP SMEM relief, 2026-05-21]
+// ENABLE_TMA_COPY=true adds a ~56 KiB TMA copy ring on top of the main
+// pipeline. EP32 single-node MNNVL (LSA_TEAM_SIZE=32) doubles s2d_map
+// (chunk * ranks_per_node * 4 bytes per slot * 2 pipelines * 2 ping-pong
+// = 64 KiB at chunk=128, vs 32 KiB at EP16 single-node).
+//
+// Default OVERLAP stages = 8 sums to ~241 KiB on EP32 + chunk=128:
+//   token 112 + prob 8 + s2d 64 + TMA ring 56 + mbar 1 = 241 KiB > 228 cap
+// Reduce stages 8 -> 6 (main token 84 KiB, total ~211 KiB, fits cap).
+// IN_FLIGHT must stay strictly less than stages_per_pipeline (= 6/2 = 3),
+// so reduce in-flight depth from 3 to 2 accordingly.
+#define HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP_LSA32 6
+#define HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP_LSA32 2
 // Maximum consecutive tokens batched into a single RDMA put in dispatch N2N.
 // Larger batches reduce NIC doorbell overhead but may delay first-byte latency.
 #define HYBRIDEP_DISPATCH_RDMA_BATCH_SIZE 4

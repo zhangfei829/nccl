@@ -621,6 +621,16 @@ void dispatch_impl(
                 constexpr int dispatch_num_inflight_lsa = (LSA_TEAM_SIZE > 16)
                     ? HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_LSA32
                     : HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G;
+                // Same LSA_TEAM_SIZE>16 SMEM relief but for the ENABLE_TMA_COPY=true
+                // (dispatch_overlap) path. The OVERLAP variant adds a ~56 KiB TMA copy
+                // ring; EP32 single-node MNNVL doubles s2d_map vs EP16, pushing total
+                // past sm_103 cap at the default OVERLAP stages=8. Drop to 6 / 2.
+                constexpr int dispatch_num_stages_overlap_lsa = (LSA_TEAM_SIZE > 16)
+                    ? HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP_LSA32
+                    : HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP;
+                constexpr int dispatch_num_inflight_overlap_lsa = (LSA_TEAM_SIZE > 16)
+                    ? HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP_LSA32
+                    : HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP;
 
                 if constexpr (NUM_LSA_TEAMS == 1) {
                     // NV72 / MNNVL single-LSA-domain path. Production build
@@ -655,8 +665,8 @@ void dispatch_impl(
                                 if (params.user_output_token != nullptr) {
                                     HybridEPType::template dispatch<
                                         TOKEN_DATA_TYPE,
-                                        HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
-                                        HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP,
+                                        dispatch_num_stages_overlap_lsa,
+                                        dispatch_num_inflight_overlap_lsa,
                                         CHUNK_TOKENS_TUNED,
                                         NUM_BLOCKS_TUNED,
                                         FORWARD_DISPATCH,
@@ -717,8 +727,8 @@ void dispatch_impl(
                                 // exceeds the per-block max ~228 KiB.
                                 HybridEPType::template dispatch<
                                     TOKEN_DATA_TYPE,
-                                    HYBRIDEP_DISPATCH_NUM_OF_STAGES_OVERLAP,
-                                    HYBRIDEP_DISPATCH_NUM_OF_IN_FLIGHT_S2G_OVERLAP,
+                                    dispatch_num_stages_overlap_lsa,
+                                    dispatch_num_inflight_overlap_lsa,
                                     CHUNK_TOKENS_TUNED,
                                     NUM_BLOCKS_TUNED,
                                     FORWARD_DISPATCH,
