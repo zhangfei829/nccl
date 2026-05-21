@@ -324,6 +324,39 @@ for (ep, t) in sorted(data.keys()):
             abw = bw(r['d_send_mb'], r[ka])
             cells.append(f"{kbw:>10.1f}/{abw:>10.1f}")
         print(f"{ep:>4} {t:>7} | {phase:<8} | {cells[0]:>22} | {cells[1]:>22} | {cells[2]:>22}")
+
+# =============================================================================
+# Adjusted API BW (assumes future framework integration with registered memory:
+# expert_input_token / x->data are pre-allocated as fabric-mapped buffers, so
+# host cudaMemcpyAsync between user buffer and NCCL internal staging is GONE).
+# Definition:
+#   adjusted_API_us  = combine_avg_us  WITHOUT host cudaMemcpyAsync overhead
+#                    ~ measured directly by no_copy case (NCCL_EP_HT_NO_COPY=1)
+#   adjusted_API_BW  = total_send_mb / adjusted_API_us * 1000
+# Reporting: side-by-side raw baseline vs adjusted (= no_copy) so the gain
+# attributable to "registered memory in framework" is explicit.
+# =============================================================================
+print()
+print("=== Adjusted API BW (assumes framework uses registered memory, no host copy) ===")
+print(f"{'EP':>4} {'tokens':>7} | {'phase':<8} | "
+      f"{'raw API (baseline)':>20} | "
+      f"{'adjusted API (no host copy)':>30} | "
+      f"{'gain':>7}")
+print("-" * 90)
+for (ep, t) in sorted(data.keys()):
+    d = data[(ep, t)]
+    b = d.get('baseline')
+    nc = d.get('no_copy')
+    if b is None or nc is None:
+        continue
+    for phase, key in (('dispatch','d_avg_us'), ('combine','c_avg_us')):
+        raw  = bw(b['d_send_mb'], b[key])
+        adj  = bw(nc['d_send_mb'], nc[key])
+        gain = (adj/raw) if raw > 0 else 0.0
+        print(f"{ep:>4} {t:>7} | {phase:<8} | "
+              f"{raw:>16.1f} GB/s | "
+              f"{adj:>26.1f} GB/s | "
+              f"{gain:>6.2f}x")
 PY
 
 echo
