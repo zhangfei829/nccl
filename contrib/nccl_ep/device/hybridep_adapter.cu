@@ -696,10 +696,23 @@ void dispatch_impl(
 #  else
                     HYBRIDEP_SWITCH_NUM_BLOCKS(num_blocks, {
                         HYBRIDEP_SWITCH_CHUNK_TOKENS(chunk_tokens, {
+                            // [perf-test bigwork] chunk=256 + LSA32 (EP32 NV72) needs
+                            // extra SMEM relief: s2d_map=chunk*ranks_per_node*16=128KiB
+                            // alone, default stages=8 token buf 112KiB pushes total
+                            // past 228KiB cap. Reduce stages 8->4 to fit
+                            // (token 56 + s2d 128 + prob 24 = ~208 KiB).
+                            constexpr int dispatch_num_stages_dyn =
+                                (LSA_TEAM_SIZE > 16 && CHUNK_TOKENS_TUNED >= 256)
+                                    ? 4
+                                    : dispatch_num_stages_lsa;
+                            constexpr int dispatch_num_inflight_dyn =
+                                (LSA_TEAM_SIZE > 16 && CHUNK_TOKENS_TUNED >= 256)
+                                    ? 2
+                                    : dispatch_num_inflight_lsa;
                             HybridEPType::template dispatch<
                                 TOKEN_DATA_TYPE,
-                                dispatch_num_stages_lsa,
-                                dispatch_num_inflight_lsa,
+                                dispatch_num_stages_dyn,
+                                dispatch_num_inflight_dyn,
                                 CHUNK_TOKENS_TUNED,
                                 NUM_BLOCKS_TUNED,
                                 FORWARD_DISPATCH,
