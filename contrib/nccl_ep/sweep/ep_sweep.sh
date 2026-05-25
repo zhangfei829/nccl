@@ -164,8 +164,9 @@ should_skip() {
             if (( tokens * EP_SIZE > 2048 )); then return 0; fi
             ;;
         ht_bf16|ht_fp8)
-            # HT: MAX_SUPPORTED_TOKENS_PER_RANK is compiled at 8192.
-            if (( tokens > 8192 )); then return 0; fi
+            # HT: MAX_SUPPORTED_TOKENS_PER_RANK compiled at 32768 in perf-test branch
+            # (was 8192). Raise sweep cap accordingly.
+            if (( tokens > 32768 )); then return 0; fi
             ;;
         fullmesh_bf16)
             # FULLMESH recv_buf = nRanks * max_tokens * (meta+hidden)
