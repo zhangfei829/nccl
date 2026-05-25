@@ -705,9 +705,11 @@ void dispatch_impl(
                                 (LSA_TEAM_SIZE > 16 && CHUNK_TOKENS_TUNED >= 256)
                                     ? 4
                                     : dispatch_num_stages_lsa;
+                            // in_flight must be strictly < stages_per_pipeline = stages/NUM_PIPELINES = 4/2 = 2
+                            // so in_flight max = 1 for chunk=256 + LSA32 cell.
                             constexpr int dispatch_num_inflight_dyn =
                                 (LSA_TEAM_SIZE > 16 && CHUNK_TOKENS_TUNED >= 256)
-                                    ? 2
+                                    ? 1
                                     : dispatch_num_inflight_lsa;
                             HybridEPType::template dispatch<
                                 TOKEN_DATA_TYPE,
