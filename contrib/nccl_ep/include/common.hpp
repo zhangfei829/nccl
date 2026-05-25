@@ -22,7 +22,7 @@
 #define MAX_NCCL_GIN_CTX_PER_COMM 4
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500
-#define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in hybridep_adapter.cu
+#define MAX_SUPPORTED_TOKENS_PER_RANK 32768  // [perf-test bigwork] bumped 8192->32768 to verify chunks/SM scaling hypothesis (加 SM+work+chunk_size 突破 664 GB/s asymptote). Revert after experiment.
 #define HT_OF_NUM_TOKENS_PER_CHUNK 64
 
 #ifndef ENABLE_FAST_DEBUG
